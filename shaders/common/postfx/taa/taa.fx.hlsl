@@ -11,8 +11,8 @@ uniform_sampler2D(velocityTex,  3);
 // ============================================================================
 cbuffer perDraw
 {
-    float  taaRenderSizeX;              float  taaRenderSizeY;              float  taaFeedbackMin;
-    float  taaFeedbackMax;              float  taaShadowMitigation;         float  taaShadowDarknessThreshold;
+    float  taaFeedbackMin;              float  taaFeedbackMax;              
+    float  taaShadowMitigation;         float  taaShadowDarknessThreshold;
     float  taaShadowBlendStrength;      float  taaVarianceGamma;            float  taaSoftClip;
     float  taaChromaVarianceMod;        float  taaJitterFlickerPadding;     float  taaJitterFlickerFade;
     float  taaDepthRejection;           float  taaVelDisocclusion;          float  taaTanHalfFovX;
@@ -22,8 +22,8 @@ cbuffer perDraw
     float  taaColorSpaceOklab;          float  taaJitterAwareVariance;      float  taaVelocityAlignedVariance;
     float  taaAlignmentFeedbackDrop;    float  taaMotionBlendDropSpeed;     float  taaBilinearHistoryVel;       
     float  taaRoundedAABB;              float  taaUseLanczos3;              float  taaFireflyClamp;             
-    float  taaAdaptiveVarStart;         float  taaAdaptiveVarEnd;           float  taaFlickerSpatialMult;       
-    float  taaShadowTemporalMult;       float  taaShadowSpatialMult;        float  taaDirectionalVariance;      
+    float  taaAdaptiveVarStart;         float  taaAdaptiveVarEnd;           float  taaShadowTemporalMult;       
+    float  taaShadowSpatialMult;        float  taaDirectionalVariance;      
     float  taaClipDistanceRejectionEnabled; float  taaClipDistanceRejectionAmount; float  taaClipDistanceRejectionMinError;
     float  taaUseKDopClipping;          float  taaKDopVariance;             float  taaFallbackFXAA;
     float  taaDepthRejRelStatic;        float  taaDepthRejRelMoving;        float  taaDepthRejAbs;
@@ -113,20 +113,22 @@ float3x3 Inverse3x3(float3x3 m, out bool success)
 // ============================================================================
 // REPROJECTION & DEPTH
 // ============================================================================
-float2 ReprojectUV(float2 uv, float yaw, float pitch)
+// Optimized: sp, cp, sy, cy are now precalculated to save 8 sincos() instructions per pixel
+float2 ReprojectUV(float2 uv, float sp, float cp, float sy, float cy)
 {
     float2 ndc = float2(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
     float3 ray = float3(ndc.x * taaTanHalfFovX, 1.0, ndc.y * taaTanHalfFovY);
-    float sp, cp, sy, cy; sincos(pitch, sp, cp); sincos(yaw, sy, cy);
+    
     float3 r1 = float3(ray.x, ray.y * cp - ray.z * sp, ray.y * sp + ray.z * cp);
     float3 r2 = float3(r1.x * cy - r1.y * sy, r1.x * sy + r1.y * cy, r1.z);
+    
     if (r2.y <= kEpsilon) return float2(-1.0, -1.0);
     return float2((r2.x / (r2.y * taaTanHalfFovX)) * 0.5 + 0.5, 0.5 - (r2.z / (r2.y * taaTanHalfFovY)) * 0.5);
 }
 float LinearizeDepth(float rawDepth) { return 1.0 / max(rawDepth, kEpsilon); }
 
 // ============================================================================
-// FALLBACK FXAA (For disocclusions and screen edges)
+// FALLBACK FXAA
 // ============================================================================
 float3 ApplyFXAA(float2 uv, float2 texel, float3 centerColor) 
 {
@@ -232,21 +234,6 @@ float3 SampleHistoryCatmullRom5Tap(float2 uv, float2 texSize, float2 invTexSize)
 struct DepthVelocityStats { float closestRawDepth; float minRawDepthSearch; float maxRawDepthSearch; float2 bestVel; float2 minVel; float2 maxVel; };
 struct NeighborhoodStats { float3 aabbMin; float3 aabbMax; float3 aabbMin5; float3 aabbMax5; float3 mu; float3 sigma; float3x3 invCov; bool validCovariance; float spatialContrast; float3 expectedColorShift; float weights[9]; };
 
-struct TAAContext {
-    float2 stableUV;
-    float2 passTexel;
-    float2 passTexSize;
-    float2 renderSize;
-    float2 renderTexel;
-    float2 minRenderUV;
-    float2 maxRenderUV;
-    float2 jitterUV;
-    float2 jitterPixelPos;
-    float2 baseRenderTC;
-    float2 snappedRenderUV;
-    float2 localJitterPx;
-};
-
 struct HistoryData {
     bool valid;
     float disocclusion;
@@ -302,7 +289,6 @@ NeighborhoodStats ComputeNeighborhoodStats(float3 cachedSpace[9], float2 velocit
     stats.sigma = useShiftedCenter ? sqrt(max(m2Ctr / max(weightSumCtr, kEpsilon) - stats.mu * stats.mu, 0.0)) : sigmaEarly;
     stats.spatialContrast = max(stats.aabbMax.x - stats.aabbMin.x, 0.001);
 
-    // Quadrant-Aware Derivatives: Only look at the neighboring pixel we are actually jittering towards
     float3 gradX = localJitterPx.x > 0.0 ? (cachedSpace[4] - cachedSpace[0]) : (cachedSpace[3] - cachedSpace[0]);
     float3 gradY = localJitterPx.y > 0.0 ? (cachedSpace[2] - cachedSpace[0]) : (cachedSpace[1] - cachedSpace[0]);
     stats.expectedColorShift = (gradX * abs(localJitterPx.x)) + (gradY * abs(localJitterPx.y));
@@ -331,7 +317,6 @@ NeighborhoodStats ComputeNeighborhoodStats(float3 cachedSpace[9], float2 velocit
             
             if (taaDirectionalVariance > 0.5)
             {
-                // Tight directed covariance expansion: Streches the bounding ellipsoid exactly along the shift vector
                 float3 dirPad = stats.expectedColorShift * padMult;
                 cov[0][0] += dirPad.x * dirPad.x;
                 cov[1][1] += dirPad.y * dirPad.y;
@@ -412,12 +397,10 @@ float3 ClipHistory(float3 historySpace, NeighborhoodStats stats, float effective
             {
                 if (taaDirectionalVariance > 0.5)
                 {
-                    // Project the exact combined color shift onto the axis
                     expectedAxisShift = dot(stats.expectedColorShift * padMult, axis);
                 }
                 else
                 {
-                    // Fallback: non-directional contrast padding
                     float crossMin = min(proj[0], min(min(proj[1], proj[2]), min(proj[3], proj[4])));
                     float crossMax = max(proj[0], max(max(proj[1], proj[2]), max(proj[3], proj[4])));
                     float padAmt = (crossMax - crossMin) * length(localJitterPx) * padMult;
@@ -445,11 +428,10 @@ float3 ClipHistory(float3 historySpace, NeighborhoodStats stats, float effective
                 extents.x = min(mu - expandedSigma, proj_pos);
                 extents.y = max(mu + expandedSigma, proj_pos);
 
-                // DIRECTED EXPANSION: Maximally tight padding
                 if (taaDirectionalVariance > 0.5 && padMult > 0.0) 
                 {
-                    extents.x += min(0.0, expectedAxisShift); // Only drops min if shift is negative
-                    extents.y += max(0.0, expectedAxisShift); // Only raises max if shift is positive
+                    extents.x += min(0.0, expectedAxisShift); 
+                    extents.y += max(0.0, expectedAxisShift); 
                 }
             }
             else
@@ -459,7 +441,6 @@ float3 ClipHistory(float3 historySpace, NeighborhoodStats stats, float effective
                 extents.x -= kEpsilon;
                 extents.y += kEpsilon;
 
-                // DIRECTED EXPANSION: Maximally tight padding
                 if (taaDirectionalVariance > 0.5 && padMult > 0.0) 
                 {
                     extents.x += min(0.0, expectedAxisShift);
@@ -540,32 +521,40 @@ float3 CompressGamut(float3 historySpace, float3 currentRGB)
 }
 
 // ============================================================================
-// MAIN SHADER PIPELINE HELPERS
+// MAIN PIXEL SHADER
 // ============================================================================
-TAAContext SetupContext(float2 uv0) 
+float4 mainP(PFXVertToPix IN) : SV_TARGET0
 {
-    TAAContext ctx;
-    ctx.stableUV = uv0;
-    ctx.passTexel = oneOverTargetSize;
-    ctx.passTexSize = 1.0 / ctx.passTexel;
-    ctx.renderSize = float2(taaRenderSizeX, taaRenderSizeY);
-    ctx.renderTexel = 1.0 / ctx.renderSize;
-    ctx.minRenderUV = 0.5 * ctx.renderTexel;
-    ctx.maxRenderUV = 1.0 - ctx.minRenderUV;
+    // 1. Setup resolution values
+    float2 passTexel = oneOverTargetSize;
+    float2 passTexSize = 1.0 / passTexel;
+    float2 minRenderUV = 0.5 * passTexel;
+    float2 maxRenderUV = 1.0 - minRenderUV;
 
-    ctx.jitterUV = ReprojectUV(ctx.stableUV, taaJitterYaw, taaJitterPitch);
-    ctx.jitterPixelPos = ctx.jitterUV * ctx.passTexSize;
-    ctx.baseRenderTC = floor(ctx.jitterUV * ctx.renderSize) + 0.5;
-    ctx.snappedRenderUV = clamp(ctx.baseRenderTC * ctx.renderTexel, ctx.minRenderUV, ctx.maxRenderUV);
-    ctx.localJitterPx = ctx.jitterPixelPos - (clamp((floor(ctx.jitterPixelPos) + 0.5) * ctx.passTexel, 0.0, 1.0 - ctx.passTexel) * ctx.passTexSize);
-    return ctx;
-}
+    // 2. Precompute trigonometric functions ONCE per pixel for reprojection
+    float sp, cp, sy, cy; sincos(taaJitterPitch, sp, cp); sincos(taaJitterYaw, sy, cy);
+    float psp, pcp, psy, pcy; sincos(-taaPrevJitterPitch, psp, pcp); sincos(-taaPrevJitterYaw, psy, pcy);
 
-void GatherNeighborhood(
-    TAAContext ctx, 
-    float centerRawDepth, float2 centerVel, float3 centerColorSpace, 
-    out DepthVelocityStats dvStats, out float3 cachedSpace[9])
-{
+    // 3. Compute Jitter UVs
+    float2 jitterUV = ReprojectUV(IN.uv0, sp, cp, sy, cy);
+    float2 jitterPixelPos = jitterUV * passTexSize;
+    float2 baseRenderTC = floor(jitterPixelPos) + 0.5;
+    float2 snappedRenderUV = clamp(baseRenderTC * passTexel, minRenderUV, maxRenderUV);
+    float2 localJitterPx = jitterPixelPos - (clamp(baseRenderTC * passTexel, 0.0, 1.0 - passTexel) * passTexSize);
+
+    // 4. Fetch center pixel samples
+    float3 currentColor = max(0.0, tex2Dlod(sceneTex, float4(snappedRenderUV, 0.0, 0.0)).rgb);
+    float centerRawDepth = tex2Dlod(depthTex, float4(snappedRenderUV, 0.0, 0.0)).r;
+    float3 centerColorSpace = ToSpace(currentColor);
+    float2 centerVel = tex2Dlod(velocityTex, float4(snappedRenderUV, 0.0, 0.0)).rg;
+
+    // 5. Compute current pixel motion
+    float2 pixelVel = (ReprojectUV(jitterUV + centerVel, psp, pcp, psy, pcy) - IN.uv0) * passTexSize;
+    float totalPixelMotion = length(pixelVel);
+    float2 velocityDir = (totalPixelMotion > taaMinMotionDir) ? normalize(pixelVel) : float2(1.0, 0.0);
+
+    // 6. Gather 3x3 neighborhood data
+    DepthVelocityStats dvStats;
     dvStats.closestRawDepth = centerRawDepth;
     dvStats.bestVel = centerVel;
     dvStats.minVel = centerVel; 
@@ -573,6 +562,7 @@ void GatherNeighborhood(
     dvStats.minRawDepthSearch = centerRawDepth; 
     dvStats.maxRawDepthSearch = centerRawDepth;
 
+    float3 cachedSpace[9];
     [unroll]
     for (int i = 0; i < 9; ++i)
     {
@@ -582,7 +572,7 @@ void GatherNeighborhood(
         } 
         else 
         {
-            float2 offsetUV = clamp((ctx.baseRenderTC + kOffsets3x3[i]) * ctx.renderTexel, ctx.minRenderUV, ctx.maxRenderUV);
+            float2 offsetUV = clamp((baseRenderTC + kOffsets3x3[i]) * passTexel, minRenderUV, maxRenderUV);
             float dRaw = tex2Dlod(depthTex, float4(offsetUV, 0.0, 0.0)).r; 
             float2 v = tex2Dlod(velocityTex, float4(offsetUV, 0.0, 0.0)).rg;
             float3 cSpace = ToSpace(max(0.0, tex2Dlod(sceneTex, float4(offsetUV, 0.0, 0.0)).rgb));
@@ -599,12 +589,27 @@ void GatherNeighborhood(
             cachedSpace[i] = cSpace;
         }
     }
-}
 
-HistoryData FetchAndEvaluateHistory(
-    TAAContext ctx, float2 historyStableUV, DepthVelocityStats dvStats, 
-    float2 histVelMem, NeighborhoodStats colorStats, float3 centerColorSpace)
-{
+    // 7. Evaluate history UVs and stored velocity
+    float2 historyStableUV = ReprojectUV(jitterUV + dvStats.bestVel, psp, pcp, psy, pcy);
+    float2 currentJitterHistUV = clamp(ReprojectUV(historyStableUV, sp, cp, sy, cy), minRenderUV, maxRenderUV);
+    
+    float2 histVelMem;
+    if (taaBilinearHistoryVel > 0.5) {
+        histVelMem = tex2Dlod(velocityTex, float4(currentJitterHistUV, 0.0, 0.0)).rg;
+    } else {
+        float2 snappedHistUV = clamp((floor(currentJitterHistUV * passTexSize) + 0.5) * passTexel, minRenderUV, maxRenderUV);
+        histVelMem = tex2Dlod(velocityTex, float4(snappedHistUV, 0.0, 0.0)).rg;
+    }
+
+    float effectivePixelMotion = max(totalPixelMotion, length(histVelMem * passTexSize));
+    float2 historyPixelCoord = historyStableUV * passTexSize;
+    float pixelAlignment = 1.0 - saturate(length(historyPixelCoord - (floor(historyPixelCoord) + 0.5)) * kSqrt2);
+
+    // 8. Compute spatial neighborhood statistics
+    NeighborhoodStats colorStats = ComputeNeighborhoodStats(cachedSpace, velocityDir, totalPixelMotion, effectivePixelMotion, localJitterPx);
+
+    // 9. Fetch and evaluate temporal history 
     HistoryData hist;
     hist.valid = all(historyStableUV >= 0.0) && all(historyStableUV <= 1.0);
     hist.disocclusion = 1.0; 
@@ -615,13 +620,12 @@ HistoryData FetchAndEvaluateHistory(
 
     if (hist.valid)
     {
-        float2 historyPixelCoord = historyStableUV * ctx.passTexSize;
-        hist.disocclusion = ComputeDisocclusion(dvStats, tex2Dlod(historyTex, float4((floor(historyPixelCoord) + 0.5) * ctx.passTexel, 0.0, 0.0)).a, histVelMem, ctx.renderSize);
+        hist.disocclusion = ComputeDisocclusion(dvStats, tex2Dlod(historyTex, float4((floor(historyPixelCoord) + 0.5) * passTexel, 0.0, 0.0)).a, histVelMem, passTexSize);
 
         if (taaUseLanczos3 > 0.5) {
-            hist.colorSpace = ToSpace(SampleHistoryLanczos3(historyStableUV, ctx.passTexSize, ctx.passTexel, ctx.minRenderUV, ctx.maxRenderUV));
+            hist.colorSpace = ToSpace(SampleHistoryLanczos3(historyStableUV, passTexSize, passTexel, minRenderUV, maxRenderUV));
         } else {
-            hist.colorSpace = ToSpace(SampleHistoryCatmullRom5Tap(historyStableUV, ctx.passTexSize, ctx.passTexel));
+            hist.colorSpace = ToSpace(SampleHistoryCatmullRom5Tap(historyStableUV, passTexSize, passTexel));
         }
 
         hist.colorSpace = clamp(hist.colorSpace, colorStats.aabbMin, colorStats.aabbMax);
@@ -637,11 +641,7 @@ HistoryData FetchAndEvaluateHistory(
         }
     }
 
-    return hist;
-}
-
-void AdaptAABB(inout NeighborhoodStats colorStats, float pixelAlignment, float effectivePixelMotion)
-{
+    // 10. Execute AABB Adaptation
     float3 range9 = colorStats.aabbMax - colorStats.aabbMin;
     float3 range5 = colorStats.aabbMax5 - colorStats.aabbMin5;
     float collapseRatio = max(range5.x / max(range9.x, 1e-4), max(range5.y / max(range9.y, 1e-4), range5.z / max(range9.z, 1e-4)));
@@ -662,96 +662,41 @@ void AdaptAABB(inout NeighborhoodStats colorStats, float pixelAlignment, float e
     
     colorStats.aabbMin = adaptiveAABBMin; 
     colorStats.aabbMax = adaptiveAABBMax;
-}
-
-float CalculateBlendFactor(HistoryData hist, float effectivePixelMotion, float pixelAlignment)
-{
-    if (!hist.valid) return 0.0;
-    
-    float blend = lerp(taaFeedbackMax, taaFeedbackMin, smoothstep(taaMotionBlendStart, max(kMinMotionBlendDropSpeed, taaMotionBlendStart + kEpsilon), effectivePixelMotion));
-    if (hist.confidence > kFSRConfidenceThreshold) { blend = lerp(blend, blend * taaAlignmentFeedbackDrop, 1.0 - pixelAlignment); }
-    if (taaShadowMitigation > 0.5) { blend = lerp(blend, taaShadowBlendStrength, hist.shadowRisk); }
-    if (taaClipDistanceRejectionEnabled > 0.5) { blend = lerp(blend, 0.0, hist.clipDistanceRejection); }
-    blend = lerp(blend, 0.0, hist.disocclusion);
-
-    return blend;
-}
-
-// ============================================================================
-// MAIN PIXEL SHADER
-// ============================================================================
-float4 mainP(PFXVertToPix IN) : SV_TARGET0
-{
-    // 1. Setup global context for UVs and rendering bounds
-    TAAContext ctx = SetupContext(IN.uv0);
-
-    // 2. Fetch center pixel samples
-    float3 currentColor = max(0.0, tex2Dlod(sceneTex, float4(ctx.snappedRenderUV, 0.0, 0.0)).rgb);
-    float centerRawDepth = tex2Dlod(depthTex, float4(ctx.snappedRenderUV, 0.0, 0.0)).r;
-    float3 centerColorSpace = ToSpace(currentColor);
-    float2 centerVel = tex2Dlod(velocityTex, float4(ctx.snappedRenderUV, 0.0, 0.0)).rg;
-
-    // 3. Compute current pixel motion
-    float2 pixelVel = (ReprojectUV(ctx.jitterUV + centerVel, -taaPrevJitterYaw, -taaPrevJitterPitch) - ctx.stableUV) * ctx.passTexSize;
-    float totalPixelMotion = length(pixelVel);
-    float2 velocityDir = (totalPixelMotion > taaMinMotionDir) ? normalize(pixelVel) : float2(1.0, 0.0);
-
-    // 4. Gather 3x3 neighborhood data
-    DepthVelocityStats dvStats;
-    float3 cachedSpace[9];
-    GatherNeighborhood(ctx, centerRawDepth, centerVel, centerColorSpace, dvStats, cachedSpace);
-
-    // 5. Evaluate history UVs and stored velocity
-    float2 historyStableUV = ReprojectUV(ctx.jitterUV + dvStats.bestVel, -taaPrevJitterYaw, -taaPrevJitterPitch);
-    float2 currentJitterHistUV = clamp(ReprojectUV(historyStableUV, taaJitterYaw, taaJitterPitch), ctx.minRenderUV, ctx.maxRenderUV);
-    
-    float2 histVelMem;
-    if (taaBilinearHistoryVel > 0.5) {
-        histVelMem = tex2Dlod(velocityTex, float4(currentJitterHistUV, 0.0, 0.0)).rg;
-    } else {
-        float2 snappedHistUV = clamp((floor(currentJitterHistUV * ctx.renderSize) + 0.5) * ctx.renderTexel, ctx.minRenderUV, ctx.maxRenderUV);
-        histVelMem = tex2Dlod(velocityTex, float4(snappedHistUV, 0.0, 0.0)).rg;
-    }
-
-    float effectivePixelMotion = max(totalPixelMotion, length(histVelMem * ctx.passTexSize));
-    
-    float2 historyPixelCoord = historyStableUV * ctx.passTexSize;
-    float pixelAlignment = 1.0 - saturate(length(historyPixelCoord - (floor(historyPixelCoord) + 0.5)) * kSqrt2);
-
-    // 6. Compute spatial neighborhood statistics
-    NeighborhoodStats colorStats = ComputeNeighborhoodStats(cachedSpace, velocityDir, totalPixelMotion, effectivePixelMotion, ctx.localJitterPx);
-
-    // 7. Fetch and evaluate temporal history 
-    HistoryData hist = FetchAndEvaluateHistory(ctx, historyStableUV, dvStats, histVelMem, colorStats, centerColorSpace);
-
-    // 8. Execute AABB Adaptation
-    AdaptAABB(colorStats, pixelAlignment, effectivePixelMotion);
 
     float dynamicGamma = max(taaVarianceGamma, 0.0);
     if (taaShadowMitigation > 0.5) { 
         dynamicGamma += (hist.shadowRisk * max(taaVarianceGamma, taaShadowVarianceBase)) * (1.0 - hist.disocclusion); 
     }
 
-    // 9. History Clipping and metrics
+    // 11. History Clipping and metrics
     float3 unclippedHistorySpace = hist.colorSpace;
-    hist.colorSpace = ClipHistory(hist.colorSpace, colorStats, effectivePixelMotion, dynamicGamma, cachedSpace, ctx.localJitterPx);
+    hist.colorSpace = ClipHistory(hist.colorSpace, colorStats, effectivePixelMotion, dynamicGamma, cachedSpace, localJitterPx);
 
     if (taaClipDistanceRejectionEnabled > 0.5 && hist.valid) { 
         float clipDistance = length(unclippedHistorySpace - hist.colorSpace);
         hist.clipDistanceRejection = saturate((clipDistance - taaClipDistanceRejectionMinError) / max(taaClipDistanceRejectionAmount, 1e-5)); 
     }
 
-    // 10. Gamut compression
+    // 12. Gamut compression
     hist.colorSpace = CompressGamut(hist.colorSpace, currentColor);
 
-    // 11. Final Blend factor mapping
-    float blend = CalculateBlendFactor(hist, effectivePixelMotion, pixelAlignment);
+    // 13. Final Blend factor mapping
+    float blend = 0.0;
+    if (hist.valid) {
+        float motionBlendEnd = max(taaMotionBlendDropSpeed, taaMotionBlendStart + kMinMotionBlendDropSpeed);
+        blend = lerp(taaFeedbackMax, taaFeedbackMin, smoothstep(taaMotionBlendStart, motionBlendEnd, effectivePixelMotion));
+        
+        if (hist.confidence > kFSRConfidenceThreshold) { blend = lerp(blend, blend * taaAlignmentFeedbackDrop, 1.0 - pixelAlignment); }
+        if (taaShadowMitigation > 0.5) { blend = lerp(blend, taaShadowBlendStrength, hist.shadowRisk); }
+        if (taaClipDistanceRejectionEnabled > 0.5) { blend = lerp(blend, 0.0, hist.clipDistanceRejection); }
+        blend = lerp(blend, 0.0, hist.disocclusion);
+    }
 
-    // 12. Fallback edge smoothing
+    // 14. Fallback edge smoothing
     float fxaaBlend = saturate((0.8 - blend) * 2.0);
     if (taaFallbackFXAA > 0.5 && fxaaBlend > 0.0)
     {
-        float3 fxaaColor = ApplyFXAA(ctx.snappedRenderUV, ctx.renderTexel, currentColor);
+        float3 fxaaColor = ApplyFXAA(snappedRenderUV, passTexel, currentColor);
         centerColorSpace = lerp(centerColorSpace, ToSpace(fxaaColor), fxaaBlend);
     }
 
