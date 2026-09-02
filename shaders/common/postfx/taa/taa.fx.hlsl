@@ -64,6 +64,10 @@ static const float2 kOffsets3x3[9] =
     float2( 1, -1), float2(-1,  1), float2( 1,  1)
 };
 
+// Optimization: Precalculated mathematical constants for the 3x3 loop
+static const float kStdWeights[9] = { 1.0, 0.36787944, 0.36787944, 0.36787944, 0.36787944, 0.13533528, 0.13533528, 0.13533528, 0.13533528 };
+static const float kInvLength[9]  = { 0.0, 1.0, 1.0, 1.0, 1.0, 0.70710678, 0.70710678, 0.70710678, 0.70710678 };
+
 static const float3 kDopAxes[16] = 
 {
     float3(1.0, 0.0, 0.0), float3(0.0, 1.0, 0.0), float3(0.0, 0.0, 1.0),
@@ -113,7 +117,6 @@ float3x3 Inverse3x3(float3x3 m, out bool success)
 // ============================================================================
 // REPROJECTION & DEPTH
 // ============================================================================
-// Optimized: sp, cp, sy, cy are now precalculated to save 8 sincos() instructions per pixel
 float2 ReprojectUV(float2 uv, float sp, float cp, float sy, float cy)
 {
     float2 ndc = float2(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
@@ -205,11 +208,13 @@ float3 SampleHistoryCatmullRom5Tap(float2 uv, float2 texSize, float2 invTexSize)
     float2 samplePos = uv * texSize;
     float2 tc = floor(samplePos - 0.5) + 0.5;
     float2 f = samplePos - tc;
+    float2 f2 = f * f;
 
-    float2 w0 = f * (-0.5 + f * (1.0 - 0.5 * f));
-    float2 w1 = 1.0 + f * f * (-2.5 + 1.5 * f);
-    float2 w2 = f * (0.5 + f * (2.0 - 1.5 * f));
-    float2 w3 = f * f * (-0.5 + 0.5 * f);
+    // Optimization: Horner's form for MAD instruction native mapping
+    float2 w0 = f * (f * (-0.5 * f + 1.0) - 0.5);
+    float2 w1 = 1.0 + f2 * (1.5 * f - 2.5);
+    float2 w2 = f * (f * (-1.5 * f + 2.0) + 0.5);
+    float2 w3 = f2 * (0.5 * f - 0.5);
 
     float2 w12 = w1 + w2;
     float2 offset12 = w2 / (w12 + 1e-5);
@@ -219,11 +224,15 @@ float3 SampleHistoryCatmullRom5Tap(float2 uv, float2 texSize, float2 invTexSize)
     float2 tc12 = (tc + offset12) * invTexSize;
 
     float3 color = 0.0;
+    float wsum = (w12.x * w0.y) + (w0.x * w12.y) + (w12.x * w12.y) + (w3.x * w12.y) + (w12.x * w3.y);
+    
     color += tex2Dlod(historyTex, float4(tc12.x, tc0.y, 0.0, 0.0)).rgb * (w12.x * w0.y);
     color += tex2Dlod(historyTex, float4(tc0.x, tc12.y, 0.0, 0.0)).rgb * (w0.x * w12.y);
     color += tex2Dlod(historyTex, float4(tc12.x, tc12.y, 0.0, 0.0)).rgb * (w12.x * w12.y);
     color += tex2Dlod(historyTex, float4(tc3.x, tc12.y, 0.0, 0.0)).rgb * (w3.x * w12.y);
     color += tex2Dlod(historyTex, float4(tc12.x, tc3.y, 0.0, 0.0)).rgb * (w12.x * w3.y);
+    
+    color /= max(wsum, 1e-4);
 
     return max(0.0, color);
 }
@@ -262,18 +271,39 @@ NeighborhoodStats ComputeNeighborhoodStats(float3 cachedSpace[9], float2 velocit
     [unroll]
     for (int i = 0; i < 9; ++i)
     {
-        float2 pixelOffset = kOffsets3x3[i]; float3 cSpace = cachedSpace[i];
-        stats.aabbMin = min(stats.aabbMin, cSpace); stats.aabbMax = max(stats.aabbMax, cSpace);
+        float2 pixelOffset = kOffsets3x3[i]; 
+        float3 cSpace = cachedSpace[i];
+        
+        stats.aabbMin = min(stats.aabbMin, cSpace); 
+        stats.aabbMax = max(stats.aabbMax, cSpace);
         if (i < 5) { stats.aabbMin5 = min(stats.aabbMin5, cSpace); stats.aabbMax5 = max(stats.aabbMax5, cSpace); }
 
-        float stdWeight = exp(-dot(pixelOffset, pixelOffset));
-        float centerWeight = exp(-dot(pixelOffset - centerShift, pixelOffset - centerShift) * 0.5);
+        // Optimization: Removed dynamic exp() and dot() leveraging pre-computed static array constants
+        float stdWeight = kStdWeights[i];
+        float2 shiftOffset = pixelOffset - centerShift;
+        float centerWeight = exp(-dot(shiftOffset, shiftOffset) * 0.5);
 
-        if (taaLumaVariance > 0.5) { float lumaMod = 1.0 / (1.0 + cSpace.x); stdWeight *= lumaMod; centerWeight *= lumaMod; }
-        if (taaVelocityAlignedVariance > 0.5 && i > 0) { float velMod = lerp(1.0, saturate(dot(normalize(pixelOffset), velocityDir) * 0.5 + 0.5), motionFactor); stdWeight *= velMod; centerWeight *= velMod; }
+        if (taaLumaVariance > 0.5) { 
+            float lumaMod = 1.0 / (1.0 + cSpace.x); 
+            stdWeight *= lumaMod; 
+            centerWeight *= lumaMod; 
+        }
+        if (taaVelocityAlignedVariance > 0.5 && i > 0) { 
+            // Optimization: Replaced normalize() with kInvLength
+            float velMod = lerp(1.0, saturate(dot(pixelOffset, velocityDir) * kInvLength[i] * 0.5 + 0.5), motionFactor); 
+            stdWeight *= velMod; 
+            centerWeight *= velMod; 
+        }
 
-        cachedWeight[i] = stdWeight; m1Std += cSpace * stdWeight; m2Std += cSpace * cSpace * stdWeight; weightSumStd += stdWeight;
-        cachedCenterWeight[i] = centerWeight; m1Ctr += cSpace * centerWeight; m2Ctr += cSpace * cSpace * centerWeight; weightSumCtr += centerWeight;
+        cachedWeight[i] = stdWeight; 
+        m1Std += cSpace * stdWeight; 
+        m2Std += cSpace * cSpace * stdWeight; 
+        weightSumStd += stdWeight;
+        
+        cachedCenterWeight[i] = centerWeight; 
+        m1Ctr += cSpace * centerWeight; 
+        m2Ctr += cSpace * cSpace * centerWeight; 
+        weightSumCtr += centerWeight;
         
         stats.weights[i] = useShiftedCenter ? centerWeight : stdWeight;
     }
@@ -540,7 +570,9 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
     float2 jitterPixelPos = jitterUV * passTexSize;
     float2 baseRenderTC = floor(jitterPixelPos) + 0.5;
     float2 snappedRenderUV = clamp(baseRenderTC * passTexel, minRenderUV, maxRenderUV);
-    float2 localJitterPx = jitterPixelPos - (clamp(baseRenderTC * passTexel, 0.0, 1.0 - passTexel) * passTexSize);
+    
+    // Optimization: Subpixel local offset simplified. Replaces redundant clamp and scaling.
+    float2 localJitterPx = jitterPixelPos - baseRenderTC;
 
     // 4. Fetch center pixel samples
     float3 currentColor = max(0.0, tex2Dlod(sceneTex, float4(snappedRenderUV, 0.0, 0.0)).rgb);
@@ -610,14 +642,18 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
     NeighborhoodStats colorStats = ComputeNeighborhoodStats(cachedSpace, velocityDir, totalPixelMotion, effectivePixelMotion, localJitterPx);
 
     // 9. Fetch and evaluate temporal history 
+    float2 support = (taaUseLanczos3 > 0.5 ? 3.0 : 2.0) * passTexel;
     HistoryData hist;
-    hist.valid = all(historyStableUV >= 0.0) && all(historyStableUV <= 1.0);
+    hist.valid = all(historyStableUV >= support) && all(historyStableUV <= 1.0 - support);
     hist.disocclusion = 1.0; 
     hist.shadowRisk = 0.0; 
     hist.clipDistanceRejection = 0.0;
     hist.confidence = 0.0;
     hist.colorSpace = centerColorSpace;
 
+    float blend = 0.0;
+
+    // Optimization: Skip all expensive filtering/clipping if history is invalid (offscreen/fully disoccluded)
     if (hist.valid)
     {
         hist.disocclusion = ComputeDisocclusion(dvStats, tex2Dlod(historyTex, float4((floor(historyPixelCoord) + 0.5) * passTexel, 0.0, 0.0)).a, histVelMem, passTexSize);
@@ -628,8 +664,6 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
             hist.colorSpace = ToSpace(SampleHistoryCatmullRom5Tap(historyStableUV, passTexSize, passTexel));
         }
 
-        hist.colorSpace = clamp(hist.colorSpace, colorStats.aabbMin, colorStats.aabbMax);
-
         float3 histDelta = hist.colorSpace - colorStats.mu;
         float3 normDelta = histDelta / max(colorStats.sigma * max(taaVarianceGamma, 0.001), 0.001);
         hist.confidence = exp(-dot(normDelta, normDelta) * 0.5);
@@ -639,50 +673,48 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
                             * saturate(abs(max(centerColorSpace.x, kShadowLumaFloor) - max(hist.colorSpace.x, kShadowLumaFloor)) * taaShadowTemporalMult) 
                             * (1.0 - saturate(colorStats.spatialContrast * taaShadowSpatialMult));
         }
-    }
 
-    // 10. Execute AABB Adaptation
-    float3 range9 = colorStats.aabbMax - colorStats.aabbMin;
-    float3 range5 = colorStats.aabbMax5 - colorStats.aabbMin5;
-    float collapseRatio = max(range5.x / max(range9.x, 1e-4), max(range5.y / max(range9.y, 1e-4), range5.z / max(range9.z, 1e-4)));
-    float allowCollapse = smoothstep(taaCollapseRatioMin, taaCollapseRatioMax, collapseRatio);
+        // 10. Execute AABB Adaptation
+        float3 range9 = colorStats.aabbMax - colorStats.aabbMin;
+        float3 range5 = colorStats.aabbMax5 - colorStats.aabbMin5;
+        float collapseRatio = max(range5.x / max(range9.x, 1e-4), max(range5.y / max(range9.y, 1e-4), range5.z / max(range9.z, 1e-4)));
+        float allowCollapse = smoothstep(taaCollapseRatioMin, taaCollapseRatioMax, collapseRatio);
 
-    float3 adaptiveAABBMin = colorStats.aabbMin5; 
-    float3 adaptiveAABBMax = colorStats.aabbMax5;
-    
-    if (taaRoundedAABB > 0.5) { 
-        adaptiveAABBMin = lerp(adaptiveAABBMin, (colorStats.aabbMin + colorStats.aabbMin5) * 0.5, pixelAlignment); 
-        adaptiveAABBMax = lerp(adaptiveAABBMax, (colorStats.aabbMax + colorStats.aabbMax5) * 0.5, pixelAlignment); 
-    }
-    if (taaAdaptiveVariance > 0.5) { 
-        float mAF = smoothstep(taaAdaptiveVarStart, taaAdaptiveVarEnd, effectivePixelMotion); 
-        adaptiveAABBMin = lerp(adaptiveAABBMin, colorStats.aabbMin5, mAF * allowCollapse); 
-        adaptiveAABBMax = lerp(adaptiveAABBMax, colorStats.aabbMax5, mAF * allowCollapse); 
-    }
-    
-    colorStats.aabbMin = adaptiveAABBMin; 
-    colorStats.aabbMax = adaptiveAABBMax;
+        float3 adaptiveAABBMin = colorStats.aabbMin5; 
+        float3 adaptiveAABBMax = colorStats.aabbMax5;
+        
+        if (taaRoundedAABB > 0.5) { 
+            adaptiveAABBMin = lerp(adaptiveAABBMin, (colorStats.aabbMin + colorStats.aabbMin5) * 0.5, pixelAlignment); 
+            adaptiveAABBMax = lerp(adaptiveAABBMax, (colorStats.aabbMax + colorStats.aabbMax5) * 0.5, pixelAlignment); 
+        }
+        if (taaAdaptiveVariance > 0.5) { 
+            float mAF = smoothstep(taaAdaptiveVarStart, taaAdaptiveVarEnd, effectivePixelMotion); 
+            adaptiveAABBMin = lerp(adaptiveAABBMin, colorStats.aabbMin5, mAF * allowCollapse); 
+            adaptiveAABBMax = lerp(adaptiveAABBMax, colorStats.aabbMax5, mAF * allowCollapse); 
+        }
+        
+        colorStats.aabbMin = adaptiveAABBMin; 
+        colorStats.aabbMax = adaptiveAABBMax;
 
-    float dynamicGamma = max(taaVarianceGamma, 0.0);
-    if (taaShadowMitigation > 0.5) { 
-        dynamicGamma += (hist.shadowRisk * max(taaVarianceGamma, taaShadowVarianceBase)) * (1.0 - hist.disocclusion); 
-    }
+        float dynamicGamma = max(taaVarianceGamma, 0.0);
+        if (taaShadowMitigation > 0.5) { 
+            dynamicGamma += (hist.shadowRisk * max(taaVarianceGamma, taaShadowVarianceBase)) * (1.0 - hist.disocclusion); 
+        }
 
-    // 11. History Clipping and metrics
-    float3 unclippedHistorySpace = hist.colorSpace;
-    hist.colorSpace = ClipHistory(hist.colorSpace, colorStats, effectivePixelMotion, dynamicGamma, cachedSpace, localJitterPx);
+        // 11. History Clipping and metrics
+        float3 unclippedHistorySpace = hist.colorSpace;
+        hist.colorSpace = ClipHistory(hist.colorSpace, colorStats, effectivePixelMotion, dynamicGamma, cachedSpace, localJitterPx);
+        hist.colorSpace = clamp(hist.colorSpace, colorStats.aabbMin, colorStats.aabbMax);
 
-    if (taaClipDistanceRejectionEnabled > 0.5 && hist.valid) { 
-        float clipDistance = length(unclippedHistorySpace - hist.colorSpace);
-        hist.clipDistanceRejection = saturate((clipDistance - taaClipDistanceRejectionMinError) / max(taaClipDistanceRejectionAmount, 1e-5)); 
-    }
+        if (taaClipDistanceRejectionEnabled > 0.5) { 
+            float clipDistance = length(unclippedHistorySpace - hist.colorSpace);
+            hist.clipDistanceRejection = saturate((clipDistance - taaClipDistanceRejectionMinError) / max(taaClipDistanceRejectionAmount, 1e-5)); 
+        }
 
-    // 12. Gamut compression
-    hist.colorSpace = CompressGamut(hist.colorSpace, currentColor);
+        // 12. Gamut compression
+        hist.colorSpace = CompressGamut(hist.colorSpace, currentColor);
 
-    // 13. Final Blend factor mapping
-    float blend = 0.0;
-    if (hist.valid) {
+        // 13. Final Blend factor mapping
         float motionBlendEnd = max(taaMotionBlendDropSpeed, taaMotionBlendStart + kMinMotionBlendDropSpeed);
         blend = lerp(taaFeedbackMax, taaFeedbackMin, smoothstep(taaMotionBlendStart, motionBlendEnd, effectivePixelMotion));
         
