@@ -64,7 +64,6 @@ static const float2 kOffsets3x3[9] =
     float2( 1, -1), float2(-1,  1), float2( 1,  1)
 };
 
-// Optimization: Precalculated mathematical constants for the 3x3 loop
 static const float kStdWeights[9] = { 1.0, 0.36787944, 0.36787944, 0.36787944, 0.36787944, 0.13533528, 0.13533528, 0.13533528, 0.13533528 };
 static const float kInvLength[9]  = { 0.0, 1.0, 1.0, 1.0, 1.0, 0.70710678, 0.70710678, 0.70710678, 0.70710678 };
 
@@ -93,7 +92,7 @@ static const float3x3 kLMS_TO_RGB = float3x3(4.07674166, -3.30771159,  0.2309699
 
 float3 RGBToOklab(float3 c) { return mul(kLMS_TO_OKLAB, pow(max(mul(kRGB_TO_LMS, c), 0.0), 1.0 / 3.0)); }
 float3 OklabToRGB(float3 c) { float3 l = mul(kOKLAB_TO_LMS, c); return mul(kLMS_TO_RGB, l * l * l); }
-float3 RGBToYCoCg(float3 c) { return float3(0.25 * c.r + 0.5 * c.g + 0.25 * c.b, 0.5 * c.r  - 0.5 * c.b, -0.25 * c.r + 0.5 * c.g - 0.25 * c.b); }
+float3 RGBToYCoCg(float3 c) { return float3(0.25 * c.r + 0.5 * c.g + 0.25 * c.b, 0.5 * c.r - 0.5 * c.b, -0.25 * c.r + 0.5 * c.g - 0.25 * c.b); }
 float3 YCoCgToRGB(float3 c) { return float3(c.x + c.y - c.z, c.x + c.z, c.x - c.y - c.z); }
 
 float3 ToSpace(float3 rgb) { return (taaColorSpaceOklab > 0.5) ? RGBToOklab(rgb) : RGBToYCoCg(rgb); }
@@ -131,15 +130,15 @@ float2 ReprojectUV(float2 uv, float sp, float cp, float sy, float cy)
 float LinearizeDepth(float rawDepth) { return 1.0 / max(rawDepth, kEpsilon); }
 
 // ============================================================================
-// FALLBACK FXAA
+// FALLBACK FXAA (Bandwidth-Optimized with Cached Neighborhood)
 // ============================================================================
-float3 ApplyFXAA(float2 uv, float2 texel, float3 centerColor) 
+float3 ApplyFXAACached(float2 uv, float2 texel, float3 cachedRGB[9]) 
 {
-    float lumaNW = PerceptualLuma(tex2Dlod(sceneTex, float4(uv + float2(-1.0, -1.0) * texel, 0.0, 0.0)).rgb);
-    float lumaNE = PerceptualLuma(tex2Dlod(sceneTex, float4(uv + float2( 1.0, -1.0) * texel, 0.0, 0.0)).rgb);
-    float lumaSW = PerceptualLuma(tex2Dlod(sceneTex, float4(uv + float2(-1.0,  1.0) * texel, 0.0, 0.0)).rgb);
-    float lumaSE = PerceptualLuma(tex2Dlod(sceneTex, float4(uv + float2( 1.0,  1.0) * texel, 0.0, 0.0)).rgb);
-    float lumaM  = PerceptualLuma(centerColor);
+    float lumaNW = PerceptualLuma(cachedRGB[5]);
+    float lumaNE = PerceptualLuma(cachedRGB[6]);
+    float lumaSW = PerceptualLuma(cachedRGB[7]);
+    float lumaSE = PerceptualLuma(cachedRGB[8]);
+    float lumaM  = PerceptualLuma(cachedRGB[0]);
 
     float lumaMin = min(lumaM, min(min(lumaNW, lumaNE), min(lumaSW, lumaSE)));
     float lumaMax = max(lumaM, max(max(lumaNW, lumaNE), max(lumaSW, lumaSE)));
@@ -189,18 +188,36 @@ float3 SampleHistoryLanczos3(float2 uv, float2 texSize, float2 invTexSize, float
     }
     [unroll] for (int i = 0; i < 6; ++i) { wX[i] /= sumX; wY[i] /= sumY; }
 
+    float uvsX[6], uvsY[6];
+    [unroll]
+    for (int k = 0; k < 6; ++k)
+    {
+        uvsX[k] = clamp((tc.x + float(k - 2)) * invTexSize.x, minUV.x, maxUV.x);
+        uvsY[k] = clamp((tc.y + float(k - 2)) * invTexSize.y, minUV.y, maxUV.y);
+    }
+
     float3 color = 0.0;
+    float3 centerMin = kLargeValue;
+    float3 centerMax = -kLargeValue;
+
     [unroll]
     for (int y = 0; y < 6; ++y)
     {
         [unroll]
         for (int x = 0; x < 6; ++x)
         {
-            float2 tapUV = clamp((tc + float2(float(x) - 2.0, float(y) - 2.0)) * invTexSize, minUV, maxUV);
-            color += tex2Dlod(historyTex, float4(tapUV, 0.0, 0.0)).rgb * (wX[x] * wY[y]);
+            float3 tapColor = tex2Dlod(historyTex, float4(uvsX[x], uvsY[y], 0.0, 0.0)).rgb;
+            color += tapColor * (wX[x] * wY[y]);
+
+            if ((x == 2 || x == 3) && (y == 2 || y == 3))
+            {
+                centerMin = min(centerMin, tapColor);
+                centerMax = max(centerMax, tapColor);
+            }
         }
     }
-    return max(0.0, color);
+
+    return clamp(color, centerMin, centerMax);
 }
 
 float3 SampleHistoryCatmullRom5Tap(float2 uv, float2 texSize, float2 invTexSize)
@@ -210,7 +227,6 @@ float3 SampleHistoryCatmullRom5Tap(float2 uv, float2 texSize, float2 invTexSize)
     float2 f = samplePos - tc;
     float2 f2 = f * f;
 
-    // Optimization: Horner's form for MAD instruction native mapping
     float2 w0 = f * (f * (-0.5 * f + 1.0) - 0.5);
     float2 w1 = 1.0 + f2 * (1.5 * f - 2.5);
     float2 w2 = f * (f * (-1.5 * f + 2.0) + 0.5);
@@ -223,18 +239,26 @@ float3 SampleHistoryCatmullRom5Tap(float2 uv, float2 texSize, float2 invTexSize)
     float2 tc3 = (tc + 2.0) * invTexSize;
     float2 tc12 = (tc + offset12) * invTexSize;
 
-    float3 color = 0.0;
-    float wsum = (w12.x * w0.y) + (w0.x * w12.y) + (w12.x * w12.y) + (w3.x * w12.y) + (w12.x * w3.y);
-    
-    color += tex2Dlod(historyTex, float4(tc12.x, tc0.y, 0.0, 0.0)).rgb * (w12.x * w0.y);
-    color += tex2Dlod(historyTex, float4(tc0.x, tc12.y, 0.0, 0.0)).rgb * (w0.x * w12.y);
-    color += tex2Dlod(historyTex, float4(tc12.x, tc12.y, 0.0, 0.0)).rgb * (w12.x * w12.y);
-    color += tex2Dlod(historyTex, float4(tc3.x, tc12.y, 0.0, 0.0)).rgb * (w3.x * w12.y);
-    color += tex2Dlod(historyTex, float4(tc12.x, tc3.y, 0.0, 0.0)).rgb * (w12.x * w3.y);
-    
+    float3 tap0 = tex2Dlod(historyTex, float4(tc12.x, tc0.y, 0.0, 0.0)).rgb;
+    float3 tap1 = tex2Dlod(historyTex, float4(tc0.x, tc12.y, 0.0, 0.0)).rgb;
+    float3 tap2 = tex2Dlod(historyTex, float4(tc12.x, tc12.y, 0.0, 0.0)).rgb;
+    float3 tap3 = tex2Dlod(historyTex, float4(tc3.x, tc12.y, 0.0, 0.0)).rgb;
+    float3 tap4 = tex2Dlod(historyTex, float4(tc12.x, tc3.y, 0.0, 0.0)).rgb;
+
+    float w0y   = w12.x * w0.y;
+    float w0x   = w0.x * w12.y;
+    float w12xy = w12.x * w12.y;
+    float w3x   = w3.x * w12.y;
+    float w3y   = w12.x * w3.y;
+
+    float3 color = tap0 * w0y + tap1 * w0x + tap2 * w12xy + tap3 * w3x + tap4 * w3y;
+    float wsum = w0y + w0x + w12xy + w3x + w3y;
     color /= max(wsum, 1e-4);
 
-    return max(0.0, color);
+    float3 ringMin = min(tap0, min(tap1, min(tap2, min(tap3, tap4))));
+    float3 ringMax = max(tap0, max(tap1, max(tap2, max(tap3, tap4))));
+
+    return clamp(color, ringMin, ringMax);
 }
 
 // ============================================================================
@@ -260,10 +284,9 @@ NeighborhoodStats ComputeNeighborhoodStats(float3 cachedSpace[9], float2 velocit
     NeighborhoodStats stats; stats.validCovariance = false;
     stats.aabbMin  = kLargeValue; stats.aabbMax  = -kLargeValue; stats.aabbMin5 = kLargeValue; stats.aabbMax5 = -kLargeValue;
 
-    float3 m1Std = 0.0, m2Std = 0.0, m1Ctr = 0.0, m2Ctr = 0.0;
-    float weightSumStd = 0.0, weightSumCtr = 0.0;
+    float3 m1 = 0.0, m2 = 0.0;
+    float weightSum = 0.0;
     float motionFactor = saturate(pixelMotion);
-    float cachedWeight[9], cachedCenterWeight[9];
 
     bool useShiftedCenter = (taaJitterAwareVariance > 0.5);
     float2 centerShift = useShiftedCenter ? localJitterPx : 0.0;
@@ -278,45 +301,33 @@ NeighborhoodStats ComputeNeighborhoodStats(float3 cachedSpace[9], float2 velocit
         stats.aabbMax = max(stats.aabbMax, cSpace);
         if (i < 5) { stats.aabbMin5 = min(stats.aabbMin5, cSpace); stats.aabbMax5 = max(stats.aabbMax5, cSpace); }
 
-        // Optimization: Removed dynamic exp() and dot() leveraging pre-computed static array constants
-        float stdWeight = kStdWeights[i];
         float2 shiftOffset = pixelOffset - centerShift;
-        float centerWeight = exp(-dot(shiftOffset, shiftOffset) * 0.5);
+        float w = useShiftedCenter ? exp(-dot(shiftOffset, shiftOffset) * 0.5) : kStdWeights[i];
 
         if (taaLumaVariance > 0.5) { 
-            float lumaMod = 1.0 / (1.0 + cSpace.x); 
-            stdWeight *= lumaMod; 
-            centerWeight *= lumaMod; 
+            w *= (1.0 / (1.0 + max(cSpace.x, 0.0))); 
         }
         if (taaVelocityAlignedVariance > 0.5 && i > 0) { 
-            // Optimization: Replaced normalize() with kInvLength
-            float velMod = lerp(1.0, saturate(dot(pixelOffset, velocityDir) * kInvLength[i] * 0.5 + 0.5), motionFactor); 
-            stdWeight *= velMod; 
-            centerWeight *= velMod; 
+            w *= lerp(1.0, saturate(dot(pixelOffset, velocityDir) * kInvLength[i] * 0.5 + 0.5), motionFactor); 
         }
 
-        cachedWeight[i] = stdWeight; 
-        m1Std += cSpace * stdWeight; 
-        m2Std += cSpace * cSpace * stdWeight; 
-        weightSumStd += stdWeight;
-        
-        cachedCenterWeight[i] = centerWeight; 
-        m1Ctr += cSpace * centerWeight; 
-        m2Ctr += cSpace * cSpace * centerWeight; 
-        weightSumCtr += centerWeight;
-        
-        stats.weights[i] = useShiftedCenter ? centerWeight : stdWeight;
+        stats.weights[i] = w;
+        m1 += cSpace * w; 
+        m2 += cSpace * cSpace * w; 
+        weightSum += w;
     }
 
-    float3 muEarly = m1Std / weightSumStd;
-    float3 sigmaEarly = sqrt(max(m2Std / weightSumStd - muEarly * muEarly, 0.0));
+    float invWeightSum = 1.0 / max(weightSum, kEpsilon);
+    stats.mu = m1 * invWeightSum;
+    stats.sigma = sqrt(max(m2 * invWeightSum - stats.mu * stats.mu, 0.0));
 
-    float3 fireflyMin = muEarly - taaFireflyClamp * sigmaEarly; float3 fireflyMax = muEarly + taaFireflyClamp * sigmaEarly;
-    stats.aabbMin  = clamp(stats.aabbMin, fireflyMin, fireflyMax); stats.aabbMax  = clamp(stats.aabbMax, fireflyMin, fireflyMax);
-    stats.aabbMin5 = clamp(stats.aabbMin5, fireflyMin, fireflyMax); stats.aabbMax5 = clamp(stats.aabbMax5, fireflyMin, fireflyMax);
+    float3 fireflyMin = stats.mu - taaFireflyClamp * stats.sigma; 
+    float3 fireflyMax = stats.mu + taaFireflyClamp * stats.sigma;
+    stats.aabbMin  = clamp(stats.aabbMin, fireflyMin, fireflyMax); 
+    stats.aabbMax  = clamp(stats.aabbMax, fireflyMin, fireflyMax);
+    stats.aabbMin5 = clamp(stats.aabbMin5, fireflyMin, fireflyMax); 
+    stats.aabbMax5 = clamp(stats.aabbMax5, fireflyMin, fireflyMax);
 
-    stats.mu = useShiftedCenter ? (m1Ctr / max(weightSumCtr, kEpsilon)) : muEarly;
-    stats.sigma = useShiftedCenter ? sqrt(max(m2Ctr / max(weightSumCtr, kEpsilon) - stats.mu * stats.mu, 0.0)) : sigmaEarly;
     stats.spatialContrast = max(stats.aabbMax.x - stats.aabbMin.x, 0.001);
 
     float3 gradX = localJitterPx.x > 0.0 ? (cachedSpace[4] - cachedSpace[0]) : (cachedSpace[3] - cachedSpace[0]);
@@ -329,14 +340,13 @@ NeighborhoodStats ComputeNeighborhoodStats(float3 cachedSpace[9], float2 velocit
         [unroll]
         for (int j = 0; j < 9; ++j)
         {
-            float3 d = cachedSpace[j] - stats.mu; float w = useShiftedCenter ? cachedCenterWeight[j] : cachedWeight[j];
+            float3 d = cachedSpace[j] - stats.mu; float w = stats.weights[j];
             cov[0][0] += d.x * d.x * w; cov[0][1] += d.x * d.y * w; cov[0][2] += d.x * d.z * w;
             cov[1][1] += d.y * d.y * w; cov[1][2] += d.y * d.z * w; cov[2][2] += d.z * d.z * w;
         }
 
-        float cWeightSum = useShiftedCenter ? weightSumCtr : weightSumStd;
-        cov[0][0] /= cWeightSum; cov[0][1] /= cWeightSum; cov[0][2] /= cWeightSum;
-        cov[1][1] /= cWeightSum; cov[1][2] /= cWeightSum; cov[2][2] /= cWeightSum;
+        cov[0][0] *= invWeightSum; cov[0][1] *= invWeightSum; cov[0][2] *= invWeightSum;
+        cov[1][1] *= invWeightSum; cov[1][2] *= invWeightSum; cov[2][2] *= invWeightSum;
 
         cov[0][0] += kEpsilon; cov[1][1] += kEpsilon; cov[2][2] += kEpsilon;
 
@@ -382,19 +392,40 @@ NeighborhoodStats ComputeNeighborhoodStats(float3 cachedSpace[9], float2 velocit
 }
 
 // ============================================================================
-// AABB CLIPPING
+// EXACT RAY-AABB INTERSECTION CLIPPING (Salvi / Karis)
 // ============================================================================
-float3 ClipAABB(float3 history, float3 boxMin, float3 boxMax, float softClip, float motionFactor)
+float3 IntersectRayAABB(float3 history, float3 target, float3 boxMin, float3 boxMax, float softClip, float motionFactor)
 {
-    float3 center = 0.5 * (boxMax + boxMin);
-    float3 extents = max(0.5 * (boxMax - boxMin), kEpsilon);
-    float3 offset = history - center;
-    float maxUnit = max(abs(offset.x / extents.x), max(abs(offset.y / extents.y), abs(offset.z / extents.z)));
+    float3 pClip = 0.5 * (boxMax + boxMin);
+    float3 eClip = max(0.5 * (boxMax - boxMin), kEpsilon);
 
-    if (maxUnit > 1.0)
+    float3 vClip = history - pClip;
+    float3 vUnit = vClip / eClip;
+    float3 aUnit = abs(vUnit);
+    float maUnit = max(aUnit.x, max(aUnit.y, aUnit.z));
+
+    if (maUnit > 1.0)
     {
-        float softLimit = 1.0 + softClip * (1.0 - exp(-(maxUnit - 1.0)));
-        return center + (offset / maxUnit) * lerp(softLimit, 1.0, motionFactor);
+        float3 rayDir = target - history;
+        // Vector-safe non-zero sign generation compatible across all HLSL/GLSL cross-compilers
+        float3 s = step(0.0, rayDir) * 2.0 - 1.0;
+        float3 invDir = 1.0 / (s * max(abs(rayDir), 1e-7));
+        
+        float3 t0 = (boxMin - history) * invDir;
+        float3 t1 = (boxMax - history) * invDir;
+        
+        float3 tMin = min(t0, t1);
+        float tHit = saturate(max(max(tMin.x, tMin.y), tMin.z));
+
+        float3 clipped = history + rayDir * tHit;
+        
+        if (softClip > 0.0)
+        {
+            float softLimit = 1.0 + softClip * (1.0 - exp(-(maUnit - 1.0)));
+            float blendSoft = lerp(softLimit, 1.0, motionFactor);
+            clipped = lerp(history, clipped, 1.0 / max(blendSoft, 1.0));
+        }
+        return clipped;
     }
     return history;
 }
@@ -478,10 +509,12 @@ float3 ClipHistory(float3 historySpace, NeighborhoodStats stats, float effective
                 }
             }
 
-            float dir_dot = dot(dir, axis); float inv_dir = 1.0 / (abs(dir_dot) > 1e-7 ? dir_dot : 1e-7 * sign(dir_dot + 1e-8));
+            float dir_dot = dot(dir, axis); 
+            float s_dot = (dir_dot >= 0.0 ? 1.0 : -1.0);
+            float inv_dir = 1.0 / (s_dot * max(abs(dir_dot), 1e-7));
             float t0 = (extents.x - proj_pos) * inv_dir; float t1 = (extents.y - proj_pos) * inv_dir;
 
-            nearHit = max(nearHit, min(t0, t1)); farHit  = min(farHit, max(t0, t1));
+            nearHit = max(nearHit, min(t0, t1)); farHit = min(farHit, max(t0, t1));
         }
 
         if (nearHit <= farHit && (nearHit > 0.0 || farHit > 0.0))
@@ -503,13 +536,15 @@ float3 ClipHistory(float3 historySpace, NeighborhoodStats stats, float effective
     {
         float3 diff = historySpace - stats.mu; float d2 = dot(diff, mul(stats.invCov, diff)); float gamma2 = dynamicGamma * dynamicGamma;
         float3 clipped = (d2 > gamma2 && d2 > kEpsilon) ? (stats.mu + diff * (dynamicGamma / sqrt(d2))) : historySpace;
-        return ClipAABB(clipped, stats.aabbMin, stats.aabbMax, taaSoftClip, motionFactor);
+        return IntersectRayAABB(clipped, stats.mu, stats.aabbMin, stats.aabbMax, taaSoftClip, motionFactor);
     }
 
     float3 chromaWeights = float3(1.0, taaChromaVarianceMod, taaChromaVarianceMod);
     float3 extents = stats.sigma * dynamicGamma * chromaWeights;
+    float3 bMin = max(stats.mu - extents, stats.aabbMin);
+    float3 bMax = min(stats.mu + extents, stats.aabbMax);
 
-    return ClipAABB(historySpace, max(stats.mu - extents, stats.aabbMin), min(stats.mu + extents, stats.aabbMax), taaSoftClip, motionFactor);
+    return IntersectRayAABB(historySpace, stats.mu, bMin, bMax, taaSoftClip, motionFactor);
 }
 
 // ============================================================================
@@ -570,8 +605,6 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
     float2 jitterPixelPos = jitterUV * passTexSize;
     float2 baseRenderTC = floor(jitterPixelPos) + 0.5;
     float2 snappedRenderUV = clamp(baseRenderTC * passTexel, minRenderUV, maxRenderUV);
-    
-    // Optimization: Subpixel local offset simplified. Replaces redundant clamp and scaling.
     float2 localJitterPx = jitterPixelPos - baseRenderTC;
 
     // 4. Fetch center pixel samples
@@ -585,7 +618,7 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
     float totalPixelMotion = length(pixelVel);
     float2 velocityDir = (totalPixelMotion > taaMinMotionDir) ? normalize(pixelVel) : float2(1.0, 0.0);
 
-    // 6. Gather 3x3 neighborhood data
+    // 6. Gather 3x3 neighborhood data (Caching RGB for zero-fetch fallback FXAA)
     DepthVelocityStats dvStats;
     dvStats.closestRawDepth = centerRawDepth;
     dvStats.bestVel = centerVel;
@@ -594,32 +627,30 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
     dvStats.minRawDepthSearch = centerRawDepth; 
     dvStats.maxRawDepthSearch = centerRawDepth;
 
+    float3 cachedRGB[9];
     float3 cachedSpace[9];
+    cachedRGB[0] = currentColor;
+    cachedSpace[0] = centerColorSpace;
+
     [unroll]
-    for (int i = 0; i < 9; ++i)
+    for (int i = 1; i < 9; ++i)
     {
-        if (i == 0) 
-        {
-            cachedSpace[0] = centerColorSpace;
-        } 
-        else 
-        {
-            float2 offsetUV = clamp((baseRenderTC + kOffsets3x3[i]) * passTexel, minRenderUV, maxRenderUV);
-            float dRaw = tex2Dlod(depthTex, float4(offsetUV, 0.0, 0.0)).r; 
-            float2 v = tex2Dlod(velocityTex, float4(offsetUV, 0.0, 0.0)).rg;
-            float3 cSpace = ToSpace(max(0.0, tex2Dlod(sceneTex, float4(offsetUV, 0.0, 0.0)).rgb));
+        float2 offsetUV = clamp((baseRenderTC + kOffsets3x3[i]) * passTexel, minRenderUV, maxRenderUV);
+        float dRaw = tex2Dlod(depthTex, float4(offsetUV, 0.0, 0.0)).r; 
+        float2 v = tex2Dlod(velocityTex, float4(offsetUV, 0.0, 0.0)).rg;
+        float3 cRGB = max(0.0, tex2Dlod(sceneTex, float4(offsetUV, 0.0, 0.0)).rgb);
 
-            dvStats.minVel = min(dvStats.minVel, v); 
-            dvStats.maxVel = max(dvStats.maxVel, v);
-            dvStats.minRawDepthSearch = min(dvStats.minRawDepthSearch, dRaw); 
-            dvStats.maxRawDepthSearch = max(dvStats.maxRawDepthSearch, dRaw);
+        dvStats.minVel = min(dvStats.minVel, v); 
+        dvStats.maxVel = max(dvStats.maxVel, v);
+        dvStats.minRawDepthSearch = min(dvStats.minRawDepthSearch, dRaw); 
+        dvStats.maxRawDepthSearch = max(dvStats.maxRawDepthSearch, dRaw);
 
-            if (taaUseDepthDilation > 0.5 && dRaw > dvStats.closestRawDepth) { 
-                dvStats.closestRawDepth = dRaw; 
-                dvStats.bestVel = v; 
-            }
-            cachedSpace[i] = cSpace;
+        if (taaUseDepthDilation > 0.5 && dRaw > dvStats.closestRawDepth) { 
+            dvStats.closestRawDepth = dRaw; 
+            dvStats.bestVel = v; 
         }
+        cachedRGB[i] = cRGB;
+        cachedSpace[i] = ToSpace(cRGB);
     }
 
     // 7. Evaluate history UVs and stored velocity
@@ -653,7 +684,6 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
 
     float blend = 0.0;
 
-    // Optimization: Skip all expensive filtering/clipping if history is invalid (offscreen/fully disoccluded)
     if (hist.valid)
     {
         hist.disocclusion = ComputeDisocclusion(dvStats, tex2Dlod(historyTex, float4((floor(historyPixelCoord) + 0.5) * passTexel, 0.0, 0.0)).a, histVelMem, passTexSize);
@@ -724,15 +754,15 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
         blend = lerp(blend, 0.0, hist.disocclusion);
     }
 
-    // 14. Fallback edge smoothing
+    // 14. Fallback edge smoothing (Reuses cached RGB)
     float fxaaBlend = saturate((0.8 - blend) * 2.0);
     if (taaFallbackFXAA > 0.5 && fxaaBlend > 0.0)
     {
-        float3 fxaaColor = ApplyFXAA(snappedRenderUV, passTexel, currentColor);
+        float3 fxaaColor = ApplyFXAACached(snappedRenderUV, passTexel, cachedRGB);
         centerColorSpace = lerp(centerColorSpace, ToSpace(fxaaColor), fxaaBlend);
     }
 
-    // Resolve outputs
+    // 15. Resolve outputs
     float3 blendedSpace = lerp(centerColorSpace, hist.colorSpace, blend);
     return float4(FromSpace(blendedSpace), centerRawDepth);
 }
