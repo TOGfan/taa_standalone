@@ -11,13 +11,13 @@
       </div>
     </div>
 
-    <!-- Presets Bar -->
+   <!-- Presets Bar -->
     <div class="options-presets">
-      <span class="preset-label">Presets:</span>
+      <!-- <span class="preset-label">Presets:</span> -->
       <BngButton class="preset-btn" :accent="ACCENTS.outlined" @click="applyPreset(presets.Performance)">Performance</BngButton>
       <BngButton class="preset-btn" :accent="ACCENTS.outlined" @click="applyPreset(presets.Balanced)">Balanced</BngButton>
-      <BngButton class="preset-btn" :accent="ACCENTS.outlined" @click="applyPreset(presets.Smooth)">Quality - Smooth</BngButton>
-      <BngButton class="preset-btn" :accent="ACCENTS.outlined" @click="applyPreset(presets.Clarity)">Quality - Clarity</BngButton>
+      <BngButton class="preset-btn" :accent="ACCENTS.outlined" @click="applyPreset(presets.Smooth)">Smooth</BngButton>
+      <BngButton class="preset-btn" :accent="ACCENTS.outlined" @click="applyPreset(presets.Clarity)">Clarity</BngButton>
     </div>
 
     <!-- Main Scrollable List -->
@@ -89,6 +89,43 @@
               </div>
             </div>
 
+            <!-- Bottom Half: Custom Dropdown Select (For Debug Modes) -->
+            <div v-if="item.type === 'select'" class="stacked-controls select-control">
+              <!-- Invisible overlay to close dropdown when clicking outside -->
+              <div v-if="openDropdown === item.id" class="dropdown-backdrop" @click="openDropdown = null"></div>
+
+              <!-- Custom Dropdown Component -->
+              <div class="custom-dropdown-container" :class="{ 'is-open': openDropdown === item.id, 'is-disabled': !isActive }">
+                <div class="dropdown-selected" @click="toggleDropdown(item.id)">
+                  <span>{{ getOptionLabel(item, config[item.id]) }}</span>
+                  <span class="dropdown-arrow">▼</span>
+                </div>
+                
+                <div class="dropdown-list" v-if="openDropdown === item.id">
+                  <div
+                    v-for="opt in item.options"
+                    :key="opt.value"
+                    class="dropdown-option"
+                    :class="{ 'is-active': config[item.id] === opt.value }"
+                    @click="selectOption(item, opt.value)"
+                  >
+                    {{ opt.label }}
+                  </div>
+                </div>
+              </div>
+
+              <div class="option-reset">
+                <BngButton 
+                  :icon="icons.undo"
+                  :accent="ACCENTS.outlined"
+                  @click="resetSetting(item)"
+                  class="bng-reset-btn"
+                  :style="{ visibility: config[item.id] !== item.default ? 'visible' : 'hidden' }"
+                  title="Reset to default"
+                />
+              </div>
+            </div>
+
           </div>
         </div>
       </details>
@@ -118,8 +155,8 @@ import { BngButton, BngSwitch, BngSlider, icons, ACCENTS } from "@/common/compon
 const isActive = ref(false)
 const config = ref({})
 const hoveredItem = ref(null)
+const openDropdown = ref(null) // Tracks which dropdown is currently open
 
-// Exact order and structure matching your Lua setup
 const settingsSchema = [
   {
     name: "General & Sharpening",
@@ -133,11 +170,11 @@ const settingsSchema = [
   {
     name: "History & Blending",
     items: [
-      { id: 'feedbackMax', type: 'float', min: 0.0, max: 0.99, step: 0.01, default: 0.99, name: "Static Blend Weight", desc: "Determines how much history is kept for stationary objects." },
-      { id: 'feedbackMin', type: 'float', min: 0.0, max: 0.99, step: 0.01, default: 0.99, name: "Motion Blend Weight", desc: "Determines how much history is kept for moving objects." },
+      { id: 'feedbackMax', type: 'float', min: 0.0, max: 0.99, step: 0.01, default: 0.97, name: "Static Blend Weight", desc: "Determines how much history is kept for stationary objects." },
+      { id: 'feedbackMin', type: 'float', min: 0.0, max: 0.99, step: 0.01, default: 0.97, name: "Motion Blend Weight", desc: "Determines how much history is kept for moving objects." },
       { id: 'motionBlendStart', type: 'float', min: 0.0, max: 5.0, step: 0.01, default: 1.0, name: "Motion Blend Start Velocity", desc: "Minimum velocity threshold before starting to lower blend weight." },
       { id: 'motionBlendDropSpeed', type: 'float', min: 1.0, max: 20.0, step: 0.1, default: 1.0, name: "Motion Blend Drop Velocity", desc: "The pixel velocity magnitude required to transition fully from static to motion blend weights." },
-      { id: 'alignmentFeedbackDrop', type: 'float', min: 0.5, max: 1.0, step: 0.01, default: 0.9, name: "Sub-Pixel Alignment Blend Drop", desc: "Multiplier applied to the temporal blend weight based on sub-pixel misalignment." },
+      { id: 'alignmentFeedbackDrop', type: 'float', min: 0.5, max: 1.0, step: 0.01, default: 0.8, name: "Sub-Pixel Alignment Blend Drop", desc: "Multiplier applied to the temporal blend weight based on sub-pixel misalignment." },
       { id: 'alignmentRCASBoost', type: 'float', min: 0.0, max: 1.0, step: 0.01, default: 0.0, name: "Sub-Pixel Alignment RCAS Boost", desc: "Additional RCAS sharpening applied dynamically based on sub-pixel misalignment." }
     ]
   },
@@ -192,8 +229,8 @@ const settingsSchema = [
   {
     name: "Advanced Rejection",
     items: [
-      { id: 'depthRejection', type: 'float', min: 0.0, max: 5.0, step: 0.01, default: 0.0, name: "Depth Mismatch Rejection", desc: "Multiplier for rejecting history samples based on linear depth differences." },
-      { id: 'velDisocclusion', type: 'float', min: 0.0, max: 5.0, step: 0.01, default: 0.3, name: "Velocity Mismatch Rejection", desc: "Multiplier for rejecting history samples based on motion vector differences." },
+      { id: 'depthRejection', type: 'float', min: 0.0, max: 1.0, step: 0.01, default: 1.0, name: "Depth Mismatch Rejection", desc: "Multiplier for rejecting history samples based on linear depth differences." },
+      { id: 'velDisocclusion', type: 'float', min: 0.0, max: 1.0, step: 0.01, default: 1.0, name: "Velocity Mismatch Rejection", desc: "Multiplier for rejecting history samples based on motion vector differences." },
       { id: 'clipDistanceRejectionEnabled', type: 'numBool', default: 0.0, name: "Clip-Distance Smear Rejection", desc: "Detects severe history clipping distances and drops history weight." },
       { id: 'clipDistanceRejectionAmount', type: 'float', min: 0.0, max: 1.0, step: 0.001, default: 0.0, name: "Smear Rejection Tolerance", desc: "Color clipping tolerance before history is fully rejected." },
       { id: 'clipDistanceRejectionMinError', type: 'float', min: 0.001, max: 0.5, step: 0.001, default: 0.05, name: "Clip Rejection Min Error", desc: "Minimum color divergence required before initiating smear rejection." },
@@ -206,6 +243,27 @@ const settingsSchema = [
       { id: 'velRejMotionScale', type: 'float', min: 0.0, max: 2.0, step: 0.01, default: 0.5, name: "Vel Rej Motion Scale", desc: "Scale multiplier for velocity mismatch magnitude rejection." },
       { id: 'collapseRatioMin', type: 'float', min: 0.0, max: 1.0, step: 0.01, default: 0.05, name: "Collapse Ratio Min", desc: "Lower threshold of neighborhood collapse ratio for adaptive contraction." },
       { id: 'collapseRatioMax', type: 'float', min: 0.0, max: 1.0, step: 0.01, default: 0.35, name: "Collapse Ratio Max", desc: "Upper threshold of neighborhood collapse ratio for adaptive contraction." }
+    ]
+  },
+  {
+    name: "Debug & Diagnostics",
+    items: [
+      { 
+        id: 'debugMode', 
+        type: 'select', 
+        default: 0.0, 
+        name: "Debug View Mode", 
+        desc: "Visualizes internal buffers and rejection masks.\n\n0: Off (Normal)\n1: Motion Vectors (White = Fast)\n2: Raw History Buffer\n3: Disocclusion (Red=Vel, Green=Depth)\n4: Depth Buffer\n5: Shadow Mitigation Proxy\n6: Bypass RCAS (Raw TAA Output)",
+        options: [
+          { label: 'Off (Normal Rendering)', value: 0.0 },
+          { label: 'Motion Vectors', value: 1.0 },
+          { label: 'History Buffer', value: 2.0 },
+          { label: 'Disocclusion Mask', value: 3.0 },
+          { label: 'Linearized Depth', value: 4.0 },
+          { label: 'Shadow Proxy', value: 5.0 },
+          { label: 'Raw TAA Result (No RCAS)', value: 6.0 }
+        ]
+      }
     ]
   }
 ]
@@ -220,13 +278,17 @@ settingsSchema.forEach(cat => {
 const presets = {
   Performance: { useLanczos3: 0, useKDopClipping: 0, colorSpaceOklab: 0, kdopVarianceClipping: 0, useCovarianceClipping: 0 },
   Balanced: { useKDopClipping: 0, colorSpaceOklab: 0, kdopVarianceClipping: 0, useCovarianceClipping: 0 }, 
-  Clarity: { feedbackMax: 0.97, feedbackMin: 0.97, alignmentFeedbackDrop: 0.8, depthRejection: 5, velDisocclusion: 5 },
-  Smooth: { kdopVarianceClipping: 0 }
+  Clarity: { },
+  Smooth: { feedbackMax: 0.99, feedbackMin: 0.99, alignmentFeedbackDrop: 0.9, depthRejection: 0.0 }
 }
 
 function formatDefault(item) {
   if (item.type === 'bool' || item.type === 'numBool') {
     return (item.default === 1 || item.default === true) ? 'Enabled' : 'Disabled'
+  }
+  if (item.type === 'select') {
+    const opt = item.options.find(o => o.value === item.default)
+    return opt ? opt.label : item.default
   }
   return item.default
 }
@@ -244,6 +306,23 @@ function onSliderChange(item, val) {
 function onSwitchChange(item, val) {
   config.value[item.id] = (item.type === 'numBool') ? (val ? 1 : 0) : val;
   updateSetting(item.id);
+}
+
+// Custom Dropdown Functions
+function toggleDropdown(id) {
+  if (!isActive.value) return;
+  openDropdown.value = openDropdown.value === id ? null : id;
+}
+
+function selectOption(item, val) {
+  config.value[item.id] = val;
+  updateSetting(item.id);
+  openDropdown.value = null; // Close menu after selection
+}
+
+function getOptionLabel(item, val) {
+  const opt = item.options.find(o => o.value === val);
+  return opt ? opt.label : val;
 }
 
 function applyPreset(presetOverrides) {
@@ -313,7 +392,7 @@ function updateSetting(key) {
   flex-direction: column;
   width: 100%;
   height: 100%;
-  min-height: 65vh; /* Prevents vertical crushing */
+  min-height: 65vh; 
   overflow: hidden; 
   font-family: 'Overpass', sans-serif;
   color: #fff;
@@ -366,9 +445,9 @@ function updateSetting(key) {
   }
 }
 
-/* Main List Array (Fills remaining center space exactly) */
+/* Main List Array */
 .options-list-scroll {
-  flex: 1 1 0; /* Critical for dynamic scrolling inside flex */
+  flex: 1 1 0; 
   overflow-y: auto;
   overflow-x: hidden;
   width: 100%;
@@ -432,7 +511,7 @@ details[open] > summary.category-title {
   padding: 0.25em 0;
 }
 
-/* Item Rows (Stacked Responsive Layout) */
+/* Item Rows */
 .options-item-row {
   display: flex;
   flex-direction: column;
@@ -445,7 +524,6 @@ details[open] > summary.category-title {
     background-color: transparent;
   }
 
-  /* Top Row of item: Label + Checkbox + Reset */
   .row-header {
     display: flex;
     justify-content: space-between;
@@ -466,7 +544,6 @@ details[open] > summary.category-title {
     }
   }
 
-  /* Bottom Row of item: Native Slider + Reset */
   .stacked-controls {
     display: flex;
     align-items: center;
@@ -481,8 +558,94 @@ details[open] > summary.category-title {
   }
 }
 
+/* ==============================================================
+   Custom Dropdown CSS (Bypasses CEF OSR restrictions)
+   ============================================================== */
 
-/* Reset Button Space (Wider, fixed box so nothing jumps) */
+/* Invisible overlay spanning the whole screen to catch outside clicks */
+.dropdown-backdrop {
+  position: fixed;
+  inset: 0; 
+  z-index: 9998; 
+  cursor: default;
+}
+
+.custom-dropdown-container {
+  position: relative;
+  flex: 1 1 auto;
+  font-size: 0.95rem;
+  z-index: 1; 
+
+  &.is-open {
+    z-index: 9999; /* Lift above the backdrop */
+  }
+  
+  &.is-disabled {
+    opacity: 0.4;
+    pointer-events: none;
+  }
+}
+
+.dropdown-selected {
+  background: rgba(0, 0, 0, 0.4);
+  color: #fff;
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  border-radius: 4px;
+  padding: 0.45em 0.75em;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  cursor: pointer;
+  transition: border-color 0.15s ease;
+  user-select: none;
+
+  &:hover {
+    border-color: rgba(255, 255, 255, 0.4);
+  }
+  
+  .dropdown-arrow {
+    font-size: 0.7em;
+    color: rgba(255, 255, 255, 0.5);
+    margin-left: 0.5em;
+  }
+}
+
+.custom-dropdown-container.is-open .dropdown-selected {
+  border-color: var(--bng-orange-550, #f60);
+  .dropdown-arrow { color: var(--bng-orange-550, #f60); }
+}
+
+.dropdown-list {
+  position: absolute;
+  top: calc(100% + 4px);
+  left: 0;
+  right: 0;
+  background: #1a1a1a;
+  border: 1px solid var(--bng-orange-550, #f60);
+  border-radius: 4px;
+  overflow: hidden;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.5);
+}
+
+.dropdown-option {
+  padding: 0.5em 0.75em;
+  cursor: pointer;
+  color: #ddd;
+  transition: background-color 0.1s;
+  
+  &:hover {
+    background: rgba(255, 102, 0, 0.2); 
+    color: #fff;
+  }
+  
+  &.is-active {
+    background: var(--bng-orange-550, #f60);
+    color: #fff;
+    font-weight: 600;
+  }
+}
+
+/* Reset Button Space */
 .option-reset {
   flex: 0 0 2.5em; 
   width: 2.5em;
@@ -498,9 +661,9 @@ details[open] > summary.category-title {
   }
 }
 
-/* Info Panel at Bottom (Always Visible, Rigid Bounds) */
+/* Info Panel at Bottom */
 .options-info-panel {
-  flex: 0 0 8.0em; /* Stays exactly this height forever */
+  flex: 0 0 8.0em; 
   min-height: 8.0em;
   max-height: 8.0em;
   width: 100%;

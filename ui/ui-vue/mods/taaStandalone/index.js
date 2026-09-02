@@ -6,7 +6,7 @@ export async function onLoad() {
     id: "taa-standalone-settings",
     tabId: "mods",
     label: "TAA Settings",
-    icon: "video", // Uses built-in BeamNG icon
+    icon: "adjust", // Uses built-in BeamNG icon
     componentName: "/ui/ui-vue/mods/taaStandalone/TaaSettings.vue",
   })
 }
