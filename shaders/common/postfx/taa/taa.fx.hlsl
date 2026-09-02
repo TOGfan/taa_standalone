@@ -99,34 +99,48 @@ float3 ToSpace(float3 rgb) { return (taaColorSpaceOklab > 0.5) ? RGBToOklab(rgb)
 float3 FromSpace(float3 c) { return (taaColorSpaceOklab > 0.5) ? OklabToRGB(c) : YCoCgToRGB(c); }
 
 // ============================================================================
-// MATRIX UTILITIES
+// MATRIX UTILITIES (Symmetric Optimized)
 // ============================================================================
-float3x3 Inverse3x3(float3x3 m, out bool success)
+float3x3 InverseSymmetric3x3(float3x3 m, out bool success)
 {
-    float det = m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1]) - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0]) + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0]);
+    float c00 = m[1][1] * m[2][2] - m[1][2] * m[1][2];
+    float c01 = m[0][2] * m[1][2] - m[0][1] * m[2][2];
+    float c02 = m[0][1] * m[1][2] - m[0][2] * m[1][1];
+    
+    float det = m[0][0] * c00 + m[0][1] * c01 + m[0][2] * c02;
     success = (abs(det) > kEpsilon);
-    if (!success) return float3x3(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
-    float invDet = 1.0 / det; float3x3 inv;
-    inv[0][0] = (m[1][1]*m[2][2] - m[2][1]*m[1][2]) * invDet; inv[0][1] = (m[0][2]*m[2][1] - m[0][1]*m[2][2]) * invDet; inv[0][2] = (m[0][1]*m[1][2] - m[0][2]*m[1][1]) * invDet;
-    inv[1][0] = (m[1][2]*m[2][0] - m[1][0]*m[2][2]) * invDet; inv[1][1] = (m[0][0]*m[2][2] - m[0][2]*m[2][0]) * invDet; inv[1][2] = (m[1][0]*m[0][2] - m[0][0]*m[1][2]) * invDet;
-    inv[2][0] = (m[1][0]*m[2][1] - m[2][0]*m[1][1]) * invDet; inv[2][1] = (m[2][0]*m[0][1] - m[0][0]*m[2][1]) * invDet; inv[2][2] = (m[0][0]*m[1][1] - m[1][0]*m[0][1]) * invDet;
+    if (!success) return float3x3(0,0,0, 0,0,0, 0,0,0);
+
+    float invDet = 1.0 / det;
+    float3x3 inv;
+    inv[0][0] = c00 * invDet;
+    inv[0][1] = c01 * invDet;
+    inv[0][2] = c02 * invDet;
+
+    inv[1][0] = c01 * invDet;
+    inv[1][1] = (m[0][0] * m[2][2] - m[0][2] * m[0][2]) * invDet;
+    inv[1][2] = (m[0][1] * m[0][2] - m[0][0] * m[1][2]) * invDet;
+
+    inv[2][0] = c02 * invDet;
+    inv[2][1] = inv[1][2];
+    inv[2][2] = (m[0][0] * m[1][1] - m[0][1] * m[0][1]) * invDet;
+
     return inv;
 }
 
 // ============================================================================
 // REPROJECTION & DEPTH
 // ============================================================================
-float2 ReprojectUV(float2 uv, float sp, float cp, float sy, float cy)
+float2 FastReprojectUV(float2 uv, float3x3 rotMat)
 {
     float2 ndc = float2(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
     float3 ray = float3(ndc.x * taaTanHalfFovX, 1.0, ndc.y * taaTanHalfFovY);
-    
-    float3 r1 = float3(ray.x, ray.y * cp - ray.z * sp, ray.y * sp + ray.z * cp);
-    float3 r2 = float3(r1.x * cy - r1.y * sy, r1.x * sy + r1.y * cy, r1.z);
+    float3 r2 = mul(rotMat, ray);
     
     if (r2.y <= kEpsilon) return float2(-1.0, -1.0);
     return float2((r2.x / (r2.y * taaTanHalfFovX)) * 0.5 + 0.5, 0.5 - (r2.z / (r2.y * taaTanHalfFovY)) * 0.5);
 }
+
 float LinearizeDepth(float rawDepth) { return 1.0 / max(rawDepth, kEpsilon); }
 
 // ============================================================================
@@ -172,21 +186,22 @@ float3 SampleHistoryLanczos3(float2 uv, float2 texSize, float2 invTexSize, float
     float2 tc = floor(samplePos - 0.5) + 0.5;
     float2 f = samplePos - tc;
 
-    float wX[6], wY[6]; float sumX = 0.0, sumY = 0.0;
+    float wX[6], wY[6]; 
+    float2 sumXY = 0.0;
+
     [unroll]
     for (int i = 0; i < 6; ++i)
     {
-        float dx = abs(f.x + float(2 - i));
-        if (dx < 1e-5) wX[i] = 1.0; else if (dx >= 3.0) wX[i] = 0.0;
-        else { float pix = 3.14159265 * dx; wX[i] = 3.0 * sin(pix) * sin(pix / 3.0) / (pix * pix); }
-        sumX += wX[i];
-
-        float dy = abs(f.y + float(2 - i));
-        if (dy < 1e-5) wY[i] = 1.0; else if (dy >= 3.0) wY[i] = 0.0;
-        else { float piy = 3.14159265 * dy; wY[i] = 3.0 * sin(piy) * sin(piy / 3.0) / (piy * piy); }
-        sumY += wY[i];
+        float2 d = abs(f.xy + float(2 - i));
+        float2 piD = 3.14159265 * max(d, 1e-5);
+        float2 w = 3.0 * sin(piD) * sin(piD * (1.0 / 3.0)) / (piD * piD);
+        wX[i] = w.x;
+        wY[i] = w.y;
+        sumXY += w;
     }
-    [unroll] for (int i = 0; i < 6; ++i) { wX[i] /= sumX; wY[i] /= sumY; }
+
+    float2 invSum = 1.0 / max(sumXY, 1e-5);
+    [unroll] for (int j = 0; j < 6; ++j) { wX[j] *= invSum.x; wY[j] *= invSum.y; }
 
     float uvsX[6], uvsY[6];
     [unroll]
@@ -375,7 +390,7 @@ NeighborhoodStats ComputeNeighborhoodStats(float3 cachedSpace[9], float2 velocit
         }
         
         cov[1][0] = cov[0][1]; cov[2][0] = cov[0][2]; cov[2][1] = cov[1][2];
-        stats.invCov = Inverse3x3(cov, stats.validCovariance);
+        stats.invCov = InverseSymmetric3x3(cov, stats.validCovariance);
     }
 
     if (!stats.validCovariance && taaJitterFlickerPadding > kFlickerPadThreshold)
@@ -407,7 +422,6 @@ float3 IntersectRayAABB(float3 history, float3 target, float3 boxMin, float3 box
     if (maUnit > 1.0)
     {
         float3 rayDir = target - history;
-        // Vector-safe non-zero sign generation compatible across all HLSL/GLSL cross-compilers
         float3 s = step(0.0, rayDir) * 2.0 - 1.0;
         float3 invDir = 1.0 / (s * max(abs(rayDir), 1e-7));
         
@@ -569,18 +583,36 @@ float ComputeDisocclusion(DepthVelocityStats dv, float histRawDepth, float2 hist
 }
 
 // ============================================================================
-// GAMUT COMPRESSION
+// GAMUT COMPRESSION (Analytic Chroma Scaling)
 // ============================================================================
 float3 CompressGamut(float3 historySpace, float3 currentRGB)
 {
-    float3 historyRGB = (taaColorSpaceOklab > 0.5) ? OklabToRGB(historySpace) : YCoCgToRGB(historySpace);
-    float minChannel = min(historyRGB.r, min(historyRGB.g, historyRGB.b));
-
-    if (minChannel < 0.0)
+    if (taaColorSpaceOklab > 0.5)
     {
-        float luma = LumaRGB(historyRGB);
-        historyRGB = luma + (historyRGB - luma) * (luma / max(luma - minChannel, kEpsilon));
-        historySpace = (taaColorSpaceOklab > 0.5) ? RGBToOklab(historyRGB) : RGBToYCoCg(historyRGB);
+        float3 historyRGB = OklabToRGB(historySpace);
+        float minChannel = min(historyRGB.r, min(historyRGB.g, historyRGB.b));
+        if (minChannel < 0.0)
+        {
+            float luma = LumaRGB(historyRGB);
+            historyRGB = luma + (historyRGB - luma) * (luma / max(luma - minChannel, kEpsilon));
+            historySpace = RGBToOklab(historyRGB);
+        }
+        return historySpace;
+    }
+
+    float Y  = historySpace.x;
+    float Co = historySpace.y;
+    float Cg = historySpace.z;
+
+    float r = Y + Co - Cg;
+    float g = Y + Cg;
+    float b = Y - Co - Cg;
+
+    float minCh = min(r, min(g, b));
+    if (minCh < 0.0)
+    {
+        float alpha = Y / max(Y - minCh, kEpsilon);
+        historySpace.yz *= alpha;
     }
     return historySpace;
 }
@@ -596,12 +628,24 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
     float2 minRenderUV = 0.5 * passTexel;
     float2 maxRenderUV = 1.0 - minRenderUV;
 
-    // 2. Precompute trigonometric functions ONCE per pixel for reprojection
+    // 2. Precompute trigonometric functions and 3x3 rotation matrices ONCE per pixel
     float sp, cp, sy, cy; sincos(taaJitterPitch, sp, cp); sincos(taaJitterYaw, sy, cy);
     float psp, pcp, psy, pcy; sincos(-taaPrevJitterPitch, psp, pcp); sincos(-taaPrevJitterYaw, psy, pcy);
 
+    float3x3 rotCurr = float3x3(
+         cy, -sy * cp,  sy * sp,
+         sy,  cy * cp, -cy * sp,
+        0.0,       sp,       cp
+    );
+
+    float3x3 rotPrev = float3x3(
+         pcy, -psy * pcp,  psy * psp,
+         psy,  pcy * pcp, -pcy * psp,
+         0.0,        psp,        pcp
+    );
+
     // 3. Compute Jitter UVs
-    float2 jitterUV = ReprojectUV(IN.uv0, sp, cp, sy, cy);
+    float2 jitterUV = FastReprojectUV(IN.uv0, rotCurr);
     float2 jitterPixelPos = jitterUV * passTexSize;
     float2 baseRenderTC = floor(jitterPixelPos) + 0.5;
     float2 snappedRenderUV = clamp(baseRenderTC * passTexel, minRenderUV, maxRenderUV);
@@ -614,11 +658,11 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
     float2 centerVel = tex2Dlod(velocityTex, float4(snappedRenderUV, 0.0, 0.0)).rg;
 
     // 5. Compute current pixel motion
-    float2 pixelVel = (ReprojectUV(jitterUV + centerVel, psp, pcp, psy, pcy) - IN.uv0) * passTexSize;
+    float2 pixelVel = (FastReprojectUV(jitterUV + centerVel, rotPrev) - IN.uv0) * passTexSize;
     float totalPixelMotion = length(pixelVel);
     float2 velocityDir = (totalPixelMotion > taaMinMotionDir) ? normalize(pixelVel) : float2(1.0, 0.0);
 
-    // 6. Gather 3x3 neighborhood data (Caching RGB for zero-fetch fallback FXAA)
+    // 6. Gather 3x3 neighborhood data (Precomputed uvLRBT packing)
     DepthVelocityStats dvStats;
     dvStats.closestRawDepth = centerRawDepth;
     dvStats.bestVel = centerVel;
@@ -626,6 +670,22 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
     dvStats.maxVel = centerVel; 
     dvStats.minRawDepthSearch = centerRawDepth; 
     dvStats.maxRawDepthSearch = centerRawDepth;
+
+    float4 uvLRBT = float4(
+        clamp(snappedRenderUV - passTexel, minRenderUV, maxRenderUV),
+        clamp(snappedRenderUV + passTexel, minRenderUV, maxRenderUV)
+    );
+
+    float2 tapUVs[9];
+    tapUVs[0] = snappedRenderUV;
+    tapUVs[1] = float2(snappedRenderUV.x, uvLRBT.y);
+    tapUVs[2] = float2(snappedRenderUV.x, uvLRBT.w);
+    tapUVs[3] = float2(uvLRBT.x, snappedRenderUV.y);
+    tapUVs[4] = float2(uvLRBT.z, snappedRenderUV.y);
+    tapUVs[5] = uvLRBT.xy;
+    tapUVs[6] = uvLRBT.zy;
+    tapUVs[7] = uvLRBT.xw;
+    tapUVs[8] = uvLRBT.zw;
 
     float3 cachedRGB[9];
     float3 cachedSpace[9];
@@ -635,7 +695,7 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
     [unroll]
     for (int i = 1; i < 9; ++i)
     {
-        float2 offsetUV = clamp((baseRenderTC + kOffsets3x3[i]) * passTexel, minRenderUV, maxRenderUV);
+        float2 offsetUV = tapUVs[i];
         float dRaw = tex2Dlod(depthTex, float4(offsetUV, 0.0, 0.0)).r; 
         float2 v = tex2Dlod(velocityTex, float4(offsetUV, 0.0, 0.0)).rg;
         float3 cRGB = max(0.0, tex2Dlod(sceneTex, float4(offsetUV, 0.0, 0.0)).rgb);
@@ -654,8 +714,8 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
     }
 
     // 7. Evaluate history UVs and stored velocity
-    float2 historyStableUV = ReprojectUV(jitterUV + dvStats.bestVel, psp, pcp, psy, pcy);
-    float2 currentJitterHistUV = clamp(ReprojectUV(historyStableUV, sp, cp, sy, cy), minRenderUV, maxRenderUV);
+    float2 historyStableUV = FastReprojectUV(jitterUV + dvStats.bestVel, rotPrev);
+    float2 currentJitterHistUV = clamp(FastReprojectUV(historyStableUV, rotCurr), minRenderUV, maxRenderUV);
     
     float2 histVelMem;
     if (taaBilinearHistoryVel > 0.5) {
