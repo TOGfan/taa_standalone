@@ -152,78 +152,80 @@ const settingsSchema = [
   {
     name: "General & Sharpening",
     items: [
-      { id: 'sharpness', type: 'float', min: 0.0, max: 1.0, step: 0.01, default: 0.25, name: "RCAS Sharpening Base", desc: "Contrast-adaptive sharpening (RCAS) applied to the final resolved image." },
-      { id: 'jitterScale', type: 'float', min: 0.0, max: 2.0, step: 0.01, default: 1.0, name: "Jitter Spread Scale", desc: "Multiplier for the sub-pixel camera offset." },
-      { id: 'fallbackFXAA', type: 'numBool', default: 1.0, name: "Fallback Spatial AA (FXAA)", desc: "Applies FXAA to pixels where temporal history was rejected." }
+      { id: 'sharpness', type: 'float', min: 0.0, max: 1.0, step: 0.01, default: 0.25, name: "Sharpening Strength (RCAS)", desc: "Contrast-adaptive sharpening applied to the final resolved image, clamped to the local pixel range so it cannot overshoot or ring. 0 disables." },
+      { id: 'jitterScale', type: 'float', min: 0.0, max: 2.0, step: 0.01, default: 1.0, name: "Jitter Spread Scale", desc: "Scales the sub-pixel camera offset pattern. Above 1 samples a wider area within each pixel (more edge anti-aliasing, more temporal softening); below 1 tightens it." },
+      { id: 'fallbackFXAA', type: 'numBool', default: 1.0, name: "Fallback Spatial AA (FXAA)", desc: "Applies FXAA edge smoothing to pixels whose temporal history was rejected, so disoccluded areas don't alias while the history rebuilds." }
     ]
   },
   {
     name: "History & Blending",
     items: [
-      { id: 'feedbackMax', type: 'float', min: 0.0, max: 0.99, step: 0.01, default: 0.97, name: "Static Blend Weight", desc: "Determines how much history is kept for stationary objects." },
-      { id: 'feedbackMin', type: 'float', min: 0.0, max: 0.99, step: 0.01, default: 0.97, name: "Motion Blend Weight", desc: "Determines how much history is kept for moving objects." },
-      { id: 'motionBlendStart', type: 'float', min: 0.0, max: 5.0, step: 0.01, default: 1.0, name: "Motion Blend Start Velocity", desc: "Minimum velocity threshold before starting to lower blend weight." },
-      { id: 'motionBlendDropSpeed', type: 'float', min: 1.0, max: 20.0, step: 0.1, default: 1.0, name: "Motion Blend Drop Velocity", desc: "The pixel velocity magnitude required to transition fully from static to motion blend weights." },
-      { id: 'alignmentFeedbackDrop', type: 'float', min: 0.5, max: 1.0, step: 0.01, default: 0.8, name: "Sub-Pixel Alignment Blend Drop", desc: "Multiplier applied to the temporal blend weight based on sub-pixel misalignment." }
+      { id: 'feedbackMax', type: 'float', min: 0.0, max: 0.99, step: 0.01, default: 0.97, name: "History Blend (Static Scenes)", desc: "How much of the previous frame is reused for stationary pixels. Higher = smoother and cleaner but slower to react to changes; lower = more responsive but noisier. 0.97 corresponds to roughly a 33-frame accumulation window." },
+      { id: 'feedbackMin', type: 'float', min: 0.0, max: 0.99, step: 0.01, default: 0.97, name: "History Blend (Moving Pixels)", desc: "History reuse once pixel velocity exceeds the motion transition range below. Typically set at or below the static value so motion receives less smoothing." },
+      { id: 'lumaDriftStrength', type: 'float', min: 0.0, max: 0.3, step: 0.01, default: 0.1, name: "Luma Drift Correction", desc: "Pulls history brightness toward the current image to clear ghost trails from moving shadows, exposure changes and vehicle lights, without reducing temporal smoothing. 0 = off. Only engages on large brightness mismatches (real shading changes), so it does not chase noise or jitter; higher values clear trails faster." },
+      { id: 'motionBlendStart', type: 'float', min: 0.0, max: 5.0, step: 0.01, default: 1.0, name: "Motion Transition Start", desc: "Pixel velocity (in pixels per frame) at which blending starts transitioning from the static to the motion weight." },
+      { id: 'motionBlendDropSpeed', type: 'float', min: 1.0, max: 20.0, step: 0.1, default: 1.0, name: "Motion Transition End", desc: "Pixel velocity at which the blend reaches the motion weight fully." },
+      { id: 'alignmentFeedbackDrop', type: 'float', min: 0.5, max: 1.0, step: 0.01, default: 0.8, name: "Sub-Pixel Alignment Drop", desc: "Reduces history weight when the reprojected sample lands between pixels (sub-pixel misalignment), where the resampling kernel is least accurate. 1.0 disables the reduction." }
     ]
   },
   {
     name: "Jitter & Sampling",
     items: [
-      { id: 'useJitter', type: 'bool', default: true, name: "Enable Sub-Pixel Camera Jitter", desc: "Shifts the camera projection matrix by a sub-pixel offset each frame to sample missing geometry." },
-      { id: 'useR2Jitter', type: 'bool', default: true, name: "R2 Jitter Sequence", desc: "Uses the R2 low-discrepancy sequence instead of the Halton sequence." },
-      { id: 'useLanczos3', type: 'numBool', default: 1.0, name: "High-Quality Lanczos 3 Resampling", desc: "Uses high-quality Lanczos 3 resampling for history accumulation." },
-      { id: 'useDepthDilation', type: 'numBool', default: 1.0, name: "Depth-Dilated Motion Search", desc: "Uses a depth-tested neighborhood search to find the closest foreground motion vector." }
+      { id: 'useJitter', type: 'bool', default: true, name: "Sub-Pixel Camera Jitter", desc: "Offsets the camera by a sub-pixel amount each frame so successive frames sample different positions within each pixel. This is the source of TAA's supersampling -- without it, TAA only stabilizes noise, it does not anti-alias." },
+      { id: 'useR2Jitter', type: 'bool', default: true, name: "R2 Jitter Sequence", desc: "Uses the R2 low-discrepancy sequence instead of Halton(2,3) for the jitter pattern. R2 spreads samples more evenly across its 32-frame cycle." },
+      { id: 'useLanczos3', type: 'numBool', default: 1.0, name: "Lanczos 3 History Resampling", desc: "36-tap Lanczos resampling of the history buffer. Retains noticeably more detail in motion than the 5-tap Catmull-Rom fallback (the two differ only for moving pixels), at roughly 7x the sampling cost." },
+      { id: 'historyOvershoot', type: 'float', min: 0.0, max: 1.0, step: 0.01, default: 1.0, name: "History Resampling Overshoot Margin", desc: "Soft anti-ringing margin for history resampling, shared by both the Lanczos and Catmull-Rom paths and applied equally to brightness and color, as a fraction of the local color range. Band-limited overshoot -- the edge detail the filter reconstructs -- survives, while ringing and color fringing are compressed. Higher = sharper history, lower = fewer halos." },
+      { id: 'useDepthDilation', type: 'numBool', default: 1.0, name: "Depth-Dilated Motion Search", desc: "Searches the 3x3 neighborhood for the closest surface and uses its motion vector, so silhouette edges reproject with the foreground's motion instead of the background's." }
     ]
   },
   {
     name: "Variance Clipping",
     items: [
-      { id: 'useKDopClipping', type: 'numBool', default: 1.0, name: "k-DOP Neighborhood Clipping", desc: "Uses k-Discrete Oriented Polytopes (k-DOPs) for color neighborhood clipping." },
-      { id: 'kdopVarianceClipping', type: 'numBool', default: 1.0, name: "Use k-DOP Variance Mode", desc: "Calculates k-DOP extents based on statistical variance rather than absolute min/max." },
-      { id: 'useCovarianceClipping', type: 'numBool', default: 1.0, name: "Covariance Clipping (OBB)", desc: "Computes a 3x3 covariance matrix to orient the color bounding box." },
-      { id: 'roundedAABB', type: 'numBool', default: 0.0, name: "Anti-Aliased Variance Bounds", desc: "Averages the bounds of the 5-pixel cross and 9-pixel box for variance clipping." },
-      { id: 'colorSpaceOklab', type: 'numBool', default: 1.0, name: "Oklab Color Space", desc: "Converts samples to Oklab color space before clipping instead of YCoCg." },
-      { id: 'varianceGamma', type: 'float', min: 0.0, max: 3.0, step: 0.01, default: 1.25, name: "Base Variance Gamma", desc: "Scaling factor for the variance bounding box size." },
-      { id: 'chromaVarianceMod', type: 'float', min: 0.5, max: 2.0, step: 0.01, default: 1.0, name: "Chroma Variance Looseness", desc: "Multiplier applied to the chrominance axes of the variance bounding box." },
-      { id: 'softClip', type: 'float', min: 0.0, max: 1.0, step: 0.01, default: 0.0, name: "Static Soft Clip Strength", desc: "Blend factor between the history color and the variance clip box during static scenes." }
+      { id: 'useKDopClipping', type: 'numBool', default: 1.0, name: "k-DOP History Clipping", desc: "Clips history against a 16-direction convex hull of the neighborhood colors instead of a simple bounding box. A tighter bound on valid history at higher cost." },
+      { id: 'kdopVarianceClipping', type: 'numBool', default: 0.0, name: "k-DOP Variance Extents", desc: "Builds the k-DOP bounds from statistical variance instead of the absolute min/max of the neighborhood -- more forgiving of single outlier samples." },
+      { id: 'useCovarianceClipping', type: 'numBool', default: 0.0, name: "Covariance Clipping (Ellipsoid)", desc: "Clips history against an ellipsoid fit of the neighborhood color distribution. Only active when k-DOP clipping is disabled -- the k-DOP path supersedes it." },
+      { id: 'roundedAABB', type: 'numBool', default: 0.0, name: "Grid-Aligned Bounds Blending", desc: "Blends the variance bounds between the tight 5-tap cross and the wider 9-tap box depending on how well the reprojected history aligns to the pixel grid." },
+      { id: 'colorSpaceOklab', type: 'numBool', default: 1.0, name: "Oklab Clipping Color Space", desc: "Performs history clipping in Oklab (perceptually uniform) instead of YCoCg. Slightly higher GPU cost." },
+      { id: 'varianceGamma', type: 'float', min: 0.0, max: 3.0, step: 0.01, default: 1.25, name: "Variance Box Scale", desc: "Scales the size of the color bounds that clamp history. Higher = looser clamp (history survives more, with more smear potential); lower = tighter (sharper, but more history rejection)." },
+      { id: 'chromaVarianceMod', type: 'float', min: 0.5, max: 2.0, step: 0.01, default: 1.0, name: "Chroma Bounds Scale", desc: "Independent multiplier for the color (non-brightness) axes of the variance bounds." },
+      { id: 'softClip', type: 'float', min: 0.0, max: 1.0, step: 0.01, default: 0.0, name: "Soft Clip Strength", desc: "Eases history into the variance bounds instead of snapping hard, in near-static scenes. Reduces clipping 'popping' at the cost of a slight ghost linger; fades out with motion." }
     ]
   },
   {
     name: "Motion & Anti-Flicker",
     items: [
-      { id: 'jitterFlickerPadding', type: 'float', min: 0.0, max: 1.0, step: 0.01, default: 0.0, name: "Jitter Anti-Flicker Padding", desc: "Expands the variance bounding box proportionally to the current sub-pixel jitter offset." },
-      { id: 'directionalVariance', type: 'numBool', default: 1.0, name: "Color-Space Directional Padding", desc: "Expands the variance bounds exclusively along the color vector of the sub-pixel offset." },
-      { id: 'jitterFlickerFade', type: 'numBool', default: 0.0, name: "Fade Jitter Padding in Motion", desc: "Attenuates the jitter anti-flicker padding when pixel velocity increases." },
-      { id: 'adaptiveVariance', type: 'numBool', default: 0.0, name: "Adaptive Motion Ghosting Reduction", desc: "Contracts the variance bounding box dynamically based on pixel velocity." },
-      { id: 'lumaVariance', type: 'numBool', default: 0.0, name: "Luma-Weighted Variance", desc: "Reduces the weight of samples based on their luminance (Karis Average)." },
-      { id: 'jitterAwareVariance', type: 'numBool', default: 1.0, name: "Jitter-Aware Variance", desc: "Centers the variance bounding box around the sub-pixel camera jitter offset." },
-      { id: 'velocityAlignedVariance', type: 'numBool', default: 0.0, name: "Velocity-Aligned Trailing Rejection", desc: "Discards neighborhood samples that fall behind the current motion vector when calculating variance." },
-      { id: 'adaptiveVarStart', type: 'float', min: 0.1, max: 5.0, step: 0.01, default: 0.5, name: "Adaptive Var Motion Start", desc: "Pixel velocity magnitude at which adaptive variance begins to engage." },
-      { id: 'adaptiveVarEnd', type: 'float', min: 1.0, max: 10.0, step: 0.01, default: 2.0, name: "Adaptive Var Motion End", desc: "Pixel velocity magnitude at which adaptive variance reaches its maximum effect." }
+      { id: 'jitterFlickerPadding', type: 'float', min: 0.0, max: 1.0, step: 0.01, default: 0.0, name: "Jitter Anti-Flicker Padding", desc: "Expands the variance bounds in proportion to the current sub-pixel jitter offset, so valid history isn't clipped away purely because of jitter phase. Reduces shimmer in fine detail." },
+      { id: 'directionalVariance', type: 'numBool', default: 1.0, name: "Directional Padding", desc: "Expands the bounds along the color direction of the expected jitter shift rather than uniformly. Only active when Jitter Anti-Flicker Padding is above zero." },
+      { id: 'jitterFlickerFade', type: 'numBool', default: 0.0, name: "Fade Padding in Motion", desc: "Disables the jitter anti-flicker padding as pixel velocity rises, since reprojection error dominates jitter error in motion." },
+      { id: 'adaptiveVariance', type: 'numBool', default: 0.0, name: "Adaptive Bounds Contraction", desc: "Contracts the variance bounds with pixel velocity, clamping ghosts harder on fast motion." },
+      { id: 'lumaVariance', type: 'numBool', default: 0.0, name: "Luma-Weighted Statistics", desc: "Downweights bright samples when computing neighborhood statistics (Karis-style), keeping the bounds from being stretched by specular fireflies." },
+      { id: 'jitterAwareVariance', type: 'numBool', default: 1.0, name: "Jitter-Aware Statistics", desc: "Weights neighborhood samples by their distance from the jittered sampling position instead of the pixel center." },
+      { id: 'velocityAlignedVariance', type: 'numBool', default: 0.0, name: "Velocity-Aligned Statistics", desc: "Downweights neighborhood samples that lie behind the direction of motion, tightening the bounds along motion trails." },
+      { id: 'adaptiveVarStart', type: 'float', min: 0.1, max: 5.0, step: 0.01, default: 0.5, name: "Adaptive Contraction Start", desc: "Pixel velocity where adaptive bounds contraction begins to engage." },
+      { id: 'adaptiveVarEnd', type: 'float', min: 1.0, max: 10.0, step: 0.01, default: 2.0, name: "Adaptive Contraction End", desc: "Pixel velocity where adaptive bounds contraction reaches its full effect." }
     ]
   },
   {
     name: "Shadows & SSAO Mitigation",
     items: [
-      { id: 'shadowMitigation', type: 'numBool', default: 0.0, name: "Enable Shadow & SSAO Mitigation", desc: "Detects and blurs flickering in shadows and ambient occlusion." },
-      { id: 'shadowDarknessThreshold', type: 'float', min: 0.05, max: 0.8, step: 0.01, default: 0.25, name: "Shadow Luma Threshold", desc: "The luma threshold below which a pixel is considered a shadow." },
-      { id: 'shadowBlendStrength', type: 'float', min: 0.5, max: 0.99, step: 0.01, default: 0.95, name: "Shadow Smoothing Strength", desc: "The interpolation factor for the shadow smoothing pass." },
-      { id: 'shadowTemporalMult', type: 'float', min: 1.0, max: 20.0, step: 0.1, default: 10.0, name: "Shadow Temporal Risk Mult", desc: "Multiplier for temporal variance when assessing shadow stability." },
-      { id: 'shadowSpatialMult', type: 'float', min: 1.0, max: 20.0, step: 0.1, default: 5.0, name: "Shadow Spatial Safety Mult", desc: "Multiplier for spatial variance when applying shadow mitigation." },
-      { id: 'shadowVarianceBase', type: 'float', min: 0.0, max: 2.0, step: 0.01, default: 0.2, name: "Shadow Variance Base", desc: "Minimum variance gamma forced inside shadow areas." }
+      { id: 'shadowMitigation', type: 'numBool', default: 0.0, name: "Shadow & SSAO Flicker Mitigation", desc: "Detects flickering shadows and ambient occlusion and reduces their history weight so they settle faster, at the cost of some temporal smoothing in dark areas. Note: Luma Drift Correction (History & Blending) clears stuck shadows without that trade -- try it first." },
+      { id: 'shadowDarknessThreshold', type: 'float', min: 0.05, max: 0.8, step: 0.01, default: 0.25, name: "Shadow Detection Threshold", desc: "Brightness below this is treated as shadow for mitigation purposes." },
+      { id: 'shadowBlendStrength', type: 'float', min: 0.5, max: 0.99, step: 0.01, default: 0.95, name: "Shadow History Weight", desc: "History weight applied inside detected unstable shadows. Lower = shadows respond faster to change but flicker more." },
+      { id: 'shadowTemporalMult', type: 'float', min: 1.0, max: 20.0, step: 0.1, default: 10.0, name: "Shadow Temporal Risk Mult", desc: "Sensitivity of the temporal brightness-change test that flags unstable shadows." },
+      { id: 'shadowSpatialMult', type: 'float', min: 1.0, max: 20.0, step: 0.1, default: 5.0, name: "Shadow Spatial Safety Mult", desc: "How strongly spatial texture suppresses shadow mitigation -- textured dark areas are left alone." },
+      { id: 'shadowVarianceBase', type: 'float', min: 0.0, max: 2.0, step: 0.01, default: 0.2, name: "Shadow Variance Floor", desc: "Minimum variance scale forced inside unstable shadows, loosening the clamp so dark detail isn't crushed." }
     ]
   },
   {
     name: "Advanced Rejection",
     items: [
-      { id: 'depthRejection', type: 'float', min: 0.0, max: 1.0, step: 0.01, default: 1.0, name: "Depth Mismatch Rejection", desc: "Relative depth discontinuity threshold beyond local geometric slope." },
-      { id: 'clipDistanceRejectionEnabled', type: 'numBool', default: 0.0, name: "Clip-Distance Smear Rejection", desc: "Detects severe history clipping distances and drops history weight." },
-      { id: 'clipDistanceRejectionAmount', type: 'float', min: 0.0, max: 1.0, step: 0.001, default: 0.0, name: "Smear Rejection Tolerance", desc: "Color clipping tolerance before history is fully rejected." },
-      { id: 'clipDistanceRejectionMinError', type: 'float', min: 0.001, max: 0.5, step: 0.001, default: 0.05, name: "Clip Rejection Min Error", desc: "Minimum color divergence required before initiating smear rejection." },
-      { id: 'fireflyClamp', type: 'float', min: 1.0, max: 10.0, step: 0.1, default: 4.0, name: "Firefly Clamp Threshold", desc: "Standard deviation threshold for clamping high-luminance outliers." },
-      { id: 'collapseRatioMin', type: 'float', min: 0.0, max: 1.0, step: 0.01, default: 0.05, name: "Collapse Ratio Min", desc: "Lower threshold of neighborhood collapse ratio for adaptive contraction." },
-      { id: 'collapseRatioMax', type: 'float', min: 0.0, max: 1.0, step: 0.01, default: 0.35, name: "Collapse Ratio Max", desc: "Upper threshold of neighborhood collapse ratio for adaptive contraction." }
+      { id: 'depthRejection', type: 'float', min: 0.0, max: 1.0, step: 0.01, default: 0.01, name: "Disocclusion Sensitivity", desc: "Threshold of the geometry-based disocclusion test: how much closer than every surface in the 1-pixel dilation zone the history must be before it is rejected as stale. 0 disables depth rejection entirely." },
+      { id: 'clipDistanceRejectionEnabled', type: 'numBool', default: 0.0, name: "Smear Rejection", desc: "Drops history weight where the color clamp had to move the history a long way -- a ghosting indicator for content without motion vectors (animated textures, particles)." },
+      { id: 'clipDistanceRejectionAmount', type: 'float', min: 0.0, max: 1.0, step: 0.001, default: 0.0, name: "Smear Rejection Tolerance", desc: "How far the clamp distance must exceed the minimum error before history is fully rejected." },
+      { id: 'clipDistanceRejectionMinError', type: 'float', min: 0.001, max: 0.5, step: 0.001, default: 0.05, name: "Smear Rejection Min Error", desc: "Minimum clamp distance before smear rejection begins to engage." },
+      { id: 'fireflyClamp', type: 'float', min: 1.0, max: 10.0, step: 0.1, default: 4.0, name: "Firefly Clamp", desc: "Clamps the variance bounds against extreme bright outliers, in standard deviations of the neighborhood. Lower = tighter (fewer fireflies, more clipping of legitimate highlights)." },
+      { id: 'collapseRatioMin', type: 'float', min: 0.0, max: 1.0, step: 0.01, default: 0.05, name: "Collapse Ratio Min", desc: "Lower bound of the cross/box neighborhood range ratio below which adaptive contraction is suppressed." },
+      { id: 'collapseRatioMax', type: 'float', min: 0.0, max: 1.0, step: 0.01, default: 0.35, name: "Collapse Ratio Max", desc: "Upper bound of the cross/box neighborhood range ratio at which adaptive contraction is fully allowed." }
     ]
   },
   {
@@ -256,10 +258,10 @@ settingsSchema.forEach(cat => {
 })
 
 const presets = {
-  Performance: { useLanczos3: 0, useKDopClipping: 0, colorSpaceOklab: 0, kdopVarianceClipping: 0, useCovarianceClipping: 0 },
-  Balanced: { useKDopClipping: 0, colorSpaceOklab: 0, kdopVarianceClipping: 0, useCovarianceClipping: 0 }, 
-  Clarity: { },
-  Smooth: { feedbackMax: 0.99, feedbackMin: 0.99, alignmentFeedbackDrop: 0.9, depthRejection: 0.0 }
+  Performance: { useLanczos3: 0, useKDopClipping: 0, colorSpaceOklab: 0 },
+  Balanced: { useKDopClipping: 0, colorSpaceOklab: 0}, 
+  Clarity: { feedbackMax: 0.95, feedbackMin: 0.95, },
+  Smooth: { feedbackMax: 0.99, feedbackMin: 0.99, alignmentFeedbackDrop: 0.9, kdopVarianceClipping: 0 }
 }
 
 function formatDefault(item) {

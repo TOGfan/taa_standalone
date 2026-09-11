@@ -77,6 +77,7 @@ M.settings = {
     jitterScale                   = 1.0,
     feedbackMin                   = 0.97,
     feedbackMax                   = 0.97,
+    lumaDriftStrength             = 0.0,     -- 0 = off; fraction of remaining mismatch per frame
     shadowMitigation              = 0.0,
     shadowDarknessThreshold       = 0.25,
     shadowBlendStrength           = 0.95,
@@ -86,15 +87,15 @@ M.settings = {
     jitterFlickerPadding          = 0.0,
     directionalVariance           = 1.0,
     jitterFlickerFade             = 0.0,
-    depthRejection                = 1.0,
+    depthRejection                = 0.1,
     sharpness                     = 0.25,
     debugMode                     = 0.0,
     useDepthDilation              = 1.0,
     adaptiveVariance              = 0.0,
     lumaVariance                  = 0.0,
     useKDopClipping               = 1.0,
-    kdopVarianceClipping          = 1.0,
-    useCovarianceClipping         = 1.0,
+    kdopVarianceClipping          = 0.0,
+    useCovarianceClipping         = 0.0,
     colorSpaceOklab               = 1.0,
     jitterAwareVariance           = 1.0,
     velocityAlignedVariance       = 0.0,
@@ -102,6 +103,7 @@ M.settings = {
     motionBlendDropSpeed          = 1.0,
     roundedAABB                   = 0.0,
     useLanczos3                   = 1.0,
+    historyOvershoot              = 1.0,    -- shared margin: both samplers, luma + chroma
     fireflyClamp                  = 4.0,
     adaptiveVarStart              = 0.5,
     adaptiveVarEnd                = 2.0,
@@ -151,6 +153,8 @@ function M.applySettings(inputs)
         pre:setShaderConst("$taaMotionBlendDropSpeed",    s.motionBlendDropSpeed)
         pre:setShaderConst("$taaRoundedAABB",             s.roundedAABB)
         pre:setShaderConst("$taaUseLanczos3",             s.useLanczos3)
+        pre:setShaderConst("$taaHistoryOvershoot",        s.historyOvershoot)
+        pre:setShaderConst("$taaLumaDriftStrength",       s.lumaDriftStrength)
         pre:setShaderConst("$taaFireflyClamp",            s.fireflyClamp)
         pre:setShaderConst("$taaAdaptiveVarStart",        s.adaptiveVarStart)
         pre:setShaderConst("$taaAdaptiveVarEnd",          s.adaptiveVarEnd)
@@ -160,7 +164,7 @@ function M.applySettings(inputs)
         pre:setShaderConst("$taaClipDistanceRejectionAmount",   s.clipDistanceRejectionAmount)
         pre:setShaderConst("$taaClipDistanceRejectionMinError", s.clipDistanceRejectionMinError)
         pre:setShaderConst("$taaMotionBlendStart",        s.motionBlendStart)
-        pre:setShaderConst("$taaShadowVarianceBase",      s.shadowShadowVarianceBase and s.shadowShadowVarianceBase or s.shadowVarianceBase)
+        pre:setShaderConst("$taaShadowVarianceBase",      s.shadowVarianceBase)
         pre:setShaderConst("$taaCollapseRatioMin",        s.collapseRatioMin)
         pre:setShaderConst("$taaCollapseRatioMax",        s.collapseRatioMax)
         pre:setShaderConst("$taaFallbackFXAA",            s.fallbackFXAA)

@@ -9,6 +9,17 @@ uniform_sampler2D(velocityTex,  3);
 // ============================================================================
 // CBUFFER
 // ============================================================================
+// taaHistoryOvershoot   -- soft anti-ringing margin for BOTH history samplers
+//                         (Lanczos3 and Catmull-Rom), applied UNIFORMLY to
+//                         luma and chroma as a fraction of the local color
+//                         range, evaluated in the working color space.
+// taaLumaDriftStrength  -- fraction of the remaining luma mismatch corrected
+//                         per frame (0 = off). Proportional form: loop pole is
+//                         feedback*(1-k) < 1 for any k <= 1, so it cannot
+//                         oscillate (the previous multiplicative-rate version
+//                         had loop gain 0.97*1.2 = 1.164 > 1 and oscillated
+//                         by construction).
+// ============================================================================
 cbuffer perDraw
 {
     float  taaFeedbackMin;                  float  taaFeedbackMax;
@@ -40,7 +51,8 @@ cbuffer perDraw
     float  taaPrevPZ;                       float  taaPrevQX;
     float  taaPrevQY;                       float  taaPrevQZ;
     float  taaPrevRX;                       float  taaPrevRY;
-    float  taaPrevRZ;
+    float  taaPrevRZ;                       float  taaHistoryOvershoot;
+    float  taaLumaDriftStrength;
 
     float2 oneOverTargetSize;
     POSTFX_UNIFORMS
@@ -211,6 +223,13 @@ float3 ApplyFXAACached(float2 uv, float2 texel, float3 cachedRGB[9])
 // ============================================================================
 // HISTORY SAMPLING
 // ============================================================================
+// NOTE: BOTH samplers return the history color ALREADY CONVERTED to the
+// working color space. The anti-ringing clamp lives inside them: footprint
+// min/max (the taps each kernel actually reads) + a soft uniform margin
+// (taaHistoryOvershoot, applied equally to luma and chroma), evaluated in
+// the working color space. The filtering itself runs in linear RGB (the
+// correct domain for weighted resampling); only the bound is in color space.
+// ============================================================================
 float3 SampleHistoryLanczos3(float2 uv, float2 texSize, float2 invTexSize, float2 minUV, float2 maxUV)
 {
     float2 samplePos = uv * texSize;
@@ -243,8 +262,10 @@ float3 SampleHistoryLanczos3(float2 uv, float2 texSize, float2 invTexSize, float
     }
 
     float3 color = 0.0;
-    float3 centerMin = kLargeValue;
-    float3 centerMax = -kLargeValue;
+    // Min/max over the WHOLE kernel footprint (the old 2x2 center clamp
+    // forced Catmull-Rom-class output out of a 36-tap filter).
+    float3 footMin = kLargeValue;
+    float3 footMax = -kLargeValue;
 
     [unroll]
     for (int y = 0; y < 6; ++y)
@@ -255,15 +276,26 @@ float3 SampleHistoryLanczos3(float2 uv, float2 texSize, float2 invTexSize, float
             float3 tapColor = tex2Dlod(historyTex, float4(uvsX[x], uvsY[y], 0.0, 0.0)).rgb;
             color += tapColor * (wX[x] * wY[y]);
 
-            if ((x == 2 || x == 3) && (y == 2 || y == 3))
-            {
-                centerMin = min(centerMin, tapColor);
-                centerMax = max(centerMax, tapColor);
-            }
+            footMin = min(footMin, tapColor);
+            footMax = max(footMax, tapColor);
         }
     }
 
-    return clamp(color, centerMin, centerMax);
+    // Soft anti-ringing clamp in the working color space, UNIFORM margin
+    // across luma and chroma (single shared knob). Mapping the RGB box
+    // corners through ToSpace is an approximation (per-channel order can
+    // even invert under the nonlinear Oklab map, hence the min/max); the
+    // hard safety net remains the current-frame AABB clamp in step 12,
+    // computed from taps actually converted to the working space.
+    float3 cSpace = ToSpace(color);
+    float3 fMinS  = ToSpace(footMin);
+    float3 fMaxS  = ToSpace(footMax);
+    float3 lo = min(fMinS, fMaxS);
+    float3 hi = max(fMinS, fMaxS);
+    float3 rng = max(hi - lo, 1e-4);
+    float3 margin = taaHistoryOvershoot * rng;
+
+    return clamp(cSpace, lo - margin, hi + margin);
 }
 
 float3 SampleHistoryCatmullRom5Tap(float2 uv, float2 texSize, float2 invTexSize)
@@ -301,10 +333,21 @@ float3 SampleHistoryCatmullRom5Tap(float2 uv, float2 texSize, float2 invTexSize)
     float wsum = w0y + w0x + w12xy + w3x + w3y;
     color /= max(wsum, 1e-4);
 
-    float3 ringMin = min(tap0, min(tap1, min(tap2, min(tap3, tap4))));
-    float3 ringMax = max(tap0, max(tap1, max(tap2, max(tap3, tap4))));
+    // Footprint bounds over the 5 taps, replacing the old hard RGB ring
+    // clamp -- same color-space soft clamp and SAME KNOB as the Lanczos
+    // sampler, so both resampling paths behave identically.
+    float3 footMin = min(tap0, min(tap1, min(tap2, min(tap3, tap4))));
+    float3 footMax = max(tap0, max(tap1, max(tap2, max(tap3, tap4))));
 
-    return clamp(color, ringMin, ringMax);
+    float3 cSpace = ToSpace(color);
+    float3 fMinS  = ToSpace(footMin);
+    float3 fMaxS  = ToSpace(footMax);
+    float3 lo = min(fMinS, fMaxS);
+    float3 hi = max(fMinS, fMaxS);
+    float3 rng = max(hi - lo, 1e-4);
+    float3 margin = taaHistoryOvershoot * rng;
+
+    return clamp(cSpace, lo - margin, hi + margin);
 }
 
 // ============================================================================
@@ -861,10 +904,32 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
     {
         hist.disocclusion = ComputeDisocclusion(dvStats, histRawDepth, centerRawDepth, snappedRenderUV, passTexel, IN.uv0);
 
+        // Both samplers return the working-space color directly (the shared
+        // color-space anti-ringing clamp lives inside them).
         if (taaUseLanczos3 > 0.5) {
-            hist.colorSpace = ToSpace(SampleHistoryLanczos3(historyStableUV, passTexSize, passTexel, minRenderUV, maxRenderUV));
+            hist.colorSpace = SampleHistoryLanczos3(historyStableUV, passTexSize, passTexel, minRenderUV, maxRenderUV);
         } else {
-            hist.colorSpace = ToSpace(SampleHistoryCatmullRom5Tap(historyStableUV, passTexSize, passTexel));
+            hist.colorSpace = SampleHistoryCatmullRom5Tap(historyStableUV, passTexSize, passTexel);
+        }
+
+        // 10b. Luminance drift correction (proportional form).
+        // Shading changes (moving shadows, exposure, vehicle lights) carry
+        // no motion vectors, so stale history otherwise decays only through
+        // the (1-feedback) injection (~33 frames of stuck shadow).
+        // This pulls history luma a FRACTION of the remaining distance toward
+        // the current neighborhood mean. Stability: the loop pole is
+        // feedback*(1-k) < 1 for any k <= 1, so it cannot oscillate -- unlike
+        // the previous multiplicative-rate version, whose loop gain
+        // (0.97 * 1.2 = 1.164 > 1) made every gated pixel a discrete
+        // oscillator. The gate is RELATIVE and large so jitter-phase swings
+        // of the neighborhood mean never engage it; only real shading
+        // changes do. Chroma is left to the AABB clamp.
+        if (taaLumaDriftStrength > 0.001) {
+            float muY = colorStats.mu.x;               // Oklab L / YCoCg Y
+            float hY  = hist.colorSpace.x;
+            if (abs(muY - hY) > max(0.30 * abs(hY), 0.03)) {
+                hist.colorSpace.x = max(hY + (muY - hY) * taaLumaDriftStrength, 1e-3);
+            }
         }
 
         float3 histDelta = hist.colorSpace - colorStats.mu;
