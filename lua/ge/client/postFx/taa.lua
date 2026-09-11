@@ -160,7 +160,7 @@ function M.applySettings(inputs)
         pre:setShaderConst("$taaClipDistanceRejectionAmount",   s.clipDistanceRejectionAmount)
         pre:setShaderConst("$taaClipDistanceRejectionMinError", s.clipDistanceRejectionMinError)
         pre:setShaderConst("$taaMotionBlendStart",        s.motionBlendStart)
-        pre:setShaderConst("$taaShadowVarianceBase",      s.shadowVarianceBase)
+        pre:setShaderConst("$taaShadowVarianceBase",      s.shadowShadowVarianceBase and s.shadowShadowVarianceBase or s.shadowVarianceBase)
         pre:setShaderConst("$taaCollapseRatioMin",        s.collapseRatioMin)
         pre:setShaderConst("$taaCollapseRatioMax",        s.collapseRatioMax)
         pre:setShaderConst("$taaFallbackFXAA",            s.fallbackFXAA)
@@ -174,14 +174,54 @@ end
 
 function M.setFrameState(tanX, tanY, yaw, pitch, prevYaw, prevPitch)
     local pre = scenetree.TAA_PreFx
-    if pre then
-        pre:setShaderConst("$taaTanHalfFovX", tanX)
-        pre:setShaderConst("$taaTanHalfFovY", tanY)
-        pre:setShaderConst("$taaJitterYaw", yaw)
-        pre:setShaderConst("$taaJitterPitch", pitch)
-        pre:setShaderConst("$taaPrevJitterYaw", prevYaw)
-        pre:setShaderConst("$taaPrevJitterPitch", prevPitch)
+    if not pre then return end
+
+    pre:setShaderConst("$taaTanHalfFovX", tanX)
+    pre:setShaderConst("$taaTanHalfFovY", tanY)
+
+    -- PERF: reprojection bases, precomputed here so the pixel shader no longer
+    -- runs sincos + builds rotation matrices per pixel. Matches the old shader
+    -- math exactly (the shader previously built these from the raw angles):
+    --   rot = float3x3( cy, -sy*cp,  sy*sp,
+    --                   sy,  cy*cp, -cy*sp,
+    --                   0.0,     sp,      cp )
+    --   ray(uv) = uv.x*(2tanX,0,0) + (-tanX,1,tanY) - uv.y*(0,0,2tanY)
+    --   P = 2tanX*col0, Q = -tanX*col0 + col1 + tanY*col2, R = 2tanY*col2
+    -- so that:  rot * ray(uv) = uv.x*P + Q - uv.y*R
+    -- and:      rot * ray(uv + vel) = that + vel.x*P - vel.y*R
+    local function basis(yawA, pitchA)
+        local sy, cy = math.sin(yawA), math.cos(yawA)
+        local sp, cp = math.sin(pitchA), math.cos(pitchA)
+        local c0x, c0y, c0z = cy, sy, 0.0
+        local c1x, c1y, c1z = -sy * cp, cy * cp, sp
+        local c2x, c2y, c2z = sy * sp, -cy * sp, cp
+        return {
+            2 * tanX * c0x, 2 * tanX * c0y, 2 * tanX * c0z,               -- P
+            -tanX * c0x + c1x + tanY * c2x,                                -- Q
+            -tanX * c0y + c1y + tanY * c2y,
+            -tanX * c0z + c1z + tanY * c2z,
+            2 * tanY * c2x, 2 * tanY * c2y, 2 * tanY * c2z,               -- R
+        }
     end
+
+    local cur = basis(yaw, pitch)
+    -- the shader previously negated the prev-jitter angles internally
+    local prv = basis(-prevYaw, -prevPitch)
+
+    local function setBasis(tag, b)
+        pre:setShaderConst("$taa" .. tag .. "PX", b[1])
+        pre:setShaderConst("$taa" .. tag .. "PY", b[2])
+        pre:setShaderConst("$taa" .. tag .. "PZ", b[3])
+        pre:setShaderConst("$taa" .. tag .. "QX", b[4])
+        pre:setShaderConst("$taa" .. tag .. "QY", b[5])
+        pre:setShaderConst("$taa" .. tag .. "QZ", b[6])
+        pre:setShaderConst("$taa" .. tag .. "RX", b[7])
+        pre:setShaderConst("$taa" .. tag .. "RY", b[8])
+        pre:setShaderConst("$taa" .. tag .. "RZ", b[9])
+    end
+
+    setBasis("Cur", cur)
+    setBasis("Prev", prv)
 end
 
 function M.setEnabled(enabled)
