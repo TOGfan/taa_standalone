@@ -1,7 +1,5 @@
--- lua/ge/client/postFx/taa.lua
 local M = {}
 
--- Helper to reduce boilerplate when creating StateBlocks
 local function getOrCreateStateBlock(objName, setupSamplers)
     local obj = scenetree.findObject(objName)
     if not obj then
@@ -16,7 +14,6 @@ local function getOrCreateStateBlock(objName, setupSamplers)
     return obj
 end
 
--- Helper to reduce boilerplate when creating Shaders
 local function getOrCreateShader(objName, path)
     local obj = scenetree.findObject(objName)
     if not obj then
@@ -29,7 +26,6 @@ local function getOrCreateShader(objName, path)
     return obj
 end
 
--- Wrapped object creation so it can be re-triggered if the mod is reloaded
 function M.build()
     getOrCreateStateBlock("TAA_StateBlock", function(sb)
         sb:setField("samplerStates", 0, "SamplerClampPoint")
@@ -54,15 +50,13 @@ function M.build()
         taaPreFx:setField("shader", 0, "TAA_Resolve_ShaderData"); taaPreFx:setField("stateBlock", 0, "TAA_StateBlock")
         taaPreFx:setField("targetScale", 0, "1.0 1.0")
 
-        -- Start with $backBuffer as history to prevent the Vulkan missing resource error on the first frame!
         taaPreFx:setField("texture", 0, "$backBuffer"); taaPreFx:setField("texture", 1, "#prepass[Depth]")
         taaPreFx:setField("texture", 2, "$backBuffer"); taaPreFx:setField("texture", 3, "#velocitybuffer")
         taaPreFx:setField("target", 0, "#TAA_Result"); taaPreFx:setField("targetFormat", 0, "GFXFormatR32G32B32A32F"); taaPreFx:setField("targetClear", 0, "PFXTargetClear_OnDraw")
 
         local taaFinalFx = createObject("PostEffect")
         taaFinalFx:setField("shader", 0, "TAA_Final_ShaderData"); taaFinalFx:setField("stateBlock", 0, "TAA_Copy_StateBlock")
-        taaFinalFx:setField("texture", 0, "#TAA_Result"); taaFinalFx:setField("texture", 1, "#velocitybuffer")
-        taaFinalFx:setField("texture", 2, "$backBuffer"); taaFinalFx:setField("texture", 3, "#prepass[Depth]")
+        taaFinalFx:setField("texture", 0, "#TAA_Result")
         taaFinalFx:setField("target", 0, "$backBuffer")
         taaFinalFx:registerObject("TAA_FinalFx"); taaPreFx:add(taaFinalFx)
 
@@ -78,59 +72,49 @@ function M.build()
 end
 
 M.settings = {
-    useJitter                 = true,
-    useR2Jitter               = true,
-    jitterScale               = 1.0,
-    feedbackMin               = 0.97,
-    feedbackMax               = 0.97,
-    shadowMitigation          = 0.0,
-    shadowDarknessThreshold   = 0.25,
-    shadowBlendStrength       = 0.95,
-    varianceGamma             = 1.25,
-    softClip                  = 0.0,
-    chromaVarianceMod         = 1.0,
-    jitterFlickerPadding      = 0.0,
-    directionalVariance       = 1.0,
-    jitterFlickerFade         = 0.0,
-    depthRejection            = 1.0,
-    velDisocclusion           = 1.0,
-    sharpness                 = 0.25,
-    adaptiveSharp             = 0.0,
-    debugMode                 = 0.0,
-    useDepthDilation          = 1.0,
-    adaptiveVariance          = 0.0,
-    lumaVariance              = 0.0,
-    useKDopClipping           = 1.0,
-    kdopVarianceClipping      = 1.0,
-    useCovarianceClipping     = 1.0,
-    colorSpaceOklab           = 1.0,
-    jitterAwareVariance       = 1.0,
-    velocityAlignedVariance   = 0.0,
-    alignmentFeedbackDrop     = 0.80,
-    alignmentRCASBoost        = 0.0,
-    motionBlendDropSpeed      = 1.0,
-    bilinearHistoryVel        = 1.0,
-    roundedAABB               = 0.0,
-    useLanczos3               = 1.0,
-    fireflyClamp              = 4.0,
-    adaptiveVarStart          = 0.5,
-    adaptiveVarEnd            = 2.0,
-    shadowTemporalMult        = 10.0,
-    shadowSpatialMult         = 5.0,
+    useJitter                     = true,
+    useR2Jitter                   = true,
+    jitterScale                   = 1.0,
+    feedbackMin                   = 0.97,
+    feedbackMax                   = 0.97,
+    shadowMitigation              = 0.0,
+    shadowDarknessThreshold       = 0.25,
+    shadowBlendStrength           = 0.95,
+    varianceGamma                 = 1.25,
+    softClip                      = 0.0,
+    chromaVarianceMod             = 1.0,
+    jitterFlickerPadding          = 0.0,
+    directionalVariance           = 1.0,
+    jitterFlickerFade             = 0.0,
+    depthRejection                = 1.0,
+    sharpness                     = 0.25,
+    debugMode                     = 0.0,
+    useDepthDilation              = 1.0,
+    adaptiveVariance              = 0.0,
+    lumaVariance                  = 0.0,
+    useKDopClipping               = 1.0,
+    kdopVarianceClipping          = 1.0,
+    useCovarianceClipping         = 1.0,
+    colorSpaceOklab               = 1.0,
+    jitterAwareVariance           = 1.0,
+    velocityAlignedVariance       = 0.0,
+    alignmentFeedbackDrop         = 0.80,
+    motionBlendDropSpeed          = 1.0,
+    roundedAABB                   = 0.0,
+    useLanczos3                   = 1.0,
+    fireflyClamp                  = 4.0,
+    adaptiveVarStart              = 0.5,
+    adaptiveVarEnd                = 2.0,
+    shadowTemporalMult            = 10.0,
+    shadowSpatialMult             = 5.0,
     clipDistanceRejectionEnabled  = 0.0,
     clipDistanceRejectionAmount   = 0.0,
     clipDistanceRejectionMinError = 0.05,
-    depthRejRelStatic         = 0.1,
-    depthRejRelMoving         = 0.02,
-    depthRejAbs               = 0.01,
-    velRejBaseStatic          = 0.05,
-    velRejBaseMoving          = 0.05,
-    velRejMotionScale         = 0.5,
-    motionBlendStart          = 1.0,
-    shadowVarianceBase        = 0.2,
-    collapseRatioMin          = 0.05,
-    collapseRatioMax          = 0.35,
-    fallbackFXAA              = 1.0
+    motionBlendStart              = 1.0,
+    shadowVarianceBase            = 0.2,
+    collapseRatioMin              = 0.05,
+    collapseRatioMax              = 0.35,
+    fallbackFXAA                  = 1.0
 }
 
 function M.applySettings(inputs)
@@ -153,7 +137,6 @@ function M.applySettings(inputs)
         pre:setShaderConst("$taaDirectionalVariance",     s.directionalVariance)
         pre:setShaderConst("$taaJitterFlickerFade",       s.jitterFlickerFade)
         pre:setShaderConst("$taaDepthRejection",          s.depthRejection)
-        pre:setShaderConst("$taaVelDisocclusion",         s.velDisocclusion)
         pre:setShaderConst("$taaDebugMode",               s.debugMode)
         pre:setShaderConst("$taaUseDepthDilation",        s.useDepthDilation)
         pre:setShaderConst("$taaAdaptiveVariance",        s.adaptiveVariance)
@@ -166,24 +149,16 @@ function M.applySettings(inputs)
         pre:setShaderConst("$taaVelocityAlignedVariance", s.velocityAlignedVariance)
         pre:setShaderConst("$taaAlignmentFeedbackDrop",   s.alignmentFeedbackDrop)
         pre:setShaderConst("$taaMotionBlendDropSpeed",    s.motionBlendDropSpeed)
-        pre:setShaderConst("$taaBilinearHistoryVel",      s.bilinearHistoryVel)
         pre:setShaderConst("$taaRoundedAABB",             s.roundedAABB)
         pre:setShaderConst("$taaUseLanczos3",             s.useLanczos3)
         pre:setShaderConst("$taaFireflyClamp",            s.fireflyClamp)
         pre:setShaderConst("$taaAdaptiveVarStart",        s.adaptiveVarStart)
         pre:setShaderConst("$taaAdaptiveVarEnd",          s.adaptiveVarEnd)
-        
         pre:setShaderConst("$taaShadowTemporalMult",      s.shadowTemporalMult)
         pre:setShaderConst("$taaShadowSpatialMult",       s.shadowSpatialMult)
         pre:setShaderConst("$taaClipDistanceRejectionEnabled",  s.clipDistanceRejectionEnabled)
         pre:setShaderConst("$taaClipDistanceRejectionAmount",   s.clipDistanceRejectionAmount)
         pre:setShaderConst("$taaClipDistanceRejectionMinError", s.clipDistanceRejectionMinError)
-        pre:setShaderConst("$taaDepthRejRelStatic",       s.depthRejRelStatic)
-        pre:setShaderConst("$taaDepthRejRelMoving",       s.depthRejRelMoving)
-        pre:setShaderConst("$taaDepthRejAbs",             s.depthRejAbs)
-        pre:setShaderConst("$taaVelRejBaseStatic",        s.velRejBaseStatic)
-        pre:setShaderConst("$taaVelRejBaseMoving",        s.velRejBaseMoving)
-        pre:setShaderConst("$taaVelRejMotionScale",       s.velRejMotionScale)
         pre:setShaderConst("$taaMotionBlendStart",        s.motionBlendStart)
         pre:setShaderConst("$taaShadowVarianceBase",      s.shadowVarianceBase)
         pre:setShaderConst("$taaCollapseRatioMin",        s.collapseRatioMin)
@@ -192,23 +167,13 @@ function M.applySettings(inputs)
     end
 
     if fin then
-        fin:setShaderConst("$taaSharpness",             s.sharpness)
-        fin:setShaderConst("$taaAdaptiveSharp",         s.adaptiveSharp)
-        fin:setShaderConst("$taaDebugMode",             s.debugMode)
-        fin:setShaderConst("$taaUseDepthDilation",      s.useDepthDilation)
-        fin:setShaderConst("$taaShadowDarknessThreshold", s.shadowDarknessThreshold)
-        fin:setShaderConst("$taaDepthRejection",        s.depthRejection)
-        fin:setShaderConst("$taaVelDisocclusion",       s.velDisocclusion)
-        fin:setShaderConst("$taaAlignmentRCASBoost",    s.alignmentRCASBoost)
-        fin:setShaderConst("$taaShadowTemporalMult",    s.shadowTemporalMult)
-        fin:setShaderConst("$taaShadowSpatialMult",     s.shadowSpatialMult)
+        fin:setShaderConst("$taaSharpness", s.sharpness)
+        fin:setShaderConst("$taaDebugMode", s.debugMode)
     end
 end
 
 function M.setFrameState(tanX, tanY, yaw, pitch, prevYaw, prevPitch)
     local pre = scenetree.TAA_PreFx
-    local fin = scenetree.TAA_FinalFx
-
     if pre then
         pre:setShaderConst("$taaTanHalfFovX", tanX)
         pre:setShaderConst("$taaTanHalfFovY", tanY)
@@ -217,24 +182,12 @@ function M.setFrameState(tanX, tanY, yaw, pitch, prevYaw, prevPitch)
         pre:setShaderConst("$taaPrevJitterYaw", prevYaw)
         pre:setShaderConst("$taaPrevJitterPitch", prevPitch)
     end
-    if fin then
-        fin:setShaderConst("$taaTanHalfFovX", tanX)
-        fin:setShaderConst("$taaTanHalfFovY", tanY)
-        fin:setShaderConst("$taaJitterYaw", yaw)
-        fin:setShaderConst("$taaJitterPitch", pitch)
-        fin:setShaderConst("$taaPrevJitterYaw", prevYaw)
-        fin:setShaderConst("$taaPrevJitterPitch", prevPitch)
-    end
 end
 
 function M.setEnabled(enabled)
     local pre = scenetree.TAA_PreFx
     if pre then
-        if enabled then 
-            pre:enable() 
-        else 
-            pre:disable()
-        end
+        if enabled then pre:enable() else pre:disable() end
     end
 end
 
@@ -258,22 +211,13 @@ function M.destroy()
     if scenetree.TAA_PreFx then scenetree.TAA_PreFx:delete() end
 end
 
--- Safely switches out the history target at runtime
 function M.setupHistory(state)
     local pre = scenetree.TAA_PreFx
-    local fin = scenetree.TAA_FinalFx
-    if pre and fin then
-        if state == "history" then
-            pre:setField("texture", 2, "#TAA_History")
-            fin:setField("texture", 2, "#TAA_History")
-        else
-            pre:setField("texture", 2, "$backBuffer")
-            fin:setField("texture", 2, "$backBuffer")
-        end
+    if pre then
+        pre:setField("texture", 2, (state == "history") and "#TAA_History" or "$backBuffer")
     end
 end
 
--- Apply defaults on initial load
 M.build()
 M.applySettings()
 

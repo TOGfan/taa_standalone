@@ -1,4 +1,3 @@
--- lua/ge/extensions/taa/taa.lua
 local M = {}
 
 local settingsPath = "settings/taa_standalone.json"
@@ -18,7 +17,7 @@ local hookedCam = nil
 local hookStamp, seenStamp = 0, 0
 local rehookTimer = 0
 
-local savedAA = nil -- Stores the original state of the game's built-in AA
+local savedAA = nil
 
 local function halton(index, base)
     local f, r, i = 1, 0, index
@@ -166,41 +165,28 @@ local function unhookScreenshot()
     end
 end
 
--- =============================================================================
--- In-Game AA Suppression Logic
--- =============================================================================
-
 local function suppressGameAA()
     if savedAA then return end
-    
     local fxaa = scenetree.findObject("FXAA_PostEffect")
     local smaa = scenetree.findObject("SMAA_PostEffect")
-    
     if not fxaa and not smaa then return end
     
     savedAA = {
         fxaa = fxaa and fxaa:isEnabled() or false, 
         smaa = smaa and smaa:isEnabled() or false
     }
-    
     if fxaa then fxaa:disable() end
     if smaa then smaa:disable() end
 end
 
 local function restoreGameAA()
     if not savedAA then return end
-    
     local fxaa = scenetree.findObject("FXAA_PostEffect")
     local smaa = scenetree.findObject("SMAA_PostEffect")
-    
     if fxaa and savedAA.fxaa then fxaa:enable() end
     if smaa and savedAA.smaa then smaa:enable() end
     savedAA = nil
 end
-
--- =============================================================================
--- State Management
--- =============================================================================
 
 local function saveState()
     local currentSettings = {}
@@ -212,12 +198,7 @@ local function saveState()
             currentSettings = savedData.settings
         end
     end
-    
-    local data = {
-        active = active,
-        settings = currentSettings
-    }
-    jsonWriteFile(settingsPath, data, true)
+    jsonWriteFile(settingsPath, { active = active, settings = currentSettings }, true)
 end
 
 local function loadState()
@@ -239,7 +220,6 @@ local function ensureChain()
     end
 
     if mod.build then mod.build() end
-    
     if not mod.exists() then
         pfx = nil
         return false
@@ -250,7 +230,6 @@ local function ensureChain()
     if savedData and type(savedData) == "table" and savedData.settings then
         pfx.applySettings(savedData.settings)
     end
-    
     return true
 end
 
@@ -266,8 +245,7 @@ local function start()
         pfx.setEnabled(true) 
     end
     
-    suppressGameAA() -- Disable in-game FXAA/SMAA while TAA is running
-    
+    suppressGameAA()
     active = true
     hookCamera()
     hookScreenshot()
@@ -284,7 +262,7 @@ local function stop()
     publishNoJitter()
     unhookCamera()
     unhookScreenshot()
-    restoreGameAA() -- Restore user's graphics settings
+    restoreGameAA()
 end
 
 local function init()
@@ -318,12 +296,7 @@ M.onPreRender = function(dt)
         if worldReadyState < 1 then return end
         initDone = true
         
-        if active then 
-            start() 
-        else
-            ensureChain()
-            stop() 
-        end
+        if active then start() else ensureChain(); stop() end
         return
     end
 
