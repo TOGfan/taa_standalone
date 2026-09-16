@@ -152,7 +152,7 @@ const settingsSchema = [
   {
     name: "General & Sharpening",
     items: [
-      { id: 'sharpness', type: 'float', min: 0.0, max: 1.0, step: 0.01, default: 0.25, name: "Sharpening Strength (RCAS)", desc: "Contrast-adaptive sharpening applied to the final resolved image, clamped to the local pixel range so it cannot overshoot or ring. 0 disables." },
+      { id: 'sharpness', type: 'float', min: 0.0, max: 1.0, step: 0.01, default: 0.50, name: "Sharpening Strength (RCAS)", desc: "Contrast-adaptive sharpening applied to the final resolved image, clamped to the local pixel range so it cannot overshoot or ring. 0 disables." },
       { id: 'jitterScale', type: 'float', min: 0.0, max: 2.0, step: 0.01, default: 1.0, name: "Jitter Spread Scale", desc: "Scales the sub-pixel camera offset pattern. Above 1 samples a wider area within each pixel (more edge anti-aliasing, more temporal softening); below 1 tightens it." },
       { id: 'fallbackFXAA', type: 'numBool', default: 1.0, name: "Fallback Spatial AA (FXAA)", desc: "Applies FXAA edge smoothing to pixels whose temporal history was rejected, so disoccluded areas don't alias while the history rebuilds." }
     ]
@@ -162,11 +162,11 @@ const settingsSchema = [
     items: [
       { id: 'feedbackMax', type: 'float', min: 0.0, max: 0.99, step: 0.01, default: 0.97, name: "History Blend (Static Scenes)", desc: "How much of the previous frame is reused for stationary pixels. Higher = smoother and cleaner but slower to react to changes; lower = more responsive but noisier. 0.97 corresponds to roughly a 33-frame accumulation window." },
       { id: 'feedbackMin', type: 'float', min: 0.0, max: 0.99, step: 0.01, default: 0.97, name: "History Blend (Moving Pixels)", desc: "History reuse once pixel velocity exceeds the motion transition range below. Typically set at or below the static value so motion receives less smoothing." },
-      { id: 'lumaDriftStrength', type: 'float', min: 0.0, max: 0.3, step: 0.01, default: 0.1, name: "Luma Drift Correction", desc: "Pulls history brightness toward the current image to clear ghost trails from moving shadows, exposure changes and vehicle lights, without reducing temporal smoothing. 0 = off. Only engages on large brightness mismatches on the same surface (see the chroma gate below), so it does not chase noise, jitter or ghosts. Higher values clear trails faster." },
+      { id: 'lumaDriftStrength', type: 'float', min: 0.0, max: 0.3, step: 0.01, default: 0.0, name: "Luma Drift Correction", desc: "Pulls history brightness toward the current image to clear ghost trails from moving shadows, exposure changes and vehicle lights, without reducing temporal smoothing. 0 = off. Only engages on large brightness mismatches on the same surface (see the chroma gate below), so it does not chase noise, jitter or ghosts. Higher values clear trails faster." },
       { id: 'lumaDriftChromaTol', type: 'float', min: 0.0, max: 0.5, step: 0.01, default: 0.1, name: "Drift Same-Surface Tolerance", desc: "Color-match tolerance for the luma drift correction, comparing color-per-brightness so that pure lighting changes (shadows, exposure) pass while a different surface does not. History from a differently-colored object (ghosts, reveal edges) fails this test and is left to the normal rejection paths -- drift only ever corrects brightness, never disguises color mismatches. Raise if legitimate shadows aren't being corrected; lower if colored ghosts linger. 0 requires an exact match (drift effectively off)." },
       { id: 'motionBlendStart', type: 'float', min: 0.0, max: 5.0, step: 0.01, default: 1.0, name: "Motion Transition Start", desc: "Pixel velocity (in pixels per frame) at which blending starts transitioning from the static to the motion weight." },
       { id: 'motionBlendDropSpeed', type: 'float', min: 1.0, max: 20.0, step: 0.1, default: 1.0, name: "Motion Transition End", desc: "Pixel velocity at which the blend reaches the motion weight fully." },
-      { id: 'alignmentFeedbackDrop', type: 'float', min: 0.5, max: 1.0, step: 0.01, default: 0.8, name: "Sub-Pixel Alignment Drop", desc: "Reduces history weight when the reprojected sample lands between pixels (sub-pixel misalignment), where the resampling kernel is least accurate. 1.0 disables the reduction." }
+      { id: 'alignmentFeedbackDrop', type: 'float', min: 0.5, max: 1.0, step: 0.01, default: 0.9, name: "Sub-Pixel Alignment Drop", desc: "Reduces history weight when the reprojected sample lands between pixels (sub-pixel misalignment), where the resampling kernel is least accurate. 1.0 disables the reduction." }
     ]
   },
   {
@@ -184,9 +184,9 @@ const settingsSchema = [
     items: [
       { id: 'useKDopClipping', type: 'numBool', default: 1.0, name: "k-DOP History Clipping", desc: "Clips history against a 16-direction convex hull of the neighborhood colors instead of a simple bounding box. A tighter bound on valid history at higher cost." },
       { id: 'kdopVarianceClipping', type: 'numBool', default: 0.0, name: "k-DOP Variance Extents", desc: "Builds the k-DOP bounds from statistical variance instead of the absolute min/max of the neighborhood -- more forgiving of single outlier samples." },
-      { id: 'useCovarianceClipping', type: 'numBool', default: 1.0, name: "Covariance Clipping (Ellipsoid)", desc: "Clips history against an ellipsoid fit of the neighborhood color distribution. Only active when k-DOP clipping is disabled -- the k-DOP path supersedes it." },
+      { id: 'useCovarianceClipping', type: 'numBool', default: 0.0, name: "Covariance Clipping (Ellipsoid)", desc: "Clips history against an ellipsoid fit of the neighborhood color distribution. Only active when k-DOP clipping is disabled -- the k-DOP path supersedes it." },
       { id: 'colorSpaceOklab', type: 'numBool', default: 1.0, name: "Oklab Clipping Color Space", desc: "Performs history clipping in Oklab (perceptually uniform) instead of YCoCg. Slightly higher GPU cost." },
-      { id: 'varianceGamma', type: 'float', min: 0.0, max: 3.0, step: 0.01, default: 1.25, name: "Variance Box Scale", desc: "Scales the size of the color bounds that clamp history. Higher = looser clamp (history survives more, with more smear potential); lower = tighter (sharper, but more history rejection)." },
+      { id: 'varianceGamma', type: 'float', min: 0.0, max: 3.0, step: 0.01, default: 1.50, name: "Variance Box Scale", desc: "Scales the size of the color bounds that clamp history. Higher = looser clamp (history survives more, with more smear potential); lower = tighter (sharper, but more history rejection)." },
       { id: 'chromaVarianceMod', type: 'float', min: 0.5, max: 2.0, step: 0.01, default: 1.0, name: "Chroma Bounds Scale", desc: "Independent multiplier for the color (non-brightness) axes of the variance bounds." },
       { id: 'softClip', type: 'float', min: 0.0, max: 1.0, step: 0.01, default: 0.0, name: "Soft Clip Strength", desc: "Eases history into the variance bounds instead of snapping hard, in near-static scenes. Reduces clipping 'popping' at the cost of a slight ghost linger; fades out with motion." },
       { id: 'clipOvershoot', type: 'float', min: 0.0, max: 0.5, step: 0.01, default: 0.0, name: "Clip Overshoot Margin", desc: "Lets accumulated history exceed the neighborhood color bounds by this fraction of the local color range. The resampling kernel's negative lobes reconstruct edges steeper than any single frame's samples; a strict per-frame bound flattens that reconstruction. With a margin, frame-consistent edge overshoot accumulates (sharper edges over multiple reprojections) while frame-inconsistent ringing averages away -- at the cost of some visible ringing on thin high-contrast geometry. On the k-DOP path this margin plus the hull is the entire color bound (there is no outer safety clamp). Raise if fine detail looks soft; lower if edges halo, crawl, or ghosts linger. If ghost trails lengthen, enable Smear Rejection under Advanced Rejection." }
@@ -218,9 +218,9 @@ const settingsSchema = [
     name: "Advanced Rejection",
     items: [
       { id: 'depthRejection', type: 'float', min: 0.0, max: 1.0, step: 0.01, default: 0.01, name: "Disocclusion Sensitivity", desc: "Threshold of the geometry-based disocclusion test: how much closer than every surface in the 1-pixel dilation zone the history must be before it is rejected as stale. 0 disables depth rejection entirely." },
-      { id: 'clipDistanceRejectionEnabled', type: 'numBool', default: 0.0, name: "Smear Rejection", desc: "Drops history weight where the clip hull had to move the history a long way -- a ghosting indicator for content without motion vectors (animated textures, particles)." },
+      { id: 'clipDistanceRejectionEnabled', type: 'numBool', default: 1.0, name: "Smear Rejection", desc: "Drops history weight where the clip hull had to move the history a long way -- a ghosting indicator for content without motion vectors (animated textures, particles)." },
       { id: 'clipDistanceRejectionAmount', type: 'float', min: 0.0, max: 1.0, step: 0.001, default: 0.0, name: "Smear Rejection Tolerance", desc: "How far the clip distance must exceed the minimum error before history is fully rejected." },
-      { id: 'clipDistanceRejectionMinError', type: 'float', min: 0.001, max: 0.5, step: 0.001, default: 0.05, name: "Smear Rejection Min Error", desc: "Minimum clip distance before smear rejection begins to engage." },
+      { id: 'clipDistanceRejectionMinError', type: 'float', min: 0.001, max: 0.5, step: 0.001, default: 0.15, name: "Smear Rejection Min Error", desc: "Minimum clip distance before smear rejection begins to engage." },
       { id: 'fireflyClamp', type: 'float', min: 1.0, max: 10.0, step: 0.1, default: 4.0, name: "Firefly Clamp", desc: "Clamps the variance bounds against extreme bright outliers, in standard deviations of the neighborhood. Lower = tighter (fewer fireflies, more clipping of legitimate highlights)." }
     ]
   },
@@ -254,10 +254,10 @@ settingsSchema.forEach(cat => {
 })
 
 const presets = {
-  Performance: { useLanczos3: 0, useKDopClipping: 0, colorSpaceOklab: 0 },
+  Performance: { feedbackMax: 0.95, feedbackMin: 0.95, useLanczos3: 0, useKDopClipping: 0, colorSpaceOklab: 0 },
   Balanced: { useKDopClipping: 0, colorSpaceOklab: 0}, 
   Clarity: { feedbackMax: 0.95, feedbackMin: 0.95, },
-  Smooth: { feedbackMax: 0.99, feedbackMin: 0.99, alignmentFeedbackDrop: 0.9 }
+  Smooth: { }
 }
 
 function formatDefault(item) {

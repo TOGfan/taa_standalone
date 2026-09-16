@@ -4,34 +4,10 @@
 uniform_sampler2D(sceneTex,     0);
 uniform_sampler2D(depthTex,     1);
 uniform_sampler2D(historyTex,   2);
-uniform_sampler2D(velocityTex, 3);
+uniform_sampler2D(velocityTex,  3);
 
 // ============================================================================
 // CBUFFER
-// ============================================================================
-// taaHistoryOvershoot   -- soft anti-ringing margin for BOTH history samplers
-//                         (Lanczos3 and Catmull-Rom), applied UNIFORMLY to
-//                         luma and chroma as a fraction of the local color
-//                         range, evaluated in the working color space.
-//                         Values >= ~0.3 stop binding (effectively unclamped
-//                         sampler); the clip hull/margins are the bound.
-// taaClipOvershoot      -- fraction of the full 9-tap neighborhood color range
-//                         that history may EXCEED the clip bounds by (k-DOP
-//                         extents, variance boxes). Lets the resampling
-//                         kernel's negative-lobe overshoot survive
-//                         accumulation: coherent edge overshoot accumulates
-//                         across frames while incoherent ringing averages
-//                         away. Bounded by construction -- the margin derives
-//                         from the current frame only, so overshoot
-//                         saturates at range + margin and cannot compound.
-//                         NOTE: there is NO outer safety clamp anymore --
-//                         on the k-DOP path the hull + this margin is the
-//                         entire color bound.
-// taaLumaDriftStrength  -- fraction of the remaining luma mismatch corrected
-//                         per frame (0 = off). Proportional form: loop pole
-//                         is feedback*(1-k) < 1 for any k <= 1.
-// taaLumaDriftChromaTol -- same-surface gate tolerance for the drift
-//                         correction, in chromaticity (chroma-per-luma) units.
 // ============================================================================
 cbuffer perDraw
 {
@@ -80,15 +56,42 @@ cbuffer perDraw
 // ============================================================================
 // CONSTANTS
 // ============================================================================
-static const float kEpsilon               = 1e-5;
-static const float kLargeValue            = 1e5;
-static const float kSqrt2                 = 1.41421356;
-static const float taaMinMotionDir        = 0.1;
-static const float kShadowLumaFloor       = 0.01;
-static const float kShadowThresholdMin    = 0.001;
-static const float kFlickerPadThreshold   = 0.001;
+static const float kEpsilon                 = 1e-5;
+static const float kLargeValue              = 1e5;
+static const float kSqrt2                   = 1.41421356;
+static const float kLog2E                   = 1.44269504;  // exp(x) == exp2(x * kLog2E)
+static const float taaMinMotionDir          = 0.1;
+static const float kShadowLumaFloor         = 0.01;
+static const float kShadowThresholdMin      = 0.001;
+static const float kFlickerPadThreshold     = 0.001;
 static const float kMinMotionBlendDropSpeed = 0.1;
-static const float kFSRConfidenceThreshold= 0.3;
+static const float kFSRConfidenceThreshold  = 0.3;
+
+// Motion, in pixels, at which motion-gated effects (velocity-aligned variance
+// weighting, jitter-padding fade, soft-clip motion blend) reach full strength.
+static const float kMotionFullStrengthPx    = 8.0;
+
+static const float kMinSigma                = 0.001;  // sigma floor for clipping
+static const float kMinSpatialContrast      = 0.001;  // spatial contrast floor
+static const float kMinFootprintRange       = 1e-4;   // history footprint / slab range floor
+static const float kFireflyClampEpsilon     = 0.001;  // below this the firefly clamp counts as "off"
+
+// Fallback FXAA
+static const float kFXAAReduceMul           = 1.0 / 128.0;
+static const float kFXAAReduceMin           = 1.0 / 128.0;
+static const float kFXAAMaxDir              = 8.0;
+static const float kFXAABlendKnee           = 0.8;    // blend level below which FXAA engages
+static const float kFXAABlendSharpness      = 2.0;    // steepness of the FXAA engage ramp
+
+// Luma drift correction
+static const float kLumaDriftLumaFloor      = 0.05;   // luma floor for the chroma-ratio test
+static const float kLumaDriftRelThreshold   = 0.30;   // relative luma error that triggers correction
+static const float kLumaDriftAbsThreshold   = 0.03;   // absolute luma error that triggers correction
+static const float kLumaDriftChromaFadeWidth = 2.0;   // chroma tolerance fade, in multiples of tol
+
+// Debug views
+static const float kDebugVelocityScale      = 0.1;
+static const float kDebugLinearDepthRange   = 100.0;
 
 static const float2 kOffsets3x3[9] =
 {
@@ -164,12 +167,6 @@ float3x3 InverseSymmetric3x3(float3x3 m, out bool success)
 // ============================================================================
 // REPROJECTION & DEPTH
 // ============================================================================
-// Bases are built on the CPU (taa.lua setFrameState). For a screen UV:
-//     r2 = uv.x * P + Q - uv.y * R
-// and on the prev-frame basis a velocity offset is linear:
-//     r2(uv + vel) = r2(uv) + vel.x * P - vel.y * R
-// ============================================================================
-
 float2 ReprojFinish(float3 r2)
 {
     if (r2.y <= kEpsilon) return float2(-1.0, -1.0);
@@ -189,9 +186,6 @@ float2 ReprojectPrev(float3 rBase, float2 vel, float3 P, float3 R)
 
 float LinearizeDepth(float rawDepth) { return 1.0 / max(rawDepth, kEpsilon); }
 
-// Un-jittered view ray for a screen UV (camera at origin, +Y forward).
-// Used by the plane-based disocclusion test; assumes LinearizeDepth(raw)
-// is roughly view-space Z (the /100 debug scaling suggests it is).
 float3 RayFromUV(float2 uv)
 {
     return float3((uv.x * 2.0 - 1.0) * taaTanHalfFovX, 1.0, (1.0 - uv.y * 2.0) * taaTanHalfFovY);
@@ -211,13 +205,13 @@ float3 ApplyFXAACached(float2 uv, float2 texel, float3 cachedRGB[9])
     float lumaMin = min(lumaM, min(min(lumaNW, lumaNE), min(lumaSW, lumaSE)));
     float lumaMax = max(lumaM, max(max(lumaNW, lumaNE), max(lumaSW, lumaSE)));
 
-    float dirReduce = max((lumaNW + lumaNE + lumaSW + lumaSE) * (0.25 * (1.0/128.0)), (1.0/128.0));
+    float dirReduce = max((lumaNW + lumaNE + lumaSW + lumaSE) * (0.25 * kFXAAReduceMul), kFXAAReduceMin);
     float rcpDirMin = 1.0 / (min(abs(lumaMax - lumaMin), max(lumaMax, 1.0)) + dirReduce);
 
     float2 dir;
     dir.x = -((lumaNW + lumaNE) - (lumaSW + lumaSE));
     dir.y =  ((lumaNW + lumaSW) - (lumaNE + lumaSE));
-    dir = clamp(dir * rcpDirMin, float2(-8.0, -8.0), float2(8.0, 8.0)) * texel;
+    dir = clamp(dir * rcpDirMin, float2(-kFXAAMaxDir, -kFXAAMaxDir), float2(kFXAAMaxDir, kFXAAMaxDir)) * texel;
 
     float3 rgbA = 0.5 * (
         tex2Dlod(sceneTex, float4(uv + dir * (1.0/3.0 - 0.5), 0.0, 0.0)).rgb +
@@ -232,14 +226,7 @@ float3 ApplyFXAACached(float2 uv, float2 texel, float3 cachedRGB[9])
 }
 
 // ============================================================================
-// HISTORY SAMPLING
-// ============================================================================
-// NOTE: BOTH samplers return the history color ALREADY CONVERTED to the
-// working color space. The anti-ringing clamp lives inside them: footprint
-// min/max (the taps each kernel actually reads) + a soft uniform margin
-// (taaHistoryOvershoot, applied equally to luma and chroma), evaluated in
-// the working color space. The filtering itself runs in linear RGB (the
-// correct domain for weighted resampling); only the bound is in color space.
+// HISTORY SAMPLING (RGB Footprint Anti-Ringing)
 // ============================================================================
 float3 SampleHistoryLanczos3(float2 uv, float2 texSize, float2 invTexSize, float2 minUV, float2 maxUV)
 {
@@ -273,8 +260,6 @@ float3 SampleHistoryLanczos3(float2 uv, float2 texSize, float2 invTexSize, float
     }
 
     float3 color = 0.0;
-    // Min/max over the WHOLE kernel footprint (the old 2x2 center clamp
-    // forced Catmull-Rom-class output out of a 36-tap filter).
     float3 footMin = kLargeValue;
     float3 footMax = -kLargeValue;
 
@@ -284,7 +269,7 @@ float3 SampleHistoryLanczos3(float2 uv, float2 texSize, float2 invTexSize, float
         [unroll]
         for (int x = 0; x < 6; ++x)
         {
-            float3 tapColor = tex2Dlod(historyTex, float4(uvsX[x], uvsY[y], 0.0, 0.0)).rgb;
+            float3 tapColor = max(0.0, tex2Dlod(historyTex, float4(uvsX[x], uvsY[y], 0.0, 0.0)).rgb);
             color += tapColor * (wX[x] * wY[y]);
 
             footMin = min(footMin, tapColor);
@@ -292,23 +277,15 @@ float3 SampleHistoryLanczos3(float2 uv, float2 texSize, float2 invTexSize, float
         }
     }
 
-    // Soft anti-ringing clamp in the working color space, UNIFORM margin
-    // across luma and chroma (single shared knob). Mapping the RGB box
-    // corners through ToSpace is an approximation (per-channel order can
-    // even invert under the nonlinear Oklab map, hence the min/max); the
-    // clip hull/margins are the remaining bound.
-    float3 cSpace = ToSpace(color);
-    float3 fMinS  = ToSpace(footMin);
-    float3 fMaxS  = ToSpace(footMax);
-    float3 lo = min(fMinS, fMaxS);
-    float3 hi = max(fMinS, fMaxS);
-    float3 rng = max(hi - lo, 1e-4);
-    float3 margin = taaHistoryOvershoot * rng;
+    // Soft anti-ringing clamp in RGB space BEFORE ToSpace()
+    float3 footRng = max(footMax - footMin, kMinFootprintRange);
+    float3 footMargin = taaHistoryOvershoot * footRng;
+    color = clamp(color, footMin - footMargin, footMax + footMargin);
 
-    return clamp(cSpace, lo - margin, hi + margin);
+    return ToSpace(max(0.0, color));
 }
 
-float3 SampleHistoryCatmullRom5Tap(float2 uv, float2 texSize, float2 invTexSize)
+float3 SampleHistoryCatmullRom5Tap(float2 uv, float2 texSize, float2 invTexSize, float2 minUV, float2 maxUV)
 {
     float2 samplePos = uv * texSize;
     float2 tc = floor(samplePos - 0.5) + 0.5;
@@ -323,15 +300,15 @@ float3 SampleHistoryCatmullRom5Tap(float2 uv, float2 texSize, float2 invTexSize)
     float2 w12 = w1 + w2;
     float2 offset12 = w2 / (w12 + 1e-5);
 
-    float2 tc0 = (tc - 1.0) * invTexSize;
-    float2 tc3 = (tc + 2.0) * invTexSize;
-    float2 tc12 = (tc + offset12) * invTexSize;
+    float2 tc0  = clamp((tc - 1.0) * invTexSize, minUV, maxUV);
+    float2 tc3  = clamp((tc + 2.0) * invTexSize, minUV, maxUV);
+    float2 tc12 = clamp((tc + offset12) * invTexSize, minUV, maxUV);
 
-    float3 tap0 = tex2Dlod(historyTex, float4(tc12.x, tc0.y, 0.0, 0.0)).rgb;
-    float3 tap1 = tex2Dlod(historyTex, float4(tc0.x, tc12.y, 0.0, 0.0)).rgb;
-    float3 tap2 = tex2Dlod(historyTex, float4(tc12.x, tc12.y, 0.0, 0.0)).rgb;
-    float3 tap3 = tex2Dlod(historyTex, float4(tc3.x, tc12.y, 0.0, 0.0)).rgb;
-    float3 tap4 = tex2Dlod(historyTex, float4(tc12.x, tc3.y, 0.0, 0.0)).rgb;
+    float3 tap0 = max(0.0, tex2Dlod(historyTex, float4(tc12.x, tc0.y, 0.0, 0.0)).rgb);
+    float3 tap1 = max(0.0, tex2Dlod(historyTex, float4(tc0.x, tc12.y, 0.0, 0.0)).rgb);
+    float3 tap2 = max(0.0, tex2Dlod(historyTex, float4(tc12.x, tc12.y, 0.0, 0.0)).rgb);
+    float3 tap3 = max(0.0, tex2Dlod(historyTex, float4(tc3.x, tc12.y, 0.0, 0.0)).rgb);
+    float3 tap4 = max(0.0, tex2Dlod(historyTex, float4(tc12.x, tc3.y, 0.0, 0.0)).rgb);
 
     float w0y   = w12.x * w0.y;
     float w0x   = w0.x * w12.y;
@@ -343,37 +320,32 @@ float3 SampleHistoryCatmullRom5Tap(float2 uv, float2 texSize, float2 invTexSize)
     float wsum = w0y + w0x + w12xy + w3x + w3y;
     color /= max(wsum, 1e-4);
 
-    // Footprint bounds over the 5 taps, same color-space soft clamp and
-    // SAME KNOB as the Lanczos sampler, so both paths behave identically.
+    // Soft anti-ringing clamp in RGB space BEFORE ToSpace()
     float3 footMin = min(tap0, min(tap1, min(tap2, min(tap3, tap4))));
     float3 footMax = max(tap0, max(tap1, max(tap2, max(tap3, tap4))));
 
-    float3 cSpace = ToSpace(color);
-    float3 fMinS  = ToSpace(footMin);
-    float3 fMaxS  = ToSpace(footMax);
-    float3 lo = min(fMinS, fMaxS);
-    float3 hi = max(fMinS, fMaxS);
-    float3 rng = max(hi - lo, 1e-4);
-    float3 margin = taaHistoryOvershoot * rng;
+    float3 footRng = max(footMax - footMin, kMinFootprintRange);
+    float3 footMargin = taaHistoryOvershoot * footRng;
+    color = clamp(color, footMin - footMargin, footMax + footMargin);
 
-    return clamp(cSpace, lo - margin, hi + margin);
+    return ToSpace(max(0.0, color));
 }
 
 // ============================================================================
 // DATA STRUCTURES
 // ============================================================================
 struct DepthVelocityStats { 
-    float closestRawDepth;       // closest raw depth in the 3x3 dilation zone
-    float minRawDepthSearch; 
-    float maxRawDepthSearch; 
+    float closestRawDepth;
     float2 bestVel; 
-    float2 closestTapUV;         // UV of the tap that owns closestRawDepth
-    float rightRawDepth;         // raw depth of the (+1,0) tap (plane tilt fit)
-    float downRawDepth;          // raw depth of the (0,+1) tap (plane tilt fit)
+    float2 closestTapUV;
+    float rightRawDepth;
+    float2 rightTapUV;
+    float downRawDepth;
+    float2 downTapUV;
 };
 
 struct NeighborhoodStats { 
-    float3 aabbMin;              // 9-tap min/max (firefly-clamped)
+    float3 aabbMin;
     float3 aabbMax; 
     float3 mu; 
     float3 sigma; 
@@ -418,21 +390,18 @@ float SampleDilatedHistoryDepth(float2 historyUV, float2 passTexel, float2 passT
 // ============================================================================
 // NEIGHBORHOOD STATISTICS
 // ============================================================================
-NeighborhoodStats ComputeNeighborhoodStats(float3 cachedSpace[9], float2 velocityDir, float pixelMotion, float effectiveMotion, float2 localJitterPx)
+NeighborhoodStats ComputeNeighborhoodStats(float3 cachedSpace[9], float2 velocityDir, float normalizedMotion, float2 localJitterPx)
 {
     NeighborhoodStats stats; stats.validCovariance = false;
     stats.aabbMin  = kLargeValue; stats.aabbMax  = -kLargeValue;
 
-    // PERF: the covariance + inverse are only consumed by the non-kDop clip
-    // path in ClipHistory; skip them entirely when kDop is active.
     bool wantCovariance = (taaUseCovarianceClipping > 0.5) && (taaUseKDopClipping <= 0.5);
-    // PERF: the jitter gradient is only needed for flicker padding.
     bool needExpectedShift = (taaJitterFlickerPadding > kFlickerPadThreshold);
 
     float3 m1 = 0.0, m2 = 0.0;
-    float3 mCross = 0.0;   // weighted E[xy], E[xz], E[yz] (fused covariance pass)
+    float3 mCross = 0.0;
     float weightSum = 0.0;
-    float motionFactor = saturate(pixelMotion);
+    float motionFactor = saturate(normalizedMotion);
 
     bool useShiftedCenter = (taaJitterAwareVariance > 0.5);
     float2 centerShift = useShiftedCenter ? localJitterPx : 0.0;
@@ -447,7 +416,7 @@ NeighborhoodStats ComputeNeighborhoodStats(float3 cachedSpace[9], float2 velocit
         stats.aabbMax = max(stats.aabbMax, cSpace);
 
         float2 shiftOffset = pixelOffset - centerShift;
-        float w = useShiftedCenter ? exp(-dot(shiftOffset, shiftOffset)) : kStdWeights[i];
+        float w = useShiftedCenter ? exp2(-dot(shiftOffset, shiftOffset) * kLog2E) : kStdWeights[i];
 
         if (taaLumaVariance > 0.5) { 
             w *= (1.0 / (1.0 + max(cSpace.x, 0.0))); 
@@ -467,12 +436,15 @@ NeighborhoodStats ComputeNeighborhoodStats(float3 cachedSpace[9], float2 velocit
     stats.mu = m1 * invWeightSum;
     stats.sigma = sqrt(max(m2 * invWeightSum - stats.mu * stats.mu, 0.0));
 
-    float3 fireflyMin = stats.mu - taaFireflyClamp * stats.sigma; 
-    float3 fireflyMax = stats.mu + taaFireflyClamp * stats.sigma;
-    stats.aabbMin  = clamp(stats.aabbMin, fireflyMin, fireflyMax); 
-    stats.aabbMax  = clamp(stats.aabbMax, fireflyMin, fireflyMax);
+    if (taaFireflyClamp > kFireflyClampEpsilon)
+    {
+        float3 fireflyMin = stats.mu - taaFireflyClamp * stats.sigma; 
+        float3 fireflyMax = stats.mu + taaFireflyClamp * stats.sigma;
+        stats.aabbMin  = clamp(stats.aabbMin, fireflyMin, fireflyMax); 
+        stats.aabbMax  = clamp(stats.aabbMax, fireflyMin, fireflyMax);
+    }
 
-    stats.spatialContrast = max(stats.aabbMax.x - stats.aabbMin.x, 0.001);
+    stats.spatialContrast = max(stats.aabbMax.x - stats.aabbMin.x, kMinSpatialContrast);
 
     stats.expectedColorShift = 0.0;
     if (needExpectedShift) {
@@ -483,7 +455,6 @@ NeighborhoodStats ComputeNeighborhoodStats(float3 cachedSpace[9], float2 velocit
 
     if (wantCovariance)
     {
-        // covariance from the moments accumulated above: cov = E[ccT] - mu*muT
         float3x3 cov = float3x3(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
         cov[0][0] = m2.x * invWeightSum - stats.mu.x * stats.mu.x;
         cov[1][1] = m2.y * invWeightSum - stats.mu.y * stats.mu.y;
@@ -496,7 +467,7 @@ NeighborhoodStats ComputeNeighborhoodStats(float3 cachedSpace[9], float2 velocit
 
         if (taaJitterFlickerPadding > kFlickerPadThreshold)
         {
-            float paddingFade = (taaJitterFlickerFade > 0.5) ? saturate(1.0 - effectiveMotion) : 1.0;
+            float paddingFade = (taaJitterFlickerFade > 0.5) ? saturate(1.0 - normalizedMotion) : 1.0;
             float padMult = taaJitterFlickerPadding * paddingFade;
             
             if (taaDirectionalVariance > 0.5)
@@ -524,14 +495,14 @@ NeighborhoodStats ComputeNeighborhoodStats(float3 cachedSpace[9], float2 velocit
 
     if (!stats.validCovariance && taaJitterFlickerPadding > kFlickerPadThreshold)
     {
-        float paddingFade = (taaJitterFlickerFade > 0.5) ? saturate(1.0 - effectiveMotion) : 1.0;
+        float paddingFade = (taaJitterFlickerFade > 0.5) ? saturate(1.0 - normalizedMotion) : 1.0;
         float padMult = taaJitterFlickerPadding * paddingFade;
         
         if (taaDirectionalVariance > 0.5) { stats.sigma += abs(stats.expectedColorShift * padMult); }
         else { stats.sigma += (stats.spatialContrast * length(localJitterPx) * padMult); }
     }
 
-    stats.sigma = max(stats.sigma, 0.001);
+    stats.sigma = max(stats.sigma, kMinSigma);
     return stats;
 }
 
@@ -564,7 +535,7 @@ float3 IntersectRayAABB(float3 history, float3 target, float3 boxMin, float3 box
         
         if (softClip > 0.0)
         {
-            float softLimit = 1.0 + softClip * (1.0 - exp(-(maUnit - 1.0)));
+            float softLimit = 1.0 + softClip * (1.0 - exp2(-(maUnit - 1.0) * kLog2E));
             float blendSoft = lerp(softLimit, 1.0, motionFactor);
             clipped = lerp(history, clipped, 1.0 / max(blendSoft, 1.0));
         }
@@ -576,53 +547,35 @@ float3 IntersectRayAABB(float3 history, float3 target, float3 boxMin, float3 box
 // ============================================================================
 // HISTORY CLIPPING
 // ============================================================================
-// clipMargin: per-channel overshoot allowance (taaClipOvershoot * local
-// 9-tap range), added to every bound that constrains history so the
-// resampling kernel's negative-lobe reconstruction can survive accumulation.
-// On the k-DOP path this hull + margin is the ENTIRE color bound (the outer
-// safety clamp was removed; see mainP step 11).
-float3 ClipHistory(float3 historySpace, NeighborhoodStats stats, float effectiveMotion, float dynamicGamma, float3 cachedSpace[9], float2 localJitterPx, float3 clipMargin)
+float3 ClipHistory(float3 historySpace, NeighborhoodStats stats, float normalizedMotion, float dynamicGamma, float3 cachedSpace[9], float3 clipMargin)
 {
+    float motionFactor = saturate(normalizedMotion);
+
     if (taaUseKDopClipping > 0.5)
     {
-        float3 rayCenter = stats.mu; float3 dir = historySpace - rayCenter;
-        float nearHit = -kLargeValue; float farHit = kLargeValue;
-        
-        float padMult = (taaJitterFlickerPadding > kFlickerPadThreshold) ? (taaJitterFlickerPadding * ((taaJitterFlickerFade > 0.5) ? saturate(1.0 - effectiveMotion) : 1.0)) : 0.0;
+        float3 rayCenter = stats.mu; 
+        float3 dir = historySpace - rayCenter;
+        float nearHit = -kLargeValue; 
+        float farHit = kLargeValue;
 
         [unroll]
         for (int a = 0; a < 16; ++a)
         {
-            float3 axis = kDopAxes[a]; float2 extents = float2(kLargeValue, -kLargeValue);
+            float3 axis = kDopAxes[a]; 
+            float2 extents = float2(kLargeValue, -kLargeValue);
             
             float proj[9];
             [unroll]
             for (int n = 0; n < 9; ++n) { proj[n] = dot(cachedSpace[n], axis); }
             
             float proj_pos = dot(rayCenter, axis);
-            float expectedAxisShift = 0.0;
-            
-            if (padMult > 0.0)
-            {
-                if (taaDirectionalVariance > 0.5)
-                {
-                    expectedAxisShift = dot(stats.expectedColorShift * padMult, axis);
-                }
-                else
-                {
-                    float crossMin = min(proj[0], min(min(proj[1], proj[2]), min(proj[3], proj[4])));
-                    float crossMax = max(proj[0], max(max(proj[1], proj[2]), max(proj[3], proj[4])));
-                    float padAmt = (crossMax - crossMin) * length(localJitterPx) * padMult;
-                    extents.x -= padAmt;
-                    extents.y += padAmt;
-                }
-            }
 
             if (taaKDopVariance > 0.5)
             {
                 float2 moments = 0.0;
                 float wSum = 0.0;
-                float pMin = kLargeValue; float pMax = -kLargeValue;
+                float pMin = kLargeValue; 
+                float pMax = -kLargeValue;
                 [unroll]
                 for (int n = 0; n < 9; ++n) 
                 { 
@@ -634,24 +587,16 @@ float3 ClipHistory(float3 historySpace, NeighborhoodStats stats, float effective
                 }
                 moments /= wSum;
                 
-                float mu = moments.x; float sigma = sqrt(max(moments.y - mu * mu, 0.0));
+                float mu = moments.x; 
+                float sigma = sqrt(max(moments.y - mu * mu, 0.0));
                 float expandedSigma = sigma * dynamicGamma;
                 
-                extents.x = min(mu - expandedSigma, proj_pos);
-                extents.y = max(mu + expandedSigma, proj_pos);
+                extents.x = mu - expandedSigma;
+                extents.y = mu + expandedSigma;
 
-                // CLIP OVERSHOOT: widen the variance hull by a fraction of
-                // the local projected range. Scales with local contrast,
-                // vanishes on flat neighborhoods.
-                float axisMargin = taaClipOvershoot * max(pMax - pMin, 1e-4);
+                float axisMargin = taaClipOvershoot * max(pMax - pMin, kMinFootprintRange);
                 extents.x -= axisMargin;
                 extents.y += axisMargin;
-
-                if (taaDirectionalVariance > 0.5 && padMult > 0.0) 
-                {
-                    extents.x += min(0.0, expectedAxisShift); 
-                    extents.y += max(0.0, expectedAxisShift); 
-                }
             }
             else
             {
@@ -660,55 +605,40 @@ float3 ClipHistory(float3 historySpace, NeighborhoodStats stats, float effective
                 extents.x -= kEpsilon;
                 extents.y += kEpsilon;
 
-                // CLIP OVERSHOOT (see variance branch note above)
-                float axisMargin = taaClipOvershoot * max(extents.y - extents.x, 1e-4);
+                float axisMargin = taaClipOvershoot * max(extents.y - extents.x, kMinFootprintRange);
                 extents.x -= axisMargin;
                 extents.y += axisMargin;
-
-                if (taaDirectionalVariance > 0.5 && padMult > 0.0) 
-                {
-                    extents.x += min(0.0, expectedAxisShift);
-                    extents.y += max(0.0, expectedAxisShift);
-                }
             }
 
             float dir_dot = dot(dir, axis); 
             float s_dot = (dir_dot >= 0.0 ? 1.0 : -1.0);
             float inv_dir = 1.0 / (s_dot * max(abs(dir_dot), 1e-7));
-            float t0 = (extents.x - proj_pos) * inv_dir; float t1 = (extents.y - proj_pos) * inv_dir;
+            float t0 = (extents.x - proj_pos) * inv_dir; 
+            float t1 = (extents.y - proj_pos) * inv_dir;
 
-            nearHit = max(nearHit, min(t0, t1)); farHit = min(farHit, max(t0, t1));
+            nearHit = max(nearHit, min(t0, t1)); 
+            farHit = min(farHit, max(t0, t1));
         }
 
-        // NOTE: the hull provably contains mu (the ray origin): in min/max
-        // mode mu is a convex combination of the samples; in variance mode
-        // the slab is built to contain proj_pos. So the intersection interval
-        // always straddles t=0 and the guard below only fails on float
-        // degeneracies. t_hit >= 1 (history inside the hull) returns history
-        // UNMODIFIED -- by design: in-range accumulated history passes
-        // through losslessly.
         if (nearHit <= farHit && (nearHit > 0.0 || farHit > 0.0))
         {
             float t_hit = clamp(nearHit > 0.0 ? nearHit : farHit, 0.0, 1.0);
             if (t_hit < 1.0)
             {
                 float maxUnit = 1.0 / max(t_hit, kEpsilon);
-                float softLimit = 1.0 + taaSoftClip * (1.0 - exp(-(maxUnit - 1.0)));
-                return rayCenter + dir * (lerp(softLimit, 1.0, saturate(effectiveMotion / max(kMinMotionBlendDropSpeed, 0.1))) / maxUnit);
+                float softLimit = 1.0 + taaSoftClip * (1.0 - exp2(-(maxUnit - 1.0) * kLog2E));
+                return rayCenter + dir * (lerp(softLimit, 1.0, motionFactor) / maxUnit);
             }
         }
         return historySpace;
     }
 
-    float motionFactor = saturate(effectiveMotion / max(kMinMotionBlendDropSpeed, 0.1));
-
     if (stats.validCovariance)
     {
-        float3 diff = historySpace - stats.mu; float d2 = dot(diff, mul(stats.invCov, diff)); float gamma2 = dynamicGamma * dynamicGamma;
+        float3 diff = historySpace - stats.mu; 
+        float d2 = dot(diff, mul(stats.invCov, diff)); 
+        float gamma2 = dynamicGamma * dynamicGamma;
         float3 clipped = (d2 > gamma2 && d2 > kEpsilon) ? (stats.mu + diff * (dynamicGamma / sqrt(d2))) : historySpace;
-        // clipMargin widens the AABB the ellipsoid result is bounded against;
-        // the ellipsoid radius itself is unchanged (raise dynamicGamma on this
-        // path if you want the ellipsoid loosened too).
         return IntersectRayAABB(clipped, stats.mu, stats.aabbMin - clipMargin, stats.aabbMax + clipMargin, taaSoftClip, motionFactor);
     }
 
@@ -723,42 +653,26 @@ float3 ClipHistory(float3 historySpace, NeighborhoodStats stats, float effective
 // ============================================================================
 // DISOCCLUSION (Local-Plane Depth Test, Dilation-Zone Anchored)
 // ============================================================================
-// The plane's NORMAL comes from the center + right/down taps (local surface
-// tilt), but the plane is ANCHORED at the closest surface of the 3x3 dilation
-// zone. This mirrors the old scalar test's minLin reference, which is part of
-// the matched set { 3x3 velocity dilation, 2x2-dilated history depth, 3x3
-// depth acceptance }: within the 1-pixel dilation zone of a silhouette the
-// history is accepted (the color clamp handles the rest), preserving edge AA.
-// Rejection is one-sided: only a history CLOSER than every surface the
-// dilation zone can vouch for is rejected.
-float ComputeDisocclusion(DepthVelocityStats dv, float histRawDepth, float centerRawDepth, float2 centerUV, float2 texel, float2 pixelUV)
+float ComputeDisocclusion(DepthVelocityStats dv, float histRawDepth, float centerRawDepth, float2 centerUV, float2 historyUV)
 {
     if (taaDepthRejection <= 0.001) return 0.0;
 
     float linC = LinearizeDepth(centerRawDepth);
     float histLin = LinearizeDepth(histRawDepth);
 
-    // Local surface tilt from the center + right/down taps
-    // (un-jittered rays; the sub-pixel jitter rotation is negligible here)
     float3 pC = RayFromUV(centerUV) * linC;
-    float3 pX = RayFromUV(centerUV + float2(texel.x, 0.0)) * LinearizeDepth(dv.rightRawDepth);
-    float3 pY = RayFromUV(centerUV + float2(0.0, texel.y)) * LinearizeDepth(dv.downRawDepth);
+    float3 pX = RayFromUV(dv.rightTapUV) * LinearizeDepth(dv.rightRawDepth);
+    float3 pY = RayFromUV(dv.downTapUV) * LinearizeDepth(dv.downRawDepth);
 
     float3 n = cross(pX - pC, pY - pC);
     float nLen = length(n);
-    if (nLen < 1e-6) return 0.0;            // degenerate plane (borders/garbage) -> accept
+    if (nLen < 1e-6) return 0.0;
     n /= nLen;
 
-    // Anchor at the closest surface of the dilation zone, NOT the center.
-    // Without this, silhouettes reject the (dilated-velocity) foreground
-    // history and edge AA collapses.
     float3 pA = RayFromUV(dv.closestTapUV) * LinearizeDepth(dv.closestRawDepth);
-    if (dot(n, pA) > 0.0) { n = -n; }       // orient toward the camera (origin)
+    if (dot(n, pA) > 0.0) { n = -n; }
 
-    // History depth interpreted along the current pixel ray
-    float3 pH = RayFromUV(pixelUV) * histLin;
-
-    // > 0: history point on the camera side of the anchored surface plane
+    float3 pH = RayFromUV(historyUV) * histLin;
     float planeDist = dot(n, pH - pA);
 
     return (planeDist > taaDepthRejection * histLin) ? 1.0 : 0.0;
@@ -775,8 +689,9 @@ float3 CompressGamut(float3 historySpace)
         float minChannel = min(historyRGB.r, min(historyRGB.g, historyRGB.b));
         if (minChannel < 0.0)
         {
-            float luma = LumaRGB(historyRGB);
-            historyRGB = luma + (historyRGB - luma) * (luma / max(luma - minChannel, kEpsilon));
+            float luma = max(0.0, LumaRGB(historyRGB));
+            float alpha = saturate(luma / max(luma - minChannel, kEpsilon));
+            historyRGB = luma + (historyRGB - luma) * alpha;
             historySpace = RGBToOklab(historyRGB);
         }
         return historySpace;
@@ -793,7 +708,7 @@ float3 CompressGamut(float3 historySpace)
     float minCh = min(r, min(g, b));
     if (minCh < 0.0)
     {
-        float alpha = Y / max(Y - minCh, kEpsilon);
+        float alpha = saturate(max(0.0, Y) / max(Y - minCh, kEpsilon));
         historySpace.yz *= alpha;
     }
     return historySpace;
@@ -810,7 +725,7 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
     float2 minRenderUV = 0.5 * passTexel;
     float2 maxRenderUV = 1.0 - minRenderUV;
 
-    // 2. CPU-precomputed reprojection bases (register reads only, free)
+    // 2. CPU-precomputed reprojection bases
     float3 Pcurr = float3(taaCurPX,  taaCurPY,  taaCurPZ);
     float3 Qcurr = float3(taaCurQX,  taaCurQY,  taaCurQZ);
     float3 Rcurr = float3(taaCurRX,  taaCurRY,  taaCurRZ);
@@ -831,31 +746,23 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
     float3 centerColorSpace = ToSpace(currentColor);
     float2 centerVel = tex2Dlod(velocityTex, float4(snappedRenderUV, 0.0, 0.0)).rg;
 
-    // 5. Compute current pixel motion
-    float3 rPrevBase = jitterUV.x * Pprev + Qprev - jitterUV.y * Rprev;
-    float2 pixelVel = (ReprojectPrev(rPrevBase, centerVel, Pprev, Rprev) - IN.uv0) * passTexSize;
-    float totalPixelMotion = length(pixelVel);
-    float2 velocityDir = (totalPixelMotion > taaMinMotionDir) ? normalize(pixelVel) : float2(1.0, 0.0);
-
-    // Debug views that need no neighborhood/history work
-    if (taaDebugMode > 0.5 && taaDebugMode < 1.5)
-        return float4(float3(saturate(abs(pixelVel) * 0.1), 0.0), centerRawDepth);
+    // Debug: linear depth view
     if (taaDebugMode > 3.5 && taaDebugMode < 4.5)
-        return float4(saturate(LinearizeDepth(centerRawDepth) / 100.0).xxx, centerRawDepth);
+        return float4(saturate(LinearizeDepth(centerRawDepth) / kDebugLinearDepthRange).xxx, centerRawDepth);
 
-    // 6. Gather 3x3 neighborhood data
+    // 5. Gather 3x3 neighborhood data
     bool useDilation = (taaUseDepthDilation > 0.5);
     bool needNeighborDepth = useDilation || (taaDepthRejection > 0.001);
-    bool storeRGB = (taaFallbackFXAA > 0.5);   // PERF: cachedRGB only feeds FXAA
+    bool storeRGB = (taaFallbackFXAA > 0.5);
 
     DepthVelocityStats dvStats;
     dvStats.closestRawDepth = centerRawDepth;
     dvStats.bestVel = centerVel;
     dvStats.closestTapUV = snappedRenderUV;
-    dvStats.minRawDepthSearch = centerRawDepth; 
-    dvStats.maxRawDepthSearch = centerRawDepth;
     dvStats.rightRawDepth = centerRawDepth;
+    dvStats.rightTapUV = snappedRenderUV;
     dvStats.downRawDepth = centerRawDepth;
+    dvStats.downTapUV = snappedRenderUV;
 
     float4 uvLRBT = float4(
         clamp(snappedRenderUV - passTexel, minRenderUV, maxRenderUV),
@@ -889,13 +796,8 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
         float3 cRGB = max(0.0, tex2Dlod(sceneTex, float4(offsetUV, 0.0, 0.0)).rgb);
 
         if (needNeighborDepth) {
-            dvStats.minRawDepthSearch = min(dvStats.minRawDepthSearch, dRaw);
-            dvStats.maxRawDepthSearch = max(dvStats.maxRawDepthSearch, dRaw);
-            if (i == 2) { dvStats.downRawDepth  = dRaw; }
-            if (i == 4) { dvStats.rightRawDepth = dRaw; }
-            // Track the closest tap of the 3x3 dilation zone: this is the
-            // disocclusion anchor (the old test's minLin reference) and the
-            // velocity-dilation key.
+            if (i == 2) { dvStats.downRawDepth  = dRaw; dvStats.downTapUV  = offsetUV; }
+            if (i == 4) { dvStats.rightRawDepth = dRaw; dvStats.rightTapUV = offsetUV; }
             if (dRaw > dvStats.closestRawDepth) {
                 dvStats.closestRawDepth = dRaw;
                 dvStats.closestTapUV = offsetUV;
@@ -906,24 +808,28 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
         if (storeRGB) { cachedRGB[i] = cRGB; }
     }
 
-    // 7. Evaluate history UVs
+    // 6. History UV from the dilated velocity
+    float3 rPrevBase = jitterUV.x * Pprev + Qprev - jitterUV.y * Rprev;
     float2 historyStableUV = ReprojectPrev(rPrevBase, dvStats.bestVel, Pprev, Rprev);
+
+    // 7. Motion metrics
+    float2 pixelVel = (historyStableUV - IN.uv0) * passTexSize;
+    float totalPixelMotion = length(pixelVel);
+    float normalizedMotion = saturate(totalPixelMotion / kMotionFullStrengthPx);
+    float2 velocityDir = (totalPixelMotion > taaMinMotionDir) ? normalize(pixelVel) : float2(1.0, 0.0);
+
+    // Debug: velocity view
+    if (taaDebugMode > 0.5 && taaDebugMode < 1.5)
+        return float4(float3(saturate(abs(pixelVel) * kDebugVelocityScale), 0.0), centerRawDepth);
+
+    // 8. Pixel-grid alignment of the history sample
     float2 historyPixelCoord = historyStableUV * passTexSize;
     float pixelAlignment = 1.0 - saturate(length(historyPixelCoord - (floor(historyPixelCoord) + 0.5)) * kSqrt2);
 
-    // 8. 2x2 Dilated History Depth
-    float histRawDepth;
-    if (useDilation) {
-        histRawDepth = SampleDilatedHistoryDepth(historyStableUV, passTexel, passTexSize, minRenderUV, maxRenderUV);
-    } else {
-        histRawDepth = tex2Dlod(historyTex, float4(clamp((floor(historyPixelCoord) + 0.5) * passTexel, minRenderUV, maxRenderUV), 0.0, 0.0)).a;
-    }
-
     // 9. Compute spatial neighborhood statistics
-    NeighborhoodStats colorStats = ComputeNeighborhoodStats(cachedSpace, velocityDir, totalPixelMotion, totalPixelMotion, localJitterPx);
+    NeighborhoodStats colorStats = ComputeNeighborhoodStats(cachedSpace, velocityDir, normalizedMotion, localJitterPx);
 
-    // 9b. CLIP OVERSHOOT margin: fraction of the full 9-tap neighborhood
-    // color range that history may exceed the clip bounds by.
+    // 9b. CLIP OVERSHOOT margin
     float3 clipMargin = taaClipOvershoot * max(colorStats.aabbMax - colorStats.aabbMin, 0.0);
 
     // 10. Fetch and evaluate temporal history 
@@ -940,38 +846,37 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
 
     if (hist.valid)
     {
-        hist.disocclusion = ComputeDisocclusion(dvStats, histRawDepth, centerRawDepth, snappedRenderUV, passTexel, IN.uv0);
+        float histRawDepth = 1.0;
+        if (taaDepthRejection > 0.001)
+        {
+            if (useDilation) {
+                histRawDepth = SampleDilatedHistoryDepth(historyStableUV, passTexel, passTexSize, minRenderUV, maxRenderUV);
+            } else {
+                histRawDepth = tex2Dlod(historyTex, float4(clamp((floor(historyPixelCoord) + 0.5) * passTexel, minRenderUV, maxRenderUV), 0.0, 0.0)).a;
+            }
+        }
 
-        // Both samplers return the working-space color directly (the shared
-        // color-space anti-ringing clamp lives inside them).
+        hist.disocclusion = ComputeDisocclusion(dvStats, histRawDepth, centerRawDepth, snappedRenderUV, historyStableUV);
+
         if (taaUseLanczos3 > 0.5) {
             hist.colorSpace = SampleHistoryLanczos3(historyStableUV, passTexSize, passTexel, minRenderUV, maxRenderUV);
         } else {
-            hist.colorSpace = SampleHistoryCatmullRom5Tap(historyStableUV, passTexSize, passTexel);
+            hist.colorSpace = SampleHistoryCatmullRom5Tap(historyStableUV, passTexSize, passTexel, minRenderUV, maxRenderUV);
         }
 
-        // 10b. Luminance drift correction (proportional, same-surface gated).
-        // Shading changes (moving shadows, exposure, vehicle lights) carry
-        // no motion vectors, so stale history otherwise decays only through
-        // the (1-feedback) injection (~33 frames of stuck shadow).
-        // Stability: the loop pole is feedback*(1-k) < 1 for any k <= 1.
-        // The gate compares chromaticity (chroma-per-luma), which is the
-        // invariant under a pure lighting change; raw chroma is NOT (it
-        // scales with luma), so a raw-chroma gate would close exactly for
-        // the darkest stuck shadows. Different-surface history (ghosts,
-        // reveal edges) fails the gate and is left to the rejection paths.
+        // 10b. Luminance drift correction
         if (taaLumaDriftStrength > 0.001) {
-            float2 hChi = hist.colorSpace.yz / max(abs(hist.colorSpace.x), 0.05);
-            float2 cChi = centerColorSpace.yz / max(abs(centerColorSpace.x), 0.05);
+            float2 hChi = hist.colorSpace.yz / max(abs(hist.colorSpace.x), kLumaDriftLumaFloor);
+            float2 cChi = centerColorSpace.yz / max(abs(centerColorSpace.x), kLumaDriftLumaFloor);
             float  chromaDist = length(hChi - cChi);
 
             float tol = max(taaLumaDriftChromaTol, 1e-3);
-            float sameSurface = 1.0 - smoothstep(tol, tol * 2.0, chromaDist);
+            float sameSurface = 1.0 - smoothstep(tol, tol * kLumaDriftChromaFadeWidth, chromaDist);
 
             if (sameSurface > 0.001) {
-                float muY = colorStats.mu.x;               // Oklab L / YCoCg Y
+                float muY = colorStats.mu.x;
                 float hY  = hist.colorSpace.x;
-                if (abs(muY - hY) > max(0.30 * abs(hY), 0.03)) {
+                if (abs(muY - hY) > max(kLumaDriftRelThreshold * abs(hY), kLumaDriftAbsThreshold)) {
                     hist.colorSpace.x = max(hY + (muY - hY) * taaLumaDriftStrength * sameSurface, 1e-3);
                 }
             }
@@ -979,7 +884,7 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
 
         float3 histDelta = hist.colorSpace - colorStats.mu;
         float3 normDelta = histDelta / max(colorStats.sigma * max(taaVarianceGamma, 0.001), 0.001);
-        hist.confidence = exp(-dot(normDelta, normDelta) * 0.5);
+        hist.confidence = exp2(-dot(normDelta, normDelta) * 0.5 * kLog2E);
 
         if (taaShadowMitigation > 0.5) {
             hist.shadowRisk = (1.0 - smoothstep(0.0, max(kShadowThresholdMin, taaShadowDarknessThreshold), centerColorSpace.x)) 
@@ -992,18 +897,11 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
             dynamicGamma += (hist.shadowRisk * max(taaVarianceGamma, taaShadowVarianceBase)) * (1.0 - hist.disocclusion); 
         }
 
-        // 11. History clipping and metrics.
-        // (The old adaptive AABB adaptation step and the outer safety clamp
-        // are DELETED: on the k-DOP path the hull + clipOvershoot margin is
-        // the entire color bound; the non-k-DOP paths clip against the
-        // 9-tap box + margin inside ClipHistory. Inside the hull, history
-        // passes through unmodified -- by design.)
+        // 11. History clipping and metrics
         float3 unclippedHistorySpace = hist.colorSpace;
-        hist.colorSpace = ClipHistory(hist.colorSpace, colorStats, totalPixelMotion, dynamicGamma, cachedSpace, localJitterPx, clipMargin);
+        hist.colorSpace = ClipHistory(hist.colorSpace, colorStats, normalizedMotion, dynamicGamma, cachedSpace, clipMargin);
 
         if (taaClipDistanceRejectionEnabled > 0.5) { 
-            // Pure hull-clip distance now (the safety clamp no longer
-            // contributes to this metric).
             float clipDistance = length(unclippedHistorySpace - hist.colorSpace);
             hist.clipDistanceRejection = saturate((clipDistance - taaClipDistanceRejectionMinError) / max(taaClipDistanceRejectionAmount, 1e-5)); 
         }
@@ -1014,15 +912,16 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
         // 13. Final Blend factor mapping
         float motionBlendEnd = max(taaMotionBlendDropSpeed, taaMotionBlendStart + kMinMotionBlendDropSpeed);
         blend = lerp(taaFeedbackMax, taaFeedbackMin, smoothstep(taaMotionBlendStart, motionBlendEnd, totalPixelMotion));
+
+        blend = lerp(blend, blend * taaAlignmentFeedbackDrop, 1.0 - pixelAlignment);
         
-        if (hist.confidence > kFSRConfidenceThreshold) { blend = lerp(blend, blend * taaAlignmentFeedbackDrop, 1.0 - pixelAlignment); }
         if (taaShadowMitigation > 0.5) { blend = lerp(blend, taaShadowBlendStrength, hist.shadowRisk); }
         if (taaClipDistanceRejectionEnabled > 0.5) { blend = lerp(blend, 0.0, hist.clipDistanceRejection); }
         blend = lerp(blend, 0.0, hist.disocclusion);
     }
 
     // 14. Fallback edge smoothing
-    float fxaaBlend = saturate((0.8 - blend) * 2.0);
+    float fxaaBlend = saturate((kFXAABlendKnee - blend) * kFXAABlendSharpness);
     if (taaFallbackFXAA > 0.5 && fxaaBlend > 0.0)
     {
         float3 fxaaColor = ApplyFXAACached(snappedRenderUV, passTexel, cachedRGB);
@@ -1030,7 +929,6 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
     }
 
     // 15. Direct Debug Output
-    // (modes 1 and 4 are handled by the early-outs above)
     if (taaDebugMode > 0.5)
     {
         float3 debugColor = 0.0;
@@ -1052,7 +950,6 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
 
     // 16. Resolve outputs
     float3 blendedSpace = lerp(centerColorSpace, hist.colorSpace, blend);
-    // Gamut/NaN guard (Oklab round-trips can land out of gamut)
     return float4(max(FromSpace(blendedSpace), 0.0), centerRawDepth);
 }
 
