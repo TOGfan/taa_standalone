@@ -1,5 +1,6 @@
 local M = {}
 
+local MOD_VERSION = "1.2"
 local settingsPath = "settings/taa_standalone.json"
 local active = true
 local pfx = nil
@@ -18,6 +19,22 @@ local hookStamp, seenStamp = 0, 0
 local rehookTimer = 0
 
 local savedAA = nil
+
+local function clearShaderCache()
+    local cacheDirs = { "/temp/shaders", "temp/shaders", "/shaders/cache", "shaders/cache" }
+    for _, dir in ipairs(cacheDirs) do
+        if FS:directoryExists(dir) then
+            local files = FS:findFiles(dir, "*", -1, true, false)
+            if files then
+                for _, file in ipairs(files) do
+                    FS:removeFile(file)
+                end
+            end
+            FS:directoryRemove(dir)
+        end
+    end
+    log("I", "TAA", "Shader cache cleared for mod version " .. MOD_VERSION)
+end
 
 local function halton(index, base)
     local f, r, i = 1, 0, index
@@ -198,15 +215,27 @@ local function saveState()
             currentSettings = savedData.settings
         end
     end
-    jsonWriteFile(settingsPath, { active = active, settings = currentSettings }, true)
+    jsonWriteFile(settingsPath, { version = MOD_VERSION, active = active, settings = currentSettings }, true)
 end
 
 local function loadState()
     local savedData = jsonReadFile(settingsPath)
+    local needsUpdate = false
+
     if savedData and type(savedData) == "table" then
+        if savedData.version ~= MOD_VERSION then
+            clearShaderCache()
+            needsUpdate = true
+        end
         if savedData.active ~= nil then active = savedData.active end
     else
+        clearShaderCache()
+        needsUpdate = true
         active = true
+    end
+
+    if needsUpdate then
+        saveState()
     end
 end
 
