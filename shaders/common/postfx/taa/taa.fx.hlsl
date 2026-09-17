@@ -65,10 +65,8 @@ static const float kShadowLumaFloor         = 0.01;
 static const float kShadowThresholdMin      = 0.001;
 static const float kFlickerPadThreshold     = 0.001;
 static const float kMinMotionBlendDropSpeed = 0.1;
-static const float kFSRConfidenceThreshold  = 0.3;
 
-// Motion, in pixels, at which motion-gated effects (velocity-aligned variance
-// weighting, jitter-padding fade, soft-clip motion blend) reach full strength.
+// Motion, in pixels, at which motion-gated effects reach full strength.
 static const float kMotionFullStrengthPx    = 8.0;
 
 static const float kMinSigma                = 0.001;  // sigma floor for clipping
@@ -119,7 +117,6 @@ static const float3 kDopAxes[16] =
 // COLOR SPACES
 // ============================================================================
 float LumaRGB(float3 rgb) { return dot(rgb, float3(0.2126, 0.7152, 0.0722)); }
-float PerceptualLuma(float3 c) { return LumaRGB(c); }
 
 static const float3x3 kRGB_TO_LMS = float3x3(0.41222147, 0.53633253, 0.05144599, 0.21190349, 0.68069954, 0.10739695, 0.08830246, 0.28171883, 0.62997870);
 static const float3x3 kLMS_TO_OKLAB = float3x3(0.21045425,  0.79361778, -0.00407204, 1.97799849, -2.42859220,  0.45059370, 0.02590403,  0.78277176, -0.80867576);
@@ -192,15 +189,16 @@ float3 RayFromUV(float2 uv)
 }
 
 // ============================================================================
-// FALLBACK FXAA (Bandwidth-Optimized with Cached Neighborhood)
+// FALLBACK FXAA
 // ============================================================================
-float3 ApplyFXAACached(float2 uv, float2 texel, float3 cachedRGB[9]) 
+// fxaaRGB layout: [0] = M, [1] = NW, [2] = NE, [3] = SW, [4] = SE
+float3 ApplyFXAACached(float2 uv, float2 texel, float3 fxaaRGB[5])
 {
-    float lumaNW = PerceptualLuma(cachedRGB[5]);
-    float lumaNE = PerceptualLuma(cachedRGB[6]);
-    float lumaSW = PerceptualLuma(cachedRGB[7]);
-    float lumaSE = PerceptualLuma(cachedRGB[8]);
-    float lumaM  = PerceptualLuma(cachedRGB[0]);
+    float lumaNW = LumaRGB(fxaaRGB[1]);
+    float lumaNE = LumaRGB(fxaaRGB[2]);
+    float lumaSW = LumaRGB(fxaaRGB[3]);
+    float lumaSE = LumaRGB(fxaaRGB[4]);
+    float lumaM  = LumaRGB(fxaaRGB[0]);
 
     float lumaMin = min(lumaM, min(min(lumaNW, lumaNE), min(lumaSW, lumaSE)));
     float lumaMax = max(lumaM, max(max(lumaNW, lumaNE), max(lumaSW, lumaSE)));
@@ -221,12 +219,12 @@ float3 ApplyFXAACached(float2 uv, float2 texel, float3 cachedRGB[9])
         tex2Dlod(sceneTex, float4(uv + dir * (0.0/3.0 - 0.5), 0.0, 0.0)).rgb +
         tex2Dlod(sceneTex, float4(uv + dir * (3.0/3.0 - 0.5), 0.0, 0.0)).rgb);
 
-    float lumaB = PerceptualLuma(rgbB);
+    float lumaB = LumaRGB(rgbB);
     return ((lumaB < lumaMin) || (lumaB > lumaMax)) ? rgbA : rgbB;
 }
 
 // ============================================================================
-// HISTORY SAMPLING (RGB Footprint Anti-Ringing)
+// HISTORY SAMPLING
 // ============================================================================
 float3 SampleHistoryLanczos3(float2 uv, float2 texSize, float2 invTexSize, float2 minUV, float2 maxUV)
 {
@@ -277,7 +275,6 @@ float3 SampleHistoryLanczos3(float2 uv, float2 texSize, float2 invTexSize, float
         }
     }
 
-    // Soft anti-ringing clamp in RGB space BEFORE ToSpace()
     float3 footRng = max(footMax - footMin, kMinFootprintRange);
     float3 footMargin = taaHistoryOvershoot * footRng;
     color = clamp(color, footMin - footMargin, footMax + footMargin);
@@ -320,7 +317,6 @@ float3 SampleHistoryCatmullRom5Tap(float2 uv, float2 texSize, float2 invTexSize,
     float wsum = w0y + w0x + w12xy + w3x + w3y;
     color /= max(wsum, 1e-4);
 
-    // Soft anti-ringing clamp in RGB space BEFORE ToSpace()
     float3 footMin = min(tap0, min(tap1, min(tap2, min(tap3, tap4))));
     float3 footMax = max(tap0, max(tap1, max(tap2, max(tap3, tap4))));
 
@@ -361,7 +357,6 @@ struct HistoryData {
     float disocclusion;
     float shadowRisk;
     float clipDistanceRejection;
-    float confidence;
     float3 colorSpace;
 };
 
@@ -507,7 +502,7 @@ NeighborhoodStats ComputeNeighborhoodStats(float3 cachedSpace[9], float2 velocit
 }
 
 // ============================================================================
-// EXACT RAY-AABB INTERSECTION CLIPPING (Salvi / Karis)
+// EXACT RAY-AABB INTERSECTION CLIPPING
 // ============================================================================
 float3 IntersectRayAABB(float3 history, float3 target, float3 boxMin, float3 boxMax, float softClip, float motionFactor)
 {
@@ -651,7 +646,7 @@ float3 ClipHistory(float3 historySpace, NeighborhoodStats stats, float normalize
 }
 
 // ============================================================================
-// DISOCCLUSION (Local-Plane Depth Test, Dilation-Zone Anchored)
+// DISOCCLUSION
 // ============================================================================
 float ComputeDisocclusion(DepthVelocityStats dv, float histRawDepth, float centerRawDepth, float2 centerUV, float2 historyUV)
 {
@@ -750,7 +745,9 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
     if (taaDebugMode > 3.5 && taaDebugMode < 4.5)
         return float4(saturate(LinearizeDepth(centerRawDepth) / kDebugLinearDepthRange).xxx, centerRawDepth);
 
-    // 5. Gather 3x3 neighborhood data
+    // 5. Gather 3x3 depth + velocity. Color taps are deferred to step 9 so
+    //    they can be skipped entirely when the history is invalid and the
+    //    FXAA fallback is disabled.
     bool useDilation = (taaUseDepthDilation > 0.5);
     bool needNeighborDepth = useDilation || (taaDepthRejection > 0.001);
     bool storeRGB = (taaFallbackFXAA > 0.5);
@@ -780,10 +777,10 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
     tapUVs[7] = uvLRBT.xw;
     tapUVs[8] = uvLRBT.zw;
 
-    float3 cachedRGB[9];
-    float3 cachedSpace[9];
-    if (storeRGB) { cachedRGB[0] = currentColor; }
-    cachedSpace[0] = centerColorSpace;
+    float  cachedDepth[9];
+    float2 cachedVel[9];
+    cachedDepth[0] = centerRawDepth;
+    cachedVel[0]   = centerVel;
 
     [unroll]
     for (int i = 1; i < 9; ++i)
@@ -793,7 +790,9 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
         if (needNeighborDepth) { dRaw = tex2Dlod(depthTex, float4(offsetUV, 0.0, 0.0)).r; }
         float2 v = centerVel;
         if (useDilation) { v = tex2Dlod(velocityTex, float4(offsetUV, 0.0, 0.0)).rg; }
-        float3 cRGB = max(0.0, tex2Dlod(sceneTex, float4(offsetUV, 0.0, 0.0)).rgb);
+
+        cachedDepth[i] = dRaw;
+        cachedVel[i]   = v;
 
         if (needNeighborDepth) {
             if (i == 2) { dvStats.downRawDepth  = dRaw; dvStats.downTapUV  = offsetUV; }
@@ -804,13 +803,78 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
                 if (useDilation) { dvStats.bestVel = v; }
             }
         }
-        cachedSpace[i] = ToSpace(cRGB);
-        if (storeRGB) { cachedRGB[i] = cRGB; }
     }
 
-    // 6. History UV from the dilated velocity
+// 5b. Signed Midpoint Curvature Velocity Selection
+    int idxX = (localJitterPx.x >= 0.0) ? 4 : 3;
+    int idxY = (localJitterPx.y >= 0.0) ? 2 : 1;
+    int idxCorner;
+    if (localJitterPx.x >= 0.0)
+        idxCorner = (localJitterPx.y >= 0.0) ? 8 : 6;
+    else
+        idxCorner = (localJitterPx.y >= 0.0) ? 7 : 5;
+
+    float2 v00 = cachedVel[0];
+    float2 v10 = cachedVel[idxX];
+    float2 v01 = cachedVel[idxY];
+    float2 v11 = cachedVel[idxCorner];
+
+    // 1. Distance-invariant scale (2.5% of local perspective depth)
+    float eps = max(centerRawDepth, 1e-6) * 0.025 + 1e-7;
+
+    // 2. Measure signed midpoint deviation across all 4 axes:
+    // delta = center - midpoint(opposite_neighbors)
+    float deltaH  = centerRawDepth - 0.5 * (cachedDepth[3] + cachedDepth[4]); // Left / Right
+    float deltaV  = centerRawDepth - 0.5 * (cachedDepth[1] + cachedDepth[2]); // Top / Bottom
+    float deltaD1 = centerRawDepth - 0.5 * (cachedDepth[5] + cachedDepth[8]); // TL / BR
+    float deltaD2 = centerRawDepth - 0.5 * (cachedDepth[6] + cachedDepth[7]); // TR / BL
+
+    float minDelta = min(min(deltaH, deltaV), min(deltaD1, deltaD2));
+    float maxDelta = max(max(deltaH, deltaV), max(deltaD1, deltaD2));
+
+    // 3. Geometric State Classification:
+    // - minDelta < -eps: Center is depressed below neighbors (Background next to incoming foreground)
+    // - maxDelta > +eps: Center is elevated above neighbors (Foreground edge / 1-px wire)
+    // - within [-eps, +eps]: Center lies on the planar midpoint (Continuous surface)
+    bool isDilationZone   = useDilation && (minDelta < -eps);
+    bool isForegroundEdge = !isDilationZone && (maxDelta > eps);
+
+    // 4. Compute subpixel bilinear velocity for State 1
+    float2 subpixelF = abs(localJitterPx);
+    float2 bilinearVel = lerp(lerp(v00, v10, subpixelF.x), lerp(v01, v11, subpixelF.x), subpixelF.y);
+
+    // 5. Resolve velocity based on the 3 states
+    float2 resolvedVel;
+    if (isDilationZone)
+    {
+        // State 2: Dilate discrete foreground velocity
+        resolvedVel = dvStats.bestVel;
+    }
+    else if (isForegroundEdge)
+    {
+        // State 3: Pure discrete center velocity (no bilinear mixing across edge)
+        resolvedVel = centerVel;
+    }
+    else
+    {
+        // State 1: Continuous planar surface; use subpixel bilinear velocity
+        resolvedVel = bilinearVel;
+    }
+
+    // Debug: Velocity State Classification (Mode 8)
+    if (taaDebugMode > 7.5 && taaDebugMode < 8.5)
+    {
+        float3 stateDebugColor = currentColor * 0.25; // Continuous = Dimmed Scene
+        if (isDilationZone)
+            stateDebugColor = float3(1.0, 0.05, 0.05); // Dilation Zone = Bright Red
+        else if (isForegroundEdge)
+            stateDebugColor = float3(0.0, 0.85, 1.0);  // Foreground Edge / 1-px Wire = Bright Cyan
+        return float4(stateDebugColor, centerRawDepth);
+    }
+
+    // 6. History UV from the resolved velocity
     float3 rPrevBase = jitterUV.x * Pprev + Qprev - jitterUV.y * Rprev;
-    float2 historyStableUV = ReprojectPrev(rPrevBase, dvStats.bestVel, Pprev, Rprev);
+    float2 historyStableUV = ReprojectPrev(rPrevBase, resolvedVel, Pprev, Rprev);
 
     // 7. Motion metrics
     float2 pixelVel = (historyStableUV - IN.uv0) * passTexSize;
@@ -826,26 +890,42 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
     float2 historyPixelCoord = historyStableUV * passTexSize;
     float pixelAlignment = 1.0 - saturate(length(historyPixelCoord - (floor(historyPixelCoord) + 0.5)) * kSqrt2);
 
-    // 9. Compute spatial neighborhood statistics
-    NeighborhoodStats colorStats = ComputeNeighborhoodStats(cachedSpace, velocityDir, normalizedMotion, localJitterPx);
-
-    // 9b. CLIP OVERSHOOT margin
-    float3 clipMargin = taaClipOvershoot * max(colorStats.aabbMax - colorStats.aabbMin, 0.0);
-
-    // 10. Fetch and evaluate temporal history 
+    // 8b. History validity (hoisted above the color work so steps 9+ can be gated)
     float2 support = (taaUseLanczos3 > 0.5 ? 3.0 : 2.0) * passTexel;
     HistoryData hist;
     hist.valid = all(historyStableUV >= support) && all(historyStableUV <= 1.0 - support);
     hist.disocclusion = 1.0; 
     hist.shadowRisk = 0.0; 
     hist.clipDistanceRejection = 0.0;
-    hist.confidence = 0.0;
     hist.colorSpace = centerColorSpace;
+
+    // FXAA corner cache: [0] = M, [1] = NW, [2] = NE, [3] = SW, [4] = SE
+    float3 fxaaRGB[5];
+    fxaaRGB[0] = currentColor;
 
     float blend = 0.0;
 
     if (hist.valid)
     {
+        // 9. Fetch neighborhood colors and convert. Only runs when the
+        //    history is valid; the 4 FXAA corner taps are cached alongside.
+        float3 cachedSpace[9];
+        cachedSpace[0] = centerColorSpace;
+        [unroll]
+        for (int i = 1; i < 9; ++i)
+        {
+            float3 cRGB = max(0.0, tex2Dlod(sceneTex, float4(tapUVs[i], 0.0, 0.0)).rgb);
+            cachedSpace[i] = ToSpace(cRGB);
+            if (storeRGB && i >= 5) { fxaaRGB[i - 4] = cRGB; }
+        }
+
+        // 9a. Compute spatial neighborhood statistics
+        NeighborhoodStats colorStats = ComputeNeighborhoodStats(cachedSpace, velocityDir, normalizedMotion, localJitterPx);
+
+        // 9b. CLIP OVERSHOOT margin
+        float3 clipMargin = taaClipOvershoot * max(colorStats.aabbMax - colorStats.aabbMin, 0.0);
+
+        // 10. Fetch and evaluate temporal history 
         float histRawDepth = 1.0;
         if (taaDepthRejection > 0.001)
         {
@@ -882,10 +962,6 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
             }
         }
 
-        float3 histDelta = hist.colorSpace - colorStats.mu;
-        float3 normDelta = histDelta / max(colorStats.sigma * max(taaVarianceGamma, 0.001), 0.001);
-        hist.confidence = exp2(-dot(normDelta, normDelta) * 0.5 * kLog2E);
-
         if (taaShadowMitigation > 0.5) {
             hist.shadowRisk = (1.0 - smoothstep(0.0, max(kShadowThresholdMin, taaShadowDarknessThreshold), centerColorSpace.x)) 
                             * saturate(abs(max(centerColorSpace.x, kShadowLumaFloor) - max(hist.colorSpace.x, kShadowLumaFloor)) * taaShadowTemporalMult) 
@@ -919,12 +995,21 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
         if (taaClipDistanceRejectionEnabled > 0.5) { blend = lerp(blend, 0.0, hist.clipDistanceRejection); }
         blend = lerp(blend, 0.0, hist.disocclusion);
     }
+    else if (storeRGB)
+    {
+        // History invalid but FXAA active: fetch only the 4 corner taps.
+        [unroll]
+        for (int i = 5; i < 9; ++i)
+        {
+            fxaaRGB[i - 4] = max(0.0, tex2Dlod(sceneTex, float4(tapUVs[i], 0.0, 0.0)).rgb);
+        }
+    }
 
     // 14. Fallback edge smoothing
     float fxaaBlend = saturate((kFXAABlendKnee - blend) * kFXAABlendSharpness);
     if (taaFallbackFXAA > 0.5 && fxaaBlend > 0.0)
     {
-        float3 fxaaColor = ApplyFXAACached(snappedRenderUV, passTexel, cachedRGB);
+        float3 fxaaColor = ApplyFXAACached(snappedRenderUV, passTexel, fxaaRGB);
         centerColorSpace = lerp(centerColorSpace, ToSpace(fxaaColor), fxaaBlend);
     }
 
@@ -940,7 +1025,7 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
         } else if (taaDebugMode < 5.5) {
             debugColor = float3(0.0, hist.shadowRisk, hist.shadowRisk);
         } else if (taaDebugMode < 6.5) {
-            debugColor = lerp(float3(1, 0, 0), float3(0, 1, 0), hist.confidence);
+            debugColor = 0.0; // reserved: was the confidence view (removed)
         } else if (taaDebugMode < 7.5) {
             debugColor = blend.xxx;
         }

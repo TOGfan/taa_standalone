@@ -232,7 +232,7 @@ const settingsSchema = [
         type: 'select', 
         default: 0.0, 
         name: "Debug View Mode", 
-        desc: "Visualizes internal buffers and rejection masks.\n\n0: Off (Normal)\n1: Pixel Motion Vectors\n2: Raw History Buffer\n3: Disocclusion Mask\n4: Linear Depth (Normalized 100m)\n5: Shadow Risk Factor\n6: Confidence Heatmap\n7: Accumulation Blend Weight",
+        desc: "Visualizes internal buffers and rejection masks.\n\n0: Off (Normal)\n1: Pixel Motion Vectors\n2: Raw History Buffer\n3: Disocclusion Mask\n4: Linear Depth (Normalized 100m)\n5: Shadow Risk Factor\n6: Confidence Heatmap\n7: Accumulation Blend Weight\n8: Velocity States (Red=Dilation, Cyan=Foreground Edge, Dark=Continuous)",
         options: [
           { label: 'Off (Normal Rendering)', value: 0.0 },
           { label: 'Motion Vectors', value: 1.0 },
@@ -241,7 +241,8 @@ const settingsSchema = [
           { label: 'Linearized Depth', value: 4.0 },
           { label: 'Shadow Risk Proxy', value: 5.0 },
           { label: 'Confidence Heatmap', value: 6.0 },
-          { label: 'Final Blend Weight', value: 7.0 }
+          { label: 'Final Blend Weight', value: 7.0 },
+          { label: 'Velocity Classification (States / Dilation)', value: 8.0 }
         ]
       }
     ]
