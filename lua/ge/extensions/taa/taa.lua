@@ -1,6 +1,6 @@
 local M = {}
 
-local MOD_VERSION = "1.2"
+local MOD_VERSION = "1.4"
 local settingsPath = "settings/taa_standalone.json"
 local active = true
 local pfx = nil
