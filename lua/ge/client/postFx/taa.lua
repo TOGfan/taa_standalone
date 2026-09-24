@@ -26,6 +26,50 @@ local function getOrCreateShader(objName, path)
     return obj
 end
 
+function M.setFrameState(tanX, tanY, yaw, pitch, prevYaw, prevPitch)
+    local pre = scenetree.TAA_PreFx
+    if not pre then return end
+
+    tanX = math.max(tanX or 1.0, 1e-4)
+    tanY = math.max(tanY or 1.0, 1e-4)
+
+    pre:setShaderConst("$taaTanHalfFovX", tanX)
+    pre:setShaderConst("$taaTanHalfFovY", tanY)
+
+    local function basis(yawA, pitchA)
+        local sy, cy = math.sin(yawA), math.cos(yawA)
+        local sp, cp = math.sin(pitchA), math.cos(pitchA)
+        local c0x, c0y, c0z = cy, sy, 0.0
+        local c1x, c1y, c1z = -sy * cp, cy * cp, sp
+        local c2x, c2y, c2z = sy * sp, -cy * sp, cp
+        return {
+            2 * tanX * c0x, 2 * tanX * c0y, 2 * tanX * c0z,               -- P
+            -tanX * c0x + c1x + tanY * c2x,                                -- Q
+            -tanX * c0y + c1y + tanY * c2y,
+            -tanX * c0z + c1z + tanY * c2z,
+            2 * tanY * c2x, 2 * tanY * c2y, 2 * tanY * c2z,               -- R
+        }
+    end
+
+    local cur = basis(yaw or 0.0, pitch or 0.0)
+    local prv = basis(-(prevYaw or 0.0), -(prevPitch or 0.0))
+
+    local function setBasis(tag, b)
+        pre:setShaderConst("$taa" .. tag .. "PX", b[1])
+        pre:setShaderConst("$taa" .. tag .. "PY", b[2])
+        pre:setShaderConst("$taa" .. tag .. "PZ", b[3])
+        pre:setShaderConst("$taa" .. tag .. "QX", b[4])
+        pre:setShaderConst("$taa" .. tag .. "QY", b[5])
+        pre:setShaderConst("$taa" .. tag .. "QZ", b[6])
+        pre:setShaderConst("$taa" .. tag .. "RX", b[7])
+        pre:setShaderConst("$taa" .. tag .. "RY", b[8])
+        pre:setShaderConst("$taa" .. tag .. "RZ", b[9])
+    end
+
+    setBasis("Cur", cur)
+    setBasis("Prev", prv)
+end
+
 function M.build()
     getOrCreateStateBlock("TAA_StateBlock", function(sb)
         sb:setField("samplerStates", 0, "SamplerClampPoint")
@@ -69,6 +113,9 @@ function M.build()
 
         taaPreFx:registerObject("TAA_PreFx")
     end
+
+    -- Bug 3 Fix: Initialize valid default reprojection bases immediately on creation
+    M.setFrameState(1.0, 1.0, 0.0, 0.0, 0.0, 0.0)
 end
 
 M.settings = {
@@ -166,58 +213,6 @@ function M.applySettings(inputs)
         fin:setShaderConst("$taaSharpness", s.sharpness)
         fin:setShaderConst("$taaDebugMode", s.debugMode)
     end
-end
-
-function M.setFrameState(tanX, tanY, yaw, pitch, prevYaw, prevPitch)
-    local pre = scenetree.TAA_PreFx
-    if not pre then return end
-
-    pre:setShaderConst("$taaTanHalfFovX", tanX)
-    pre:setShaderConst("$taaTanHalfFovY", tanY)
-
-    -- PERF: reprojection bases, precomputed here so the pixel shader no longer
-    -- runs sincos + builds rotation matrices per pixel. Matches the old shader
-    -- math exactly (the shader previously built these from the raw angles):
-    --   rot = float3x3( cy, -sy*cp,  sy*sp,
-    --                   sy,  cy*cp, -cy*sp,
-    --                   0.0,     sp,      cp )
-    --   ray(uv) = uv.x*(2tanX,0,0) + (-tanX,1,tanY) - uv.y*(0,0,2tanY)
-    --   P = 2tanX*col0, Q = -tanX*col0 + col1 + tanY*col2, R = 2tanY*col2
-    -- so that:  rot * ray(uv) = uv.x*P + Q - uv.y*R
-    -- and:      rot * ray(uv + vel) = that + vel.x*P - vel.y*R
-    local function basis(yawA, pitchA)
-        local sy, cy = math.sin(yawA), math.cos(yawA)
-        local sp, cp = math.sin(pitchA), math.cos(pitchA)
-        local c0x, c0y, c0z = cy, sy, 0.0
-        local c1x, c1y, c1z = -sy * cp, cy * cp, sp
-        local c2x, c2y, c2z = sy * sp, -cy * sp, cp
-        return {
-            2 * tanX * c0x, 2 * tanX * c0y, 2 * tanX * c0z,               -- P
-            -tanX * c0x + c1x + tanY * c2x,                                -- Q
-            -tanX * c0y + c1y + tanY * c2y,
-            -tanX * c0z + c1z + tanY * c2z,
-            2 * tanY * c2x, 2 * tanY * c2y, 2 * tanY * c2z,               -- R
-        }
-    end
-
-    local cur = basis(yaw, pitch)
-    -- the shader previously negated the prev-jitter angles internally
-    local prv = basis(-prevYaw, -prevPitch)
-
-    local function setBasis(tag, b)
-        pre:setShaderConst("$taa" .. tag .. "PX", b[1])
-        pre:setShaderConst("$taa" .. tag .. "PY", b[2])
-        pre:setShaderConst("$taa" .. tag .. "PZ", b[3])
-        pre:setShaderConst("$taa" .. tag .. "QX", b[4])
-        pre:setShaderConst("$taa" .. tag .. "QY", b[5])
-        pre:setShaderConst("$taa" .. tag .. "QZ", b[6])
-        pre:setShaderConst("$taa" .. tag .. "RX", b[7])
-        pre:setShaderConst("$taa" .. tag .. "RY", b[8])
-        pre:setShaderConst("$taa" .. tag .. "RZ", b[9])
-    end
-
-    setBasis("Cur", cur)
-    setBasis("Prev", prv)
 end
 
 function M.setEnabled(enabled)

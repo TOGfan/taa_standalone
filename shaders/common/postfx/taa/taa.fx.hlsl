@@ -58,43 +58,40 @@ cbuffer perDraw
 // CONSTANTS
 // ============================================================================
 static const float kEpsilon                 = 1e-5;
-static const float kLargeValue              = 32000.0; // Safe for FP16/half-precision without overflow
+static const float kLargeValue              = 32000.0;
 static const float kSqrt2                   = 1.41421356;
-static const float kLog2E                   = 1.44269504;  // exp(x) == exp2(x * kLog2E)
+static const float kLog2E                   = 1.44269504;
 static const float taaMinMotionDir          = 0.1;
 static const float kShadowLumaFloor         = 0.01;
 static const float kShadowThresholdMin      = 0.001;
 static const float kFlickerPadThreshold     = 0.001;
 static const float kMinMotionBlendDropSpeed = 0.1;
 
-// Motion, in pixels, at which motion-gated effects reach full strength.
 static const float kMotionFullStrengthPx    = 8.0;
 
-static const float kMinSigma                = 0.001;  // sigma floor for clipping
-static const float kMinSpatialContrast      = 0.001;  // spatial contrast floor
-static const float kMinFootprintRange       = 1e-4;   // history footprint / slab range floor
-static const float kFireflyClampEpsilon     = 0.001;  // below this the firefly clamp counts as "off"
+static const float kMinSigma                = 0.001;
+static const float kMinSpatialContrast      = 0.001;
+static const float kMinFootprintRange       = 1e-4;
+static const float kFireflyClampEpsilon     = 0.001;
 
-// Disocclusion measurement model: every threshold term is a bound on a named
-// physical residual of the depth comparison (see ComputeDisocclusion).
-static const float kVelPrecisionPx        = 1.0;   // px: velocity resampling / snap slack paired with the local slope
-static const float kForegroundSlopeRadius = 3.0;   // px: dilation offset + history footprint span on the dilated object
-static const float kReprojResidualPerTan  = 0.5;   // rotation-model slack per unit angular screen motion
-static const float kReprojResidualMax     = 0.05;  // cap of the motion-scaled reprojection residual
-static const float kDollyResidualMax      = 0.10;  // cap of the translation depth-scale residual
+// Tightened physical residuals
+static const float kForegroundSlopeRadius   = 1.5;   // px: true 3x3 footprint reach (was 3.0)
+static const float kReprojResidualPerTan    = 0.5;  // rotation slack per unit motion
+static const float kReprojResidualMax       = 0.05; // cap of reprojection residual (was 0.05)
+static const float kDollyResidualMax        = 0.1;  // cap of translation depth-scale residual
 
 // Fallback FXAA
 static const float kFXAAReduceMul           = 1.0 / 128.0;
 static const float kFXAAReduceMin           = 1.0 / 128.0;
 static const float kFXAAMaxDir              = 8.0;
-static const float kFXAABlendKnee           = 0.8;    // blend level below which FXAA engages
-static const float kFXAABlendSharpness      = 2.0;    // steepness of the FXAA engage ramp
+static const float kFXAABlendKnee           = 0.8;
+static const float kFXAABlendSharpness      = 2.0;
 
 // Luma drift correction
-static const float kLumaDriftLumaFloor      = 0.05;   // luma floor for the chroma-ratio test
-static const float kLumaDriftRelThreshold   = 0.30;   // relative luma error that triggers correction
-static const float kLumaDriftAbsThreshold   = 0.03;   // absolute luma error that triggers correction
-static const float kLumaDriftChromaFadeWidth = 2.0;   // chroma tolerance fade, in multiples of tol
+static const float kLumaDriftLumaFloor      = 0.05;
+static const float kLumaDriftRelThreshold   = 0.30;
+static const float kLumaDriftAbsThreshold   = 0.03;
+static const float kLumaDriftChromaFadeWidth = 2.0;
 
 // Debug views
 static const float kDebugVelocityScale      = 0.1;
@@ -123,9 +120,21 @@ static const float3 kDopAxes[16] =
 };
 
 // ============================================================================
-// COLOR SPACES
+// COLOR SPACES & REVERSIBLE TONEMAPPING
 // ============================================================================
 float LumaRGB(float3 rgb) { return dot(rgb, float3(0.2126, 0.7152, 0.0722)); }
+
+float3 Tonemap(float3 c)
+{
+    float luma = LumaRGB(c);
+    return c / (1.0 + luma);
+}
+
+float3 Untonemap(float3 c)
+{
+    float luma = LumaRGB(c);
+    return c / max(1.0 - min(luma, 0.999), 1e-4);
+}
 
 static const float3x3 kRGB_TO_LMS = float3x3(0.41222147, 0.53633253, 0.05144599, 0.21190349, 0.68069954, 0.10739695, 0.08830246, 0.28171883, 0.62997870);
 static const float3x3 kLMS_TO_OKLAB = float3x3(0.21045425,  0.79361778, -0.00407204, 1.97799849, -2.42859220,  0.45059370, 0.02590403,  0.78277176, -0.80867576);
@@ -135,7 +144,6 @@ static const float3x3 kLMS_TO_RGB = float3x3(4.07674166, -3.30771159,  0.2309699
 float3 RGBToOklab(float3 c) 
 { 
     float3 lms = max(mul(kRGB_TO_LMS, c), 0.0);
-    // Scalar condition per component prevents short-circuiting vector ternary errors in DXC/Clang
     float3 lmsRoot;
     lmsRoot.x = (lms.x > 0.0) ? pow(lms.x, 1.0 / 3.0) : 0.0;
     lmsRoot.y = (lms.y > 0.0) ? pow(lms.y, 1.0 / 3.0) : 0.0;
@@ -147,11 +155,20 @@ float3 OklabToRGB(float3 c) { float3 l = mul(kOKLAB_TO_LMS, c); return mul(kLMS_
 float3 RGBToYCoCg(float3 c) { return float3(0.25 * c.r + 0.5 * c.g + 0.25 * c.b, 0.5 * c.r - 0.5 * c.b, -0.25 * c.r + 0.5 * c.g - 0.25 * c.b); }
 float3 YCoCgToRGB(float3 c) { return float3(c.x + c.y - c.z, c.x + c.z, c.x - c.y - c.z); }
 
-float3 ToSpace(float3 rgb) { return (taaColorSpaceOklab > 0.5) ? RGBToOklab(rgb) : RGBToYCoCg(rgb); }
-float3 FromSpace(float3 c) { return (taaColorSpaceOklab > 0.5) ? OklabToRGB(c) : YCoCgToRGB(c); }
+float3 ToSpace(float3 rgb) 
+{ 
+    float3 cTonemapped = Tonemap(max(0.0, rgb));
+    return (taaColorSpaceOklab > 0.5) ? RGBToOklab(cTonemapped) : RGBToYCoCg(cTonemapped); 
+}
+
+float3 FromSpace(float3 c) 
+{ 
+    float3 cRGB = (taaColorSpaceOklab > 0.5) ? OklabToRGB(c) : YCoCgToRGB(c); 
+    return Untonemap(max(0.0, cRGB)); 
+}
 
 // ============================================================================
-// MATRIX UTILITIES (Symmetric Optimized)
+// MATRIX UTILITIES
 // ============================================================================
 float3x3 InverseSymmetric3x3(float3x3 m, out bool success)
 {
@@ -183,24 +200,19 @@ float3x3 InverseSymmetric3x3(float3x3 m, out bool success)
 // ============================================================================
 // REPROJECTION & DEPTH
 // ============================================================================
-float2 ReprojFinish(float3 r2)
+float2 ReprojFinish(float3 r2, float2 fallbackUV)
 {
-    if (r2.y <= kEpsilon) return float2(-1.0, -1.0);
-    return float2((r2.x / (r2.y * taaTanHalfFovX)) * 0.5 + 0.5,
-                  0.5 - (r2.z / (r2.y * taaTanHalfFovY)) * 0.5);
+    if (r2.y <= kEpsilon) return fallbackUV;
+    return float2((r2.x / (r2.y * max(taaTanHalfFovX, kEpsilon))) * 0.5 + 0.5,
+                  0.5 - (r2.z / (r2.y * max(taaTanHalfFovY, kEpsilon))) * 0.5);
 }
 
 float2 ReprojectUV(float2 uv, float3 P, float3 Q, float3 R)
 {
-    return ReprojFinish(uv.x * P + Q - uv.y * R);
+    return ReprojFinish(uv.x * P + Q - uv.y * R, uv);
 }
 
 float LinearizeDepth(float rawDepth) { return 1.0 / max(rawDepth, kEpsilon); }
-
-float3 RayFromUV(float2 uv)
-{
-    return float3((uv.x * 2.0 - 1.0) * taaTanHalfFovX, 1.0, (1.0 - uv.y * 2.0) * taaTanHalfFovY);
-}
 
 // ============================================================================
 // FALLBACK FXAA
@@ -239,8 +251,6 @@ float3 ApplyFXAACached(float2 uv, float2 texel, float3 fxaaRGB[5])
 // ============================================================================
 // HISTORY SAMPLING
 // ============================================================================
-// Lanczos3 window weight for one axis. tap is the kernel tap index (0..5);
-// fc is the fractional sub-texel position along that axis.
 float Lanczos3Weight(float fc, int tap)
 {
     float d = abs(fc + float(2 - tap));
@@ -254,7 +264,6 @@ float3 SampleHistoryLanczos3(float2 uv, float2 texSize, float2 invTexSize, float
     float2 tc = floor(samplePos - 0.5) + 0.5;
     float2 f = samplePos - tc;
 
-    // Per-axis weight normalization (separable kernel).
     float2 sumXY = float2(0.0, 0.0);
     [unroll]
     for (int i = 0; i < 6; ++i)
@@ -268,13 +277,6 @@ float3 SampleHistoryLanczos3(float2 uv, float2 texSize, float2 invTexSize, float
     float3 footMin = float3(kLargeValue, kLargeValue, kLargeValue);
     float3 footMax = float3(-kLargeValue, -kLargeValue, -kLargeValue);
 
-    // Rolled loop with no local arrays: tap coordinates and weights are derived
-    // arithmetically from the loop counters. This keeps the two properties the
-    // rolled form was chosen for (no huge unrolled body -> no compiler timeouts
-    // on mobile/integrated GPUs) while eliminating dynamically indexed local
-    // arrays, which force indexable temps / scratch-memory spills on the same
-    // hardware. Expression trees are identical to the array version, so the
-    // accumulated result is bit-identical.
     for (int y = 0; y < 6; ++y)
     {
         float wY = Lanczos3Weight(f.y, y) * invSum.y;
@@ -350,10 +352,10 @@ float3 SampleHistoryCatmullRom5Tap(float2 uv, float2 texSize, float2 invTexSize,
 // DATA STRUCTURES
 // ============================================================================
 struct DepthVelocityStats { 
-    float  closestRawDepth;   // raw depth of the foreground object (larger raw = closer)
-    float  secondClosestRaw;  // second-closest texel, same object
-    float2 closestOffset;     // pixel offset of the closest texel
-    float2 secondOffset;      // pixel offset of the second-closest texel
+    float  closestRawDepth;
+    float  secondClosestRaw;
+    float2 closestOffset;
+    float2 secondOffset;
     float2 bestVel; 
 };
 
@@ -567,7 +569,7 @@ float3 IntersectRayAABB(float3 history, float3 target, float3 boxMin, float3 box
 }
 
 // ============================================================================
-// HISTORY CLIPPING (Stabilized Production k-DOP)
+// HISTORY CLIPPING
 // ============================================================================
 float3 ClipHistory(float3 historySpace, NeighborhoodStats stats, float normalizedMotion, float dynamicGamma, float3 cachedSpace[9], float3 clipMargin)
 {
@@ -575,7 +577,6 @@ float3 ClipHistory(float3 historySpace, NeighborhoodStats stats, float normalize
 
     if (taaUseKDopClipping > 0.5)
     {
-        // 1. Temporally stable anchor: stats.mu filters out frame-to-frame subpixel jitter
         float3 rayCenter = stats.mu;
         float3 dir = historySpace - rayCenter;
         
@@ -591,7 +592,6 @@ float3 ClipHistory(float3 historySpace, NeighborhoodStats stats, float normalize
 
             if (taaKDopVariance > 0.5)
             {
-                // Jitter-weighted statistical moments (eliminates diagonal box chatter)
                 float2 moments = float2(0.0, 0.0);
                 float wSum = 0.0;
                 float pMin = kLargeValue;
@@ -616,13 +616,11 @@ float3 ClipHistory(float3 historySpace, NeighborhoodStats stats, float normalize
                 extents.x = mu - expandedSigma;
                 extents.y = mu + expandedSigma;
 
-                // Contrast-proportional margin prevents clamping subpixel edge gradients
                 float axisMargin = taaClipOvershoot * max(pMax - pMin, kMinFootprintRange);
                 extents += float2(-axisMargin, axisMargin);
             }
             else
             {
-                // Convex hull with local contrast-aware overshoot
                 extents = float2(kLargeValue, -kLargeValue);
                 [unroll]
                 for (int n = 0; n < 9; ++n)
@@ -636,7 +634,6 @@ float3 ClipHistory(float3 historySpace, NeighborhoodStats stats, float normalize
                 extents += float2(-axisMargin, axisMargin);
             }
 
-            // Safe division for parallel rays
             float dir_dot = dot(dir, axis);
             float s_dot   = (dir_dot >= 0.0 ? 1.0 : -1.0);
             float inv_dir = 1.0 / (s_dot * max(abs(dir_dot), 1e-7));
@@ -654,7 +651,6 @@ float3 ClipHistory(float3 historySpace, NeighborhoodStats stats, float normalize
 
             if (t_hit < 1.0)
             {
-                // Soft clipping removes binary facet-chatter
                 if (taaSoftClip > 0.0)
                 {
                     float maxUnit = 1.0 / max(t_hit, kEpsilon);
@@ -674,7 +670,7 @@ float3 ClipHistory(float3 historySpace, NeighborhoodStats stats, float normalize
         float3 diff = historySpace - stats.mu; 
         float d2 = dot(diff, mul(stats.invCov, diff)); 
         float gamma2 = dynamicGamma * dynamicGamma;
-        float3 clipped = (d2 > gamma2 && d2 > kEpsilon) ? (stats.mu + diff * (dynamicGamma / sqrt(d2))) : historySpace;
+        float3 clipped = (d2 > gamma2 && d2 > kEpsilon) ? (stats.mu + diff * (dynamicGamma / sqrt(max(d2, kEpsilon)))) : historySpace;
         return IntersectRayAABB(clipped, stats.mu, stats.aabbMin - clipMargin, stats.aabbMax + clipMargin, taaSoftClip, motionFactor);
     }
 
@@ -687,7 +683,7 @@ float3 ClipHistory(float3 historySpace, NeighborhoodStats stats, float normalize
 }
 
 // ============================================================================
-// MOTION-COMPENSATED DEPTH DISOCCLUSION
+// MOTION-COMPENSATED DEPTH DISOCCLUSION (Optimized for Tilted Planes)
 // ============================================================================
 float ComputeDisocclusion(
     float  resolvedDepth,
@@ -704,43 +700,41 @@ float ComputeDisocclusion(
 {
     if (taaDepthRejection <= 0.001) return 0.0;
 
-    // 1. Expected previous raw depth (exact inter-frame projective scale).
-    float expectedPrevRawDepth = resolvedDepth / max(rPrevY, 1e-4);
+    float safeRPrevY = (rPrevY > 1e-4) ? rPrevY : 1.0;
+    float expectedPrevRawDepth = resolvedDepth / safeRPrevY;
 
-    // 2. One-sided test: only a historical surface that was an occluder
-    //    (closer, i.e. larger raw) invalidates the history.
     float depthDiff = histRawDepth - expectedPrevRawDepth;
     if (depthDiff <= 0.0) return 0.0;
 
     float invExpected  = 1.0 / max(expectedPrevRawDepth, 1e-6);
     float relativeDiff = depthDiff * invExpected;
-
-    // 3. Measurement residuals. taaDepthRejection doubles as the user
-    //    sensitivity and as the floor for depth quantisation.
-    float threshold = taaDepthRejection;
+    float threshold    = taaDepthRejection;
 
     if (!isDilationZone && !isForegroundEdge)
     {
-        // State 1: continuous surface. Both depths refer to the same 3D surface.
+        // State 1: Continuous Surface / Tilted Plane
         float dxLeft   = resolvedDepth - cachedDepth[3];
         float dxRight  = cachedDepth[4] - resolvedDepth;
         float dyTop    = resolvedDepth - cachedDepth[1];
         float dyBottom = cachedDepth[2] - resolvedDepth;
 
-        float gradX   = (abs(dxLeft) < abs(dxRight)) ? dxLeft : dxRight;
-        float gradY   = (abs(dyTop)  < abs(dyBottom)) ? dyTop  : dyBottom;
+        float gradX = (abs(dxLeft) < abs(dxRight)) ? dxLeft : dxRight;
+        float gradY = (abs(dyTop)  < abs(dyBottom)) ? dyTop  : dyBottom;
 
-        // Exact directional depth swing caused by the inter-frame subpixel sampling displacement:
+        // Exact directional subpixel jitter slack
         float directionalJitterSlack = abs(gradX * exactJitterDelta.x + gradY * exactJitterDelta.y);
 
-        // Velocity resampling slack (isotropic, 1 px):
-        float slopeL1  = abs(gradX) + abs(gradY);
-        float velSlack = slopeL1 * kVelPrecisionPx;
+        // Directional velocity slack: projects slope onto actual screen motion vector
+        // Eliminates the huge isotropic L1 padding on tilted planes
+        float2 vDir = (length(pixelVel) > 1e-4) ? normalize(pixelVel) : float2(0.0, 0.0);
+        float dirSlope   = abs(gradX * vDir.x + gradY * vDir.y);
+        float crossSlope = abs(gradX * -vDir.y + gradY * vDir.x);
+        float velSlack   = (dirSlope * 0.75 + crossSlope * 0.25);
 
         threshold += (directionalJitterSlack + velSlack) * invExpected;
 
-        // Inter-frame depth scale that the projective scale does not carry (forward/backward translation):
-        float2 texSize = 1.0 / oneOverTargetSize;
+        // Divergence scale
+        float2 texSize = 1.0 / max(oneOverTargetSize, 1e-6);
         float divX = ( (cachedVel[4].x - cachedVel[3].x)
                      + (cachedVel[6].x - cachedVel[5].x)
                      + (cachedVel[8].x - cachedVel[7].x) ) * (1.0 / 3.0);
@@ -753,28 +747,22 @@ float ComputeDisocclusion(
     }
     else if (isForegroundEdge)
     {
-        // State 3: Foreground silhouette edge / curved crest rolling away from the camera.
-        // At the geometric horizon (N.V = 0), the surface tangent approaches vertical.
-        // The historical depth of THIS SAME OBJECT under jitter/motion spans anywhere
-        // between resolvedDepth (the crest) and dvStats.closestRawDepth (the interior).
-        // crestDrop is the physical height of this curve in the 3x3 cell. Any depth
-        // delta <= crestDrop is the curved surface itself, NOT an external occluder!
+        // State 3: Foreground Crest / Geometric Horizon
         float jitterL1 = abs(exactJitterDelta.x) + abs(exactJitterDelta.y);
-        float curveSlack = crestDrop + foregroundSlope * (kVelPrecisionPx + jitterL1);
+        float curveSlack = crestDrop + foregroundSlope * (1.0 + jitterL1);
         threshold += curveSlack * invExpected;
     }
-    else // isDilationZone
+    else
     {
-        // State 2: Background pixel adjacent to foreground; tested as the dilated object.
+        // State 2: Dilation Zone (Background pixel adjacent to low-profile foreground)
         float jitterL1 = abs(exactJitterDelta.x) + abs(exactJitterDelta.y);
         threshold += foregroundSlope * (kForegroundSlopeRadius + jitterL1) * invExpected;
     }
 
-    // 4. Remaining reprojection residual that scales with screen motion in angular units:
+    // Motion-scaled reprojection residual (tightened cap)
     float motionTan = length(pixelVel) * oneOverTargetSize.y * 2.0 * taaTanHalfFovY;
     threshold += min(motionTan * kReprojResidualPerTan, kReprojResidualMax);
 
-    // 5. Binary decision (0.0 or 1.0).
     return (relativeDiff > threshold) ? 1.0 : 0.0;
 }
 
@@ -821,7 +809,7 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
 {
     // 1. Setup resolution values
     float2 passTexel = oneOverTargetSize;
-    float2 passTexSize = 1.0 / passTexel;
+    float2 passTexSize = 1.0 / max(passTexel, 1e-6);
     float2 minRenderUV = 0.5 * passTexel;
     float2 maxRenderUV = 1.0 - minRenderUV;
 
@@ -840,7 +828,7 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
     float2 snappedRenderUV = clamp(baseRenderTC * passTexel, minRenderUV, maxRenderUV);
     float2 localJitterPx = jitterPixelPos - baseRenderTC;
 
-    // 4. Fetch center pixel samples
+    // 4. Fetch center pixel samples (tonemapped in ToSpace)
     float3 currentColor = max(tex2Dlod(sceneTex, float4(snappedRenderUV, 0.0, 0.0)).rgb, 0.0);
     float centerRawDepth = tex2Dlod(depthTex, float4(snappedRenderUV, 0.0, 0.0)).r;
     float3 centerColorSpace = ToSpace(currentColor);
@@ -913,8 +901,7 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
         }
     }
 
-    // 5b. Signed Midpoint Curvature Velocity & Depth Selection
-    // Statically resolve quadrant taps to avoid dynamic register-array indexing (scratch memory spills)
+    // 5b. Sensitive Signed Midpoint Curvature Velocity & Depth Selection
     float2 v00 = cachedVel[0];
     float2 v10 = (localJitterPx.x >= 0.0) ? cachedVel[4] : cachedVel[3];
     float2 v01 = (localJitterPx.y >= 0.0) ? cachedVel[2] : cachedVel[1];
@@ -922,10 +909,11 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
         ? ((localJitterPx.y >= 0.0) ? cachedVel[8] : cachedVel[6])
         : ((localJitterPx.y >= 0.0) ? cachedVel[7] : cachedVel[5]);
 
-    // Distance-invariant scale (2.5% of local perspective depth)
-    float eps = max(centerRawDepth, 1e-6) * 0.025 + 1e-7;
+    // Adaptive Planar Epsilon: 0.6% base relative scale + plane slope noise
+    // 4x more sensitive to objects skimming above roads than the old 2.5%
+    float planeNoise = (abs(cachedDepth[4] - cachedDepth[3]) + abs(cachedDepth[2] - cachedDepth[1])) * 0.04;
+    float eps = max(max(centerRawDepth, 1e-6) * 0.006, planeNoise) + 1e-6;
 
-    // Measure signed midpoint deviation across all 4 axes:
     float deltaH  = centerRawDepth - 0.5 * (cachedDepth[3] + cachedDepth[4]);
     float deltaV  = centerRawDepth - 0.5 * (cachedDepth[1] + cachedDepth[2]);
     float deltaD1 = centerRawDepth - 0.5 * (cachedDepth[5] + cachedDepth[8]);
@@ -934,15 +922,12 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
     float minDelta = min(min(deltaH, deltaV), min(deltaD1, deltaD2));
     float maxDelta = max(max(deltaH, deltaV), max(deltaD1, deltaD2));
 
-    // Geometric State Classification:
     bool isDilationZone   = useDilation && (minDelta < -eps);
     bool isForegroundEdge = !isDilationZone && (maxDelta > eps);
 
-    // Compute subpixel bilinear velocity for State 1
     float2 subpixelF = abs(localJitterPx);
     float2 bilinearVel = lerp(lerp(v00, v10, subpixelF.x), lerp(v01, v11, subpixelF.x), subpixelF.y);
 
-    // Resolve velocity and depth symmetrically based on the 3 states
     float2 resolvedVel;
     float  resolvedDepth;
 
@@ -962,20 +947,19 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
         resolvedDepth = centerRawDepth;
     }
 
-    // 5c. True Curvature Drop & Foreground Slope Estimation:
-    // crestDrop: height difference between the closest interior texel and the edge crest:
+    // 5c. True Curvature Drop & Foreground Slope Estimation
     float crestDrop = max(dvStats.closestRawDepth - resolvedDepth, 0.0);
     float crestSpan = max(length(dvStats.closestOffset), 1.0);
     float crestSlope = crestDrop / crestSpan;
 
-    // Interior base slope across the object's two closest texels:
+    // Disconnect cliff step from interior object slope when only 1-2 foreground pixels exist
+    float rawDiff = dvStats.closestRawDepth - dvStats.secondClosestRaw;
+    bool secondIsSameObject = (rawDiff < eps * 3.5);
     float fgSpan = max(length(dvStats.closestOffset - dvStats.secondOffset), 1.0);
-    float baseSlope = max(dvStats.closestRawDepth - dvStats.secondClosestRaw, 0.0) / fgSpan;
+    float baseSlope = secondIsSameObject ? (max(rawDiff, 0.0) / fgSpan) : 0.0;
 
-    // For State 3, the effective slope includes the steep curvature drop-off towards the crest:
     float foregroundSlope = max(crestSlope, baseSlope);
 
-    // Debug: Velocity State Classification (Mode 8)
     if (taaDebugMode > 7.5 && taaDebugMode < 8.5)
     {
         float3 stateDebugColor = currentColor * 0.25;
@@ -989,7 +973,7 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
     // 6. History UV and Previous Ray Formulation
     float3 rPrevBase = jitterUV.x * Pprev + Qprev - jitterUV.y * Rprev;
     float3 rPrev = rPrevBase + resolvedVel.x * Pprev - resolvedVel.y * Rprev;
-    float2 historyStableUV = ReprojFinish(rPrev);
+    float2 historyStableUV = ReprojFinish(rPrev, jitterUV + resolvedVel);
 
     // 7. Motion metrics
     float2 pixelVel = (historyStableUV - IN.uv0) * passTexSize;
@@ -997,16 +981,13 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
     float normalizedMotion = saturate(totalPixelMotion / kMotionFullStrengthPx);
     float2 velocityDir = (totalPixelMotion > taaMinMotionDir) ? normalize(pixelVel) : float2(1.0, 0.0);
 
-    // Debug: velocity view
     if (taaDebugMode > 0.5 && taaDebugMode < 1.5)
         return float4(float3(saturate(abs(pixelVel) * kDebugVelocityScale), 0.0), centerRawDepth);
 
-    // 8. Pixel-grid alignment and exact subpixel sampling displacement:
+    // 8. Pixel-grid alignment and exact subpixel sampling displacement
     float2 historyPixelCoord = historyStableUV * passTexSize;
     float2 histSubpixel = historyPixelCoord - (floor(historyPixelCoord) + 0.5);
     float pixelAlignment = 1.0 - saturate(length(histSubpixel) * kSqrt2);
-
-    // Exact subpixel sampling displacement between current and historical depth taps:
     float2 exactJitterDelta = localJitterPx - histSubpixel;
 
     // 8b. History validity
@@ -1018,10 +999,8 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
     hist.clipDistanceRejection = 0.0;
     hist.colorSpace = centerColorSpace;
 
-    // FXAA corner cache: [0] = M, [1] = NW, [2] = NE, [3] = SW, [4] = SE
     float3 fxaaRGB[5];
     fxaaRGB[0] = currentColor;
-
     float blend = 0.0;
 
     if (hist.valid)
@@ -1037,10 +1016,7 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
             if (storeRGB && i >= 5) { fxaaRGB[i - 4] = cRGB; }
         }
 
-        // 9a. Compute spatial neighborhood statistics
         NeighborhoodStats colorStats = ComputeNeighborhoodStats(cachedSpace, velocityDir, normalizedMotion, localJitterPx);
-
-        // 9b. CLIP OVERSHOOT margin
         float3 clipMargin = taaClipOvershoot * max(colorStats.aabbMax - colorStats.aabbMin, 0.0);
 
         // 10. Fetch and evaluate temporal history 
@@ -1055,7 +1031,6 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
             histRawDepth = (isDilationZone || isForegroundEdge) ? histClosestDepth : histBilinearDepth;
         }
 
-        // 10a. Motion-compensated binary disocclusion detection
         hist.disocclusion = ComputeDisocclusion(resolvedDepth, histRawDepth, cachedDepth, cachedVel,
                                                 pixelVel, rPrev.y, exactJitterDelta, foregroundSlope,
                                                 crestDrop, isDilationZone, isForegroundEdge);
@@ -1095,13 +1070,18 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
             dynamicGamma += (hist.shadowRisk * max(taaVarianceGamma, taaShadowVarianceBase)) * (1.0 - hist.disocclusion); 
         }
 
-        // 11. History clipping and metrics
+        // 11. History clipping and relative metrics
         float3 unclippedHistorySpace = hist.colorSpace;
         hist.colorSpace = ClipHistory(hist.colorSpace, colorStats, normalizedMotion, dynamicGamma, cachedSpace, clipMargin);
 
         if (taaClipDistanceRejectionEnabled > 0.5) { 
             float clipDistance = length(unclippedHistorySpace - hist.colorSpace);
-            hist.clipDistanceRejection = saturate((clipDistance - taaClipDistanceRejectionMinError) / max(taaClipDistanceRejectionAmount, 1e-5)); 
+            float rejectionAmount = max(taaClipDistanceRejectionAmount, 0.05);
+            hist.clipDistanceRejection = smoothstep(
+                taaClipDistanceRejectionMinError, 
+                taaClipDistanceRejectionMinError + rejectionAmount, 
+                clipDistance
+            );
         }
 
         // 12. Gamut compression
@@ -1110,7 +1090,6 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
         // 13. Final Blend factor mapping
         float motionBlendEnd = max(taaMotionBlendDropSpeed, taaMotionBlendStart + kMinMotionBlendDropSpeed);
         blend = lerp(taaFeedbackMax, taaFeedbackMin, smoothstep(taaMotionBlendStart, motionBlendEnd, totalPixelMotion));
-
         blend = lerp(blend, blend * taaAlignmentFeedbackDrop, 1.0 - pixelAlignment);
         
         if (taaShadowMitigation > 0.5) { blend = lerp(blend, taaShadowBlendStrength, hist.shadowRisk); }

@@ -74,8 +74,13 @@ local function frameSize()
     return 1920, 1080
 end
 
+-- Bug 3 Fix: publish realistic camera FOV instead of 1.0, 1.0
 local function publishNoJitter()
-    if pfx then pfx.setFrameState(1.0, 1.0, 0.0, 0.0, 0.0, 0.0) end
+    local w, h = frameSize()
+    local fovRad = math.rad(65)
+    local tanHalfFovY = math.tan(fovRad * 0.5)
+    local tanHalfFovX = tanHalfFovY * (w / h)
+    if pfx then pfx.setFrameState(tanHalfFovX, tanHalfFovY, 0.0, 0.0, 0.0, 0.0) end
     prevYaw, prevPitch = 0, 0
 end
 

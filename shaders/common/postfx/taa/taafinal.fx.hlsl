@@ -50,47 +50,50 @@ float3 FsrRcasF(float2 uv, float2 texel, float2 minUV, float2 maxUV, float sharp
         return max(0.0, tex2Dlod(taaResultTex, float4(uv, 0.0, 0.0)).rgb);
     }
 
-    // 1. Fetch 5-tap neighborhood:
-    //      b
-    //   d  e  f
-    //      h
-    float3 b = SamplePerceptual(clamp(uv + float2( 0.0, -texel.y), minUV, maxUV));
-    float3 d = SamplePerceptual(clamp(uv + float2(-texel.x,  0.0), minUV, maxUV));
-    float3 e = SamplePerceptual(uv);
-    float3 f = SamplePerceptual(clamp(uv + float2( texel.x,  0.0), minUV, maxUV));
-    float3 h = SamplePerceptual(clamp(uv + float2( 0.0,  texel.y), minUV, maxUV));
+    // 1. Fetch raw HDR colors (unclamped)
+    float3 b = max(0.0, tex2Dlod(taaResultTex, float4(clamp(uv + float2( 0.0, -texel.y), minUV, maxUV), 0.0, 0.0)).rgb);
+    float3 d = max(0.0, tex2Dlod(taaResultTex, float4(clamp(uv + float2(-texel.x,  0.0), minUV, maxUV), 0.0, 0.0)).rgb);
+    float3 e = max(0.0, tex2Dlod(taaResultTex, float4(uv, 0.0, 0.0)).rgb);
+    float3 f = max(0.0, tex2Dlod(taaResultTex, float4(clamp(uv + float2( texel.x,  0.0), minUV, maxUV), 0.0, 0.0)).rgb);
+    float3 h = max(0.0, tex2Dlod(taaResultTex, float4(clamp(uv + float2( 0.0,  texel.y), minUV, maxUV), 0.0, 0.0)).rgb);
 
-    // 2. Min and max of 4-tap ring (excluding center e)
-    // AF3 mn4 = min(AMin3F3(b.rgb, d.rgb, f.rgb), h.rgb);
-    // AF3 mx4 = max(AMax3F3(b.rgb, d.rgb, f.rgb), h.rgb);
-    float3 mn4 = min(min(b, d), min(f, h));
-    float3 mx4 = max(max(b, d), max(f, h));
+    // 2. Compute local peak luminance to normalize the neighborhood into [0, 1]
+    float maxLuma = max(max(max(b.g, d.g), max(e.g, f.g)), h.g);
+    float normFactor = 1.0 / max(maxLuma, 1e-4);
 
-    // 3. Exact AMD peak limit search
-    // AF3 hitMin = mn4 / (4.0 * mx4);
-    // AF3 hitMax = (peakC.x - mx4) / (4.0 * mn4 + peakC.y);
+    // 3. Normalised perceptual space for lobe calculation (safe in [0, 1])
+    float3 bNorm = sqrt(saturate(b * normFactor));
+    float3 dNorm = sqrt(saturate(d * normFactor));
+    float3 eNorm = sqrt(saturate(e * normFactor));
+    float3 fNorm = sqrt(saturate(f * normFactor));
+    float3 hNorm = sqrt(saturate(h * normFactor));
+
+    // 4. Min and max of 4-tap ring
+    float3 mn4 = min(min(bNorm, dNorm), min(fNorm, hNorm));
+    float3 mx4 = max(max(bNorm, dNorm), max(fNorm, hNorm));
+
+    // 5. AMD RCAS peak limit search (now guaranteed safe from division by zero)
     float3 hitMin = mn4 / (4.0 * max(mx4, 1e-4));
-    float3 hitMax = (peakC.x - mx4) / (4.0 * mn4 + peakC.y);
-    float3 lobeRGB = max(-hitMin, hitMax);
+    float3 hitMaxDenom = 4.0 * mn4 + peakC.y; // peakC.y is -4.0
+    // Prevent division by zero near 1.0
+    hitMaxDenom = min(hitMaxDenom, -1e-4);
+    float3 hitMax = (peakC.x - mx4) / hitMaxDenom;
 
-    // AF1 lobe = max(-FSR_RCAS_LIMIT, min(max(lobeRGB.r, max(lobeRGB.g, lobeRGB.b)), 0.0)) * con;
+    float3 lobeRGB = max(-hitMin, hitMax);
     float lobe = max(-FSR_RCAS_LIMIT, min(0.0, max(lobeRGB.r, max(lobeRGB.g, lobeRGB.b))));
 
-    // 4. AMD Noise mitigation (FSR_RCAS_DENOISE) using green channel / approximate luma
-    float nz = 0.25 * (b.g + d.g + f.g + h.g) - e.g;
+    // 6. AMD Noise mitigation
+    float nz = 0.25 * (bNorm.g + dNorm.g + fNorm.g + hNorm.g) - eNorm.g;
     float rangeL = max(mx4.g - mn4.g, 1e-4);
     nz = saturate(abs(nz) / rangeL);
     nz = -0.5 * nz + 1.0;
     
-    // Apply user sharpness scaling and noise attenuation factor
     lobe *= sharpness * nz;
 
-    // 5. Official AMD RCAS Resolve
-    // pix = (lobe * (b + d + h + f) + e) / (4.0 * lobe + 1.0);
+    // 7. Resolve using the ORIGINAL HDR values (retains 100% full HDR range)
     float3 outColor = (lobe * (b + d + f + h) + e) / (4.0 * lobe + 1.0);
 
-    // Transform back to linear color (NO final bounding clamp, exact to AMD SDK)
-    return max(0.0, PerceptualToLinear(outColor));
+    return max(0.0, outColor);
 }
 
 // ============================================================================
