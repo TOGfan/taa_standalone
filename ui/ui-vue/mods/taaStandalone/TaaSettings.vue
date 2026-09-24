@@ -10,7 +10,7 @@
       </div>
     </div>
 
-   <!-- Presets Bar -->
+    <!-- Presets Bar -->
     <div class="options-presets">
       <BngButton class="preset-btn" :accent="ACCENTS.outlined" @click="applyPreset(presets.Performance)">Performance</BngButton>
       <BngButton class="preset-btn" :accent="ACCENTS.outlined" @click="applyPreset(presets.Balanced)">Balanced</BngButton>
@@ -217,7 +217,8 @@ const settingsSchema = [
   {
     name: "Advanced Rejection",
     items: [
-      { id: 'depthRejection', type: 'float', min: 0.0, max: 1.0, step: 0.01, default: 0.01, name: "Disocclusion Sensitivity", desc: "Threshold of the geometry-based disocclusion test: how much closer than every surface in the 1-pixel dilation zone the history must be before it is rejected as stale. 0 disables depth rejection entirely." },
+      { id: 'depthRejection', type: 'float', min: 0.0, max: 0.10, step: 0.001, default: 0.01, name: "Disocclusion Sensitivity (Depth)", desc: "Threshold of the geometry-based disocclusion test: how much closer than every surface in the 1-pixel dilation zone the history must be before it is rejected as stale. 0 disables depth rejection entirely." },
+      { id: 'velRejection', type: 'float', min: 0.0, max: 10.0, step: 0.1, default: 1.5, name: "Disocclusion Threshold (Dilated Velocity)", desc: "Threshold (in pixels) for velocity consistency rejection using 3x3 dilated motion vectors (both current and historical). Rejects history if the historical dilated velocity differs from current motion, eliminating ghosts behind accelerating objects or rotating wheels. 0 disables." },
       { id: 'clipDistanceRejectionEnabled', type: 'numBool', default: 1.0, name: "Smear Rejection", desc: "Drops history weight where the clip hull had to move the history a long way -- a ghosting indicator for content without motion vectors (animated textures, particles)." },
       { id: 'clipDistanceRejectionAmount', type: 'float', min: 0.0, max: 1.0, step: 0.001, default: 0.0, name: "Smear Rejection Tolerance", desc: "How far the clip distance must exceed the minimum error before history is fully rejected." },
       { id: 'clipDistanceRejectionMinError', type: 'float', min: 0.001, max: 0.5, step: 0.001, default: 0.15, name: "Smear Rejection Min Error", desc: "Minimum clip distance before smear rejection begins to engage." },
@@ -232,15 +233,15 @@ const settingsSchema = [
         type: 'select', 
         default: 0.0, 
         name: "Debug View Mode", 
-        desc: "Visualizes internal buffers and rejection masks.\n\n0: Off (Normal)\n1: Pixel Motion Vectors\n2: Raw History Buffer\n3: Disocclusion Mask\n4: Linear Depth (Normalized 100m)\n5: Shadow Risk Factor\n6: Confidence Heatmap\n7: Accumulation Blend Weight\n8: Velocity States (Red=Dilation, Cyan=Foreground Edge, Dark=Continuous)",
+        desc: "Visualizes internal buffers and rejection masks.\n\n0: Off (Normal)\n1: Pixel Motion Vectors\n2: Raw History Buffer\n3: Disocclusion Mask (Red=Depth, Cyan=Dilated Vel, Yellow=Both)\n4: Linear Depth (Normalized 100m)\n5: Shadow Risk Factor\n6: Historical Dilated Velocity (Diagnostics)\n7: Accumulation Blend Weight\n8: Velocity States (Red=Dilation, Cyan=Foreground Edge, Dark=Continuous)",
         options: [
           { label: 'Off (Normal Rendering)', value: 0.0 },
           { label: 'Motion Vectors', value: 1.0 },
           { label: 'History Buffer', value: 2.0 },
-          { label: 'Disocclusion Mask', value: 3.0 },
+          { label: 'Disocclusion Mask (Red:Depth, Cyan:Vel, Yel:Both)', value: 3.0 },
           { label: 'Linearized Depth', value: 4.0 },
           { label: 'Shadow Risk Proxy', value: 5.0 },
-          { label: 'Confidence Heatmap', value: 6.0 },
+          { label: 'Historical Dilated Velocity (Diagnostics)', value: 6.0 },
           { label: 'Final Blend Weight', value: 7.0 },
           { label: 'Velocity Classification (States / Dilation)', value: 8.0 }
         ]

@@ -10,6 +10,9 @@ local function getOrCreateStateBlock(objName, setupSamplers)
         obj.samplersDefined = true
         setupSamplers(obj)
         obj:registerObject(objName)
+    else
+        -- Force re-setup of samplers on existing stateblock
+        setupSamplers(obj)
     end
     return obj
 end
@@ -70,51 +73,69 @@ function M.setFrameState(tanX, tanY, yaw, pitch, prevYaw, prevPitch)
     setBasis("Prev", prv)
 end
 
+function M.destroy()
+    if scenetree.TAA_StoreVelocityFx then scenetree.TAA_StoreVelocityFx:delete() end
+    if scenetree.TAA_StoreFx then scenetree.TAA_StoreFx:delete() end
+    if scenetree.TAA_FinalFx then scenetree.TAA_FinalFx:delete() end
+    if scenetree.TAA_PreFx then scenetree.TAA_PreFx:delete() end
+end
+
 function M.build()
+    -- Ensure clean recreation so changes to slots or children never skip
+    M.destroy()
+
     getOrCreateStateBlock("TAA_StateBlock", function(sb)
-        sb:setField("samplerStates", 0, "SamplerClampPoint")
-        sb:setField("samplerStates", 1, "SamplerClampPoint")
-        sb:setField("samplerStates", 2, "SamplerClampLinear")
-        sb:setField("samplerStates", 3, "SamplerClampPoint")
+        sb:setField("samplerStates", 0, "SamplerClampPoint")   -- 0: sceneTex
+        sb:setField("samplerStates", 1, "SamplerClampPoint")   -- 1: depthTex
+        sb:setField("samplerStates", 2, "SamplerClampLinear")  -- 2: historyTex
+        sb:setField("samplerStates", 3, "SamplerClampPoint")   -- 3: velocityTex
+        sb:setField("samplerStates", 4, "SamplerClampPoint")   -- 4: prevVelocityTex
     end)
 
     getOrCreateStateBlock("TAA_Copy_StateBlock", function(sb)
-        sb:setField("samplerStates", 0, "SamplerClampLinear")
+        sb:setField("samplerStates", 0, "SamplerClampPoint")
     end)
 
     getOrCreateShader("TAA_Resolve_ShaderData", "shaders/common/postFx/taa/taa.fx.hlsl")
     getOrCreateShader("TAA_Copy_ShaderData", "shaders/common/postFx/taa/taaCopy.fx.hlsl")
     getOrCreateShader("TAA_Final_ShaderData", "shaders/common/postFx/taa/taaFinal.fx.hlsl")
 
-    local taaPreFx = scenetree.findObject("TAA_PreFx")
-    if not taaPreFx then
-        taaPreFx = createObject("PostEffect")
-        taaPreFx.isEnabled = false; taaPreFx.allowReflectPass = false
-        taaPreFx:setField("renderTime", 0, "PFXBeforeBin"); taaPreFx:setField("renderBin", 0, "EditorBin"); taaPreFx.renderPriority = 0.1
-        taaPreFx:setField("shader", 0, "TAA_Resolve_ShaderData"); taaPreFx:setField("stateBlock", 0, "TAA_StateBlock")
-        taaPreFx:setField("targetScale", 0, "1.0 1.0")
+    local taaPreFx = createObject("PostEffect")
+    taaPreFx.isEnabled = false; taaPreFx.allowReflectPass = false
+    taaPreFx:setField("renderTime", 0, "PFXBeforeBin"); taaPreFx:setField("renderBin", 0, "EditorBin"); taaPreFx.renderPriority = 0.1
+    taaPreFx:setField("shader", 0, "TAA_Resolve_ShaderData"); taaPreFx:setField("stateBlock", 0, "TAA_StateBlock")
+    taaPreFx:setField("targetScale", 0, "1.0 1.0")
 
-        taaPreFx:setField("texture", 0, "$backBuffer"); taaPreFx:setField("texture", 1, "#prepass[Depth]")
-        taaPreFx:setField("texture", 2, "$backBuffer"); taaPreFx:setField("texture", 3, "#velocitybuffer")
-        taaPreFx:setField("target", 0, "#TAA_Result"); taaPreFx:setField("targetFormat", 0, "GFXFormatR32G32B32A32F"); taaPreFx:setField("targetClear", 0, "PFXTargetClear_OnDraw")
+    taaPreFx:setField("texture", 0, "$backBuffer")
+    taaPreFx:setField("texture", 1, "#prepass[Depth]")
+    taaPreFx:setField("texture", 2, "$backBuffer")
+    taaPreFx:setField("texture", 3, "#velocitybuffer")
+    taaPreFx:setField("texture", 4, "#velocitybuffer")
+    taaPreFx:setField("target", 0, "#TAA_Result")
+    taaPreFx:setField("targetFormat", 0, "GFXFormatR32G32B32A32F")
+    taaPreFx:setField("targetClear", 0, "PFXTargetClear_OnDraw")
 
-        local taaFinalFx = createObject("PostEffect")
-        taaFinalFx:setField("shader", 0, "TAA_Final_ShaderData"); taaFinalFx:setField("stateBlock", 0, "TAA_Copy_StateBlock")
-        taaFinalFx:setField("texture", 0, "#TAA_Result")
-        taaFinalFx:setField("target", 0, "$backBuffer")
-        taaFinalFx:registerObject("TAA_FinalFx"); taaPreFx:add(taaFinalFx)
+    local taaFinalFx = createObject("PostEffect")
+    taaFinalFx:setField("shader", 0, "TAA_Final_ShaderData"); taaFinalFx:setField("stateBlock", 0, "TAA_Copy_StateBlock")
+    taaFinalFx:setField("texture", 0, "#TAA_Result")
+    taaFinalFx:setField("target", 0, "$backBuffer")
+    taaFinalFx:registerObject("TAA_FinalFx"); taaPreFx:add(taaFinalFx)
 
-        local taaStoreFx = createObject("PostEffect")
-        taaStoreFx:setField("shader", 0, "TAA_Copy_ShaderData"); taaStoreFx:setField("stateBlock", 0, "TAA_Copy_StateBlock")
-        taaStoreFx:setField("targetScale", 0, "1.0 1.0")
-        taaStoreFx:setField("texture", 0, "#TAA_Result"); taaStoreFx:setField("target", 0, "#TAA_History")
-        taaStoreFx:setField("targetFormat", 0, "GFXFormatR32G32B32A32F"); taaStoreFx:setField("targetClear", 0, "PFXTargetClear_None")
-        taaStoreFx:registerObject("TAA_StoreFx"); taaPreFx:add(taaStoreFx)
+    local taaStoreFx = createObject("PostEffect")
+    taaStoreFx:setField("shader", 0, "TAA_Copy_ShaderData"); taaStoreFx:setField("stateBlock", 0, "TAA_Copy_StateBlock")
+    taaStoreFx:setField("targetScale", 0, "1.0 1.0")
+    taaStoreFx:setField("texture", 0, "#TAA_Result"); taaStoreFx:setField("target", 0, "#TAA_History")
+    taaStoreFx:setField("targetFormat", 0, "GFXFormatR32G32B32A32F"); taaStoreFx:setField("targetClear", 0, "PFXTargetClear_None")
+    taaStoreFx:registerObject("TAA_StoreFx"); taaPreFx:add(taaStoreFx)
 
-        taaPreFx:registerObject("TAA_PreFx")
-    end
+    local taaStoreVelFx = createObject("PostEffect")
+    taaStoreVelFx:setField("shader", 0, "TAA_Copy_ShaderData"); taaStoreVelFx:setField("stateBlock", 0, "TAA_Copy_StateBlock")
+    taaStoreVelFx:setField("targetScale", 0, "1.0 1.0")
+    taaStoreVelFx:setField("texture", 0, "#velocitybuffer"); taaStoreVelFx:setField("target", 0, "#TAA_PrevVelocity")
+    taaStoreVelFx:setField("targetFormat", 0, "GFXFormatR32G32B32A32F"); taaStoreVelFx:setField("targetClear", 0, "PFXTargetClear_None")
+    taaStoreVelFx:registerObject("TAA_StoreVelocityFx"); taaPreFx:add(taaStoreVelFx)
 
-    -- Bug 3 Fix: Initialize valid default reprojection bases immediately on creation
+    taaPreFx:registerObject("TAA_PreFx")
     M.setFrameState(1.0, 1.0, 0.0, 0.0, 0.0, 0.0)
 end
 
@@ -124,8 +145,8 @@ M.settings = {
     jitterScale                   = 1.0,
     feedbackMin                   = 0.97,
     feedbackMax                   = 0.97,
-    lumaDriftStrength             = 0.0,     -- 0 = off; fraction of remaining mismatch per frame
-    lumaDriftChromaTol            = 0.1,     -- same-surface gate tolerance (chromaticity units)
+    lumaDriftStrength             = 0.0,
+    lumaDriftChromaTol            = 0.1,
     shadowMitigation              = 0.0,
     shadowDarknessThreshold       = 0.25,
     shadowBlendStrength           = 0.95,
@@ -135,7 +156,8 @@ M.settings = {
     jitterFlickerPadding          = 0.0,
     directionalVariance           = 1.0,
     jitterFlickerFade             = 0.0,
-    depthRejection                = 0.1,
+    depthRejection                = 0.01,
+    velRejection                  = 1.5,
     sharpness                     = 0.50,
     debugMode                     = 0.0,
     useDepthDilation              = 1.0,
@@ -149,8 +171,8 @@ M.settings = {
     alignmentFeedbackDrop         = 0.90,
     motionBlendDropSpeed          = 1.0,
     useLanczos3                   = 1.0,
-    historyOvershoot              = 1.0,    -- sampler anti-ringing margin (luma + chroma)
-    clipOvershoot                 = 0.0,    -- clip-bound overshoot margin (fraction of 9-tap range)
+    historyOvershoot              = 1.0,
+    clipOvershoot                 = 0.0,
     fireflyClamp                  = 4.0,
     shadowTemporalMult            = 10.0,
     shadowSpatialMult             = 5.0,
@@ -182,6 +204,7 @@ function M.applySettings(inputs)
         pre:setShaderConst("$taaDirectionalVariance",     s.directionalVariance)
         pre:setShaderConst("$taaJitterFlickerFade",       s.jitterFlickerFade)
         pre:setShaderConst("$taaDepthRejection",          s.depthRejection)
+        pre:setShaderConst("$taaVelRejection",            s.velRejection)
         pre:setShaderConst("$taaDebugMode",               s.debugMode)
         pre:setShaderConst("$taaUseDepthDilation",        s.useDepthDilation)
         pre:setShaderConst("$taaLumaVariance",            s.lumaVariance)
@@ -233,19 +256,15 @@ function M.setPriority(priority)
 end
 
 function M.exists()
-    return scenetree.TAA_PreFx ~= nil
-end
-
-function M.destroy()
-    if scenetree.TAA_StoreFx then scenetree.TAA_StoreFx:delete() end
-    if scenetree.TAA_FinalFx then scenetree.TAA_FinalFx:delete() end
-    if scenetree.TAA_PreFx then scenetree.TAA_PreFx:delete() end
+    return scenetree.TAA_PreFx ~= nil and scenetree.TAA_StoreVelocityFx ~= nil
 end
 
 function M.setupHistory(state)
     local pre = scenetree.TAA_PreFx
     if pre then
-        pre:setField("texture", 2, (state == "history") and "#TAA_History" or "$backBuffer")
+        local isHistory = (state == "history")
+        pre:setField("texture", 2, isHistory and "#TAA_History" or "$backBuffer")
+        pre:setField("texture", 4, isHistory and "#TAA_PrevVelocity" or "#velocitybuffer")
     end
 end
 

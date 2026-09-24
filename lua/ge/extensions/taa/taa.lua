@@ -1,6 +1,6 @@
 local M = {}
 
-local MOD_VERSION = "1.4"
+local MOD_VERSION = "1.6"
 local settingsPath = "settings/taa_standalone.json"
 local active = true
 local pfx = nil
@@ -74,7 +74,6 @@ local function frameSize()
     return 1920, 1080
 end
 
--- Bug 3 Fix: publish realistic camera FOV instead of 1.0, 1.0
 local function publishNoJitter()
     local w, h = frameSize()
     local fovRad = math.rad(65)
