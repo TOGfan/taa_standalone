@@ -1,6 +1,6 @@
 local M = {}
 
-local MOD_VERSION = "1.6"
+local MOD_VERSION = "1.12"
 local settingsPath = "settings/taa_standalone.json"
 local active = true
 local pfx = nil
@@ -12,7 +12,25 @@ local historyWarmupFrames = 0
 local jitterIndex = 0
 local jitterQuat = quat(0, 0, 0, 1)
 local tmpQuat = quat(0, 0, 0, 1)
+-- Jitter angle history: prev = frame t-1, prev2 = frame t-2.
+-- The shader needs t-2 to cancel the jitter in both the velocity comparison
+-- (second difference) and the pursuit transport (first-order combination).
 local prevYaw, prevPitch = 0, 0
+local prev2Yaw, prev2Pitch = 0, 0
+
+-- Last known projection parameters, so no-jitter frames keep the shader's
+-- tangent-space math consistent instead of falling back to a hardcoded FOV.
+local lastFov = 65.0
+local lastTanX, lastTanY = 1.0, 1.0
+
+-- Canvas size, tracked so resolution changes reset the history warmup (the
+-- history buffer's contents do not survive a resize).
+local lastCanvasW, lastCanvasH = 0, 0
+
+-- Settings accepted while the effect chain is unavailable (require failed or
+-- mid-rebuild): persisted immediately, applied on the next ensureChain(), and
+-- surfaced by requestUIState().
+local pendingSettings = nil
 
 local hookedCam = nil
 local hookStamp, seenStamp = 0, 0
@@ -75,12 +93,15 @@ local function frameSize()
 end
 
 local function publishNoJitter()
+    -- With zero jitter all screen maps are identities regardless of tan, but
+    -- the disocclusion tangent-space math still consumes taaTanHalfFov, so
+    -- keep it consistent with the last valid projection / current canvas size.
     local w, h = frameSize()
-    local fovRad = math.rad(65)
-    local tanHalfFovY = math.tan(fovRad * 0.5)
-    local tanHalfFovX = tanHalfFovY * (w / h)
-    if pfx then pfx.setFrameState(tanHalfFovX, tanHalfFovY, 0.0, 0.0, 0.0, 0.0) end
+    lastTanY = math.tan(math.rad(lastFov) * 0.5)
+    lastTanX = lastTanY * (w / h)
+    if pfx then pfx.setFrameState(lastTanX, lastTanY, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0) end
     prevYaw, prevPitch = 0, 0
+    prev2Yaw, prev2Pitch = 0, 0
 end
 
 local function applyJitter(data)
@@ -89,7 +110,7 @@ local function applyJitter(data)
 
     local res = data.res
     local simPaused = (data.dtSim or 1) < 1e-5
-    
+
     local wantJitter = active and pfx and pfx.settings.useJitter and res and res.rot
         and not res.ortho
         and not data.openxrSessionRunning
@@ -102,20 +123,23 @@ local function applyJitter(data)
     end
 
     local w, h = frameSize()
-    local fovRad = math.rad(res.fov or 65)
+    local fovDeg = res.fov or lastFov
+    local fovRad = math.rad(fovDeg)
     local tanHalfFovY = math.tan(fovRad * 0.5)
     local tanHalfFovX = tanHalfFovY * (w / h)
+    lastFov = fovDeg
+    lastTanX, lastTanY = tanHalfFovX, tanHalfFovY
 
     local period = pfx.settings.useR2Jitter and 32 or 16
     jitterIndex = (jitterIndex + 1) % period
 
     local hx, hy
-    if pfx.settings.useR2Jitter then 
+    if pfx.settings.useR2Jitter then
         hx, hy = r2_sequence(jitterIndex)
         hx, hy = hx - 0.5, hy - 0.5
-    else 
+    else
         hx = halton(jitterIndex + 1, 2) - 0.5
-        hy = halton(jitterIndex + 1, 3) - 0.5 
+        hy = halton(jitterIndex + 1, 3) - 0.5
     end
 
     local pxX = hx * pfx.settings.jitterScale
@@ -128,7 +152,8 @@ local function applyJitter(data)
     tmpQuat:set(res.rot)
     res.rot:setMul2(jitterQuat, tmpQuat)
 
-    pfx.setFrameState(tanHalfFovX, tanHalfFovY, yaw, pitch, prevYaw, prevPitch)
+    pfx.setFrameState(tanHalfFovX, tanHalfFovY, yaw, pitch, prevYaw, prevPitch, prev2Yaw, prev2Pitch)
+    prev2Yaw, prev2Pitch = prevYaw, prevPitch
     prevYaw, prevPitch = yaw, pitch
 end
 
@@ -144,46 +169,24 @@ local function hookCamera()
     local cam = getGameengineCam()
     if not cam then return false end
     if cam == hookedCam and rawget(cam, "taa_orig_update") then return true end
-    
+
     unhookCamera()
-    
+
     local orig = cam.update
     rawset(cam, "taa_orig_update", orig)
     rawset(cam, "update", function(self, ...)
         local data = ...
         if type(data) == "table" then
-            pcall(applyJitter, data)
+            local ok, err = pcall(applyJitter, data)
+            if not ok then
+                log("E", "TAA", "applyJitter failed: " .. tostring(err))
+            end
         end
         return orig(self, ...)
     end)
-    
+
     hookedCam = cam
     return true
-end
-
-local function hookScreenshot()
-    if render_renderViews and not render_renderViews.taa_orig_takeScreenshot then
-        render_renderViews.taa_orig_takeScreenshot = render_renderViews.takeScreenshot
-        render_renderViews.takeScreenshot = function(options, callback)
-            local function newCallback()
-                if callback then callback() end
-                if active and pfx then 
-                    historyWarmupFrames = 0 
-                    pfx.setupHistory("reset")
-                    pfx.setEnabled(true) 
-                end
-            end
-            if pfx then pfx.setEnabled(false) end
-            render_renderViews.taa_orig_takeScreenshot(options, newCallback)
-        end
-    end
-end
-
-local function unhookScreenshot()
-    if render_renderViews and render_renderViews.taa_orig_takeScreenshot then
-        render_renderViews.takeScreenshot = render_renderViews.taa_orig_takeScreenshot
-        render_renderViews.taa_orig_takeScreenshot = nil
-    end
 end
 
 local function suppressGameAA()
@@ -191,9 +194,9 @@ local function suppressGameAA()
     local fxaa = scenetree.findObject("FXAA_PostEffect")
     local smaa = scenetree.findObject("SMAA_PostEffect")
     if not fxaa and not smaa then return end
-    
+
     savedAA = {
-        fxaa = fxaa and fxaa:isEnabled() or false, 
+        fxaa = fxaa and fxaa:isEnabled() or false,
         smaa = smaa and smaa:isEnabled() or false
     }
     if fxaa then fxaa:disable() end
@@ -211,7 +214,7 @@ end
 
 local function saveState()
     local currentSettings = {}
-    if pfx then 
+    if pfx then
         currentSettings = pfx.settings
     else
         local savedData = jsonReadFile(settingsPath)
@@ -219,33 +222,49 @@ local function saveState()
             currentSettings = savedData.settings
         end
     end
+    -- Settings staged while the effect chain was unavailable travel with the
+    -- save so they survive into the next ensureChain().
+    if pendingSettings then
+        local merged = {}
+        tableMerge(merged, currentSettings)
+        tableMerge(merged, pendingSettings)
+        currentSettings = merged
+    end
     jsonWriteFile(settingsPath, { version = MOD_VERSION, active = active, settings = currentSettings }, true)
 end
 
 local function loadState()
     local savedData = jsonReadFile(settingsPath)
-    local needsUpdate = false
 
     if savedData and type(savedData) == "table" then
+        if savedData.active ~= nil then active = savedData.active end
+
         if savedData.version ~= MOD_VERSION then
             clearShaderCache()
-            needsUpdate = true
+            -- Legacy migration (pre-1.11 files): the alignment drop default
+            -- moved 0.25 -> 0.5 once it was actually reachable. Only migrate
+            -- untouched defaults (0.25 from 1.10, 0.9 from the inert era);
+            -- keep user tuning.
+            if type(savedData.settings) == "table" then
+                local v = tonumber(savedData.settings.alignmentFeedbackDrop)
+                if v and (math.abs(v - 0.25) < 1e-4 or math.abs(v - 0.9) < 1e-4) then
+                    savedData.settings.alignmentFeedbackDrop = 0.5
+                end
+            end
+            savedData.version = MOD_VERSION
+            savedData.active = active
+            jsonWriteFile(settingsPath, savedData, true)
         end
-        if savedData.active ~= nil then active = savedData.active end
     else
         clearShaderCache()
-        needsUpdate = true
         active = true
-    end
-
-    if needsUpdate then
         saveState()
     end
 end
 
 local function ensureChain()
     if pfx and pfx.exists() then return true end
-    
+
     local ok, mod = pcall(require, "client/postFx/taa")
     if not ok or type(mod) ~= "table" then
         pfx = nil
@@ -258,43 +277,45 @@ local function ensureChain()
         return false
     end
     pfx = mod
-    
+
     local savedData = jsonReadFile(settingsPath)
     if savedData and type(savedData) == "table" and savedData.settings then
         pfx.applySettings(savedData.settings)
     end
+    -- Anything staged while the chain was down was already merged into the
+    -- settings file by saveState(); it is live now.
+    pendingSettings = nil
     return true
 end
 
 local function start()
     if not ensureChain() then return false end
-    
+
     publishNoJitter()
     jitterIndex = 0
     historyWarmupFrames = 0
-    
-    if pfx then 
+    lastCanvasW, lastCanvasH = frameSize()
+
+    if pfx then
         pfx.setupHistory("reset")
-        pfx.setEnabled(true) 
+        pfx.setEnabled(true)
     end
-    
+
     suppressGameAA()
     active = true
     hookCamera()
-    hookScreenshot()
     return true
 end
 
 local function stop()
-    active = false 
-    if pfx then 
+    active = false
+    if pfx then
         pfx.setEnabled(false)
-        pfx.setupHistory("reset") 
+        pfx.setupHistory("reset")
     end
-    
+
     publishNoJitter()
     unhookCamera()
-    unhookScreenshot()
     restoreGameAA()
 end
 
@@ -328,7 +349,7 @@ M.onPreRender = function(dt)
     if not initDone then
         if worldReadyState < 1 then return end
         initDone = true
-        
+
         if active then start() else ensureChain(); stop() end
         return
     end
@@ -337,12 +358,21 @@ M.onPreRender = function(dt)
         retryTimer = retryTimer + dt
         if retryTimer > 5.0 then
             retryTimer = 0
-            ensureChain() 
+            ensureChain()
         end
         return
     end
 
     if pfx and pfx.exists() then
+        -- Resolution change: the history buffer no longer corresponds to the
+        -- new canvas; restart the warmup so accumulation rebuilds cleanly.
+        local w, h = frameSize()
+        if w ~= lastCanvasW or h ~= lastCanvasH then
+            lastCanvasW, lastCanvasH = w, h
+            historyWarmupFrames = 0
+            pfx.setupHistory("reset")
+        end
+
         if historyWarmupFrames < 2 then
             historyWarmupFrames = historyWarmupFrames + 1
             if historyWarmupFrames == 2 then
@@ -350,16 +380,16 @@ M.onPreRender = function(dt)
             end
         end
     end
-    
+
     local filterRan = (hookStamp ~= seenStamp)
     seenStamp = hookStamp
-    
+
     if not filterRan then
         publishNoJitter()
-        hookCamera() 
+        hookCamera()
         return
     end
-    
+
     rehookTimer = rehookTimer + dt
     if rehookTimer >= 2.0 then
         if hookedCam ~= getGameengineCam() then hookCamera() end
@@ -373,22 +403,43 @@ M.requestUIState = function()
         if ok and type(mod) == "table" then pfx = mod end
     end
 
+    local settings = pfx and pfx.settings or {}
+    if pendingSettings then
+        local merged = {}
+        tableMerge(merged, settings)
+        tableMerge(merged, pendingSettings)
+        settings = merged
+    end
+
     return {
         active = active,
-        settings = pfx and pfx.settings or {}
+        settings = settings
     }
+end
+
+-- Bulk settings application (UI presets): one apply pass and one settings-file
+-- write instead of a round-trip per key.
+M.uiSetSettings = function(settings)
+    if type(settings) ~= "table" then return end
+    if pfx then
+        pfx.applySettings(settings)
+        pendingSettings = nil
+    else
+        -- Effect chain currently unavailable: stage the values so they are
+        -- persisted now and applied on the next ensureChain().
+        pendingSettings = pendingSettings or {}
+        tableMerge(pendingSettings, settings)
+    end
+    saveState()
+end
+
+M.uiSetSetting = function(key, value)
+    M.uiSetSettings({ [key] = value })
 end
 
 M.uiSetEnabled = function(enabled)
     if enabled then start() else stop() end
     saveState()
-end
-
-M.uiSetSetting = function(key, value)
-    if pfx then
-        pfx.applySettings({[key] = value})
-        saveState()
-    end
 end
 
 return M

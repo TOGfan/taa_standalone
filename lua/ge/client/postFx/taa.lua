@@ -1,5 +1,23 @@
 local M = {}
 
+-- Every scenetree object this module owns. M.destroy() removes them ALL so
+-- M.build() always constructs the chain fresh from the CURRENT files. A
+-- persistent ShaderData object left behind by an older mod version can keep
+-- serving a stale compiled shader (setShaderConst on constants that no longer
+-- exist in the running binary silently no-ops).
+local ownedObjects = {
+    -- PostEffects first (they reference the shaders/stateblocks below)
+    "TAA_StoreVelocityFx",
+    "TAA_StoreFx",
+    "TAA_FinalFx",
+    "TAA_PreFx",
+    "TAA_Resolve_ShaderData",
+    "TAA_Copy_ShaderData",
+    "TAA_Final_ShaderData",
+    "TAA_StateBlock",
+    "TAA_Copy_StateBlock",
+}
+
 local function getOrCreateStateBlock(objName, setupSamplers)
     local obj = scenetree.findObject(objName)
     if not obj then
@@ -29,7 +47,10 @@ local function getOrCreateShader(objName, path)
     return obj
 end
 
-function M.setFrameState(tanX, tanY, yaw, pitch, prevYaw, prevPitch)
+-- prev2Yaw/prev2Pitch: the jitter angles of frame t-2, needed by the shader to
+-- de-jitter both the velocity comparison (second difference) and the pursuit
+-- transport (first-order combination). Both terms are always applied.
+function M.setFrameState(tanX, tanY, yaw, pitch, prevYaw, prevPitch, prev2Yaw, prev2Pitch)
     local pre = scenetree.TAA_PreFx
     if not pre then return end
 
@@ -38,6 +59,8 @@ function M.setFrameState(tanX, tanY, yaw, pitch, prevYaw, prevPitch)
 
     pre:setShaderConst("$taaTanHalfFovX", tanX)
     pre:setShaderConst("$taaTanHalfFovY", tanY)
+    pre:setShaderConst("$taaJitPrev2Yaw",   prev2Yaw or 0.0)
+    pre:setShaderConst("$taaJitPrev2Pitch", prev2Pitch or 0.0)
 
     local function basis(yawA, pitchA)
         local sy, cy = math.sin(yawA), math.cos(yawA)
@@ -74,25 +97,33 @@ function M.setFrameState(tanX, tanY, yaw, pitch, prevYaw, prevPitch)
 end
 
 function M.destroy()
-    if scenetree.TAA_StoreVelocityFx then scenetree.TAA_StoreVelocityFx:delete() end
-    if scenetree.TAA_StoreFx then scenetree.TAA_StoreFx:delete() end
-    if scenetree.TAA_FinalFx then scenetree.TAA_FinalFx:delete() end
-    if scenetree.TAA_PreFx then scenetree.TAA_PreFx:delete() end
+    for _, name in ipairs(ownedObjects) do
+        local obj = scenetree.findObject(name)
+        if obj then obj:delete() end
+    end
 end
 
 function M.build()
-    -- Ensure clean recreation so changes to slots or children never skip
+    -- Ensure clean recreation so changes to slots, children or shader files
+    -- never leave a stale object behind.
     M.destroy()
 
     getOrCreateStateBlock("TAA_StateBlock", function(sb)
-        sb:setField("samplerStates", 0, "SamplerClampPoint")   -- 0: sceneTex
+        -- Linear for sceneTex: every main-path fetch sits on an exact texel
+        -- center (bilinear returns the exact texel there), while the FXAA
+        -- fallback samples at sub-texel positions and needs real filtering to
+        -- function as FXAA.
+        sb:setField("samplerStates", 0, "SamplerClampLinear")  -- 0: sceneTex
         sb:setField("samplerStates", 1, "SamplerClampPoint")   -- 1: depthTex
-        sb:setField("samplerStates", 2, "SamplerClampLinear")  -- 2: historyTex
+        sb:setField("samplerStates", 2, "SamplerClampLinear")  -- 2: historyTex (fused Catmull tap needs it)
         sb:setField("samplerStates", 3, "SamplerClampPoint")   -- 3: velocityTex
         sb:setField("samplerStates", 4, "SamplerClampPoint")   -- 4: prevVelocityTex
     end)
 
     getOrCreateStateBlock("TAA_Copy_StateBlock", function(sb)
+        -- Point sampling doubles as the RCAS integer-load callback in the
+        -- final pass (FsrRcasLoadF fetches exact texel centers; edge offsets
+        -- clamp to the border texel, matching integer-load semantics).
         sb:setField("samplerStates", 0, "SamplerClampPoint")
     end)
 
@@ -100,6 +131,10 @@ function M.build()
     getOrCreateShader("TAA_Copy_ShaderData", "shaders/common/postFx/taa/taaCopy.fx.hlsl")
     getOrCreateShader("TAA_Final_ShaderData", "shaders/common/postFx/taa/taaFinal.fx.hlsl")
 
+    -- ------------------------------------------------------------------
+    -- Resolve pass (root effect): scene + depth + history + velocity ->
+    -- #TAA_Result.
+    -- ------------------------------------------------------------------
     local taaPreFx = createObject("PostEffect")
     taaPreFx.isEnabled = false; taaPreFx.allowReflectPass = false
     taaPreFx:setField("renderTime", 0, "PFXBeforeBin"); taaPreFx:setField("renderBin", 0, "EditorBin"); taaPreFx.renderPriority = 0.1
@@ -115,12 +150,26 @@ function M.build()
     taaPreFx:setField("targetFormat", 0, "GFXFormatR32G32B32A32F")
     taaPreFx:setField("targetClear", 0, "PFXTargetClear_OnDraw")
 
+    -- ------------------------------------------------------------------
+    -- Final pass (sharpening): #TAA_Result -> $backBuffer. MUST be a CHILD
+    -- of the resolve pass: children execute immediately after their parent,
+    -- inside the parent's pass, i.e. strictly after #TAA_Result is written
+    -- and before anything else touches $backBuffer. As a top-level effect it
+    -- gets scheduled independently and can run against $backBuffer before
+    -- the resolve has consumed the scene (feedback loop -> flat screen).
+    -- Field set matches the last known-good version exactly: no own
+    -- renderTime / renderBin / priority / targetScale -- a child inherits
+    -- the parent's scheduling.
+    -- ------------------------------------------------------------------
     local taaFinalFx = createObject("PostEffect")
     taaFinalFx:setField("shader", 0, "TAA_Final_ShaderData"); taaFinalFx:setField("stateBlock", 0, "TAA_Copy_StateBlock")
     taaFinalFx:setField("texture", 0, "#TAA_Result")
     taaFinalFx:setField("target", 0, "$backBuffer")
     taaFinalFx:registerObject("TAA_FinalFx"); taaPreFx:add(taaFinalFx)
 
+    -- ------------------------------------------------------------------
+    -- History copies (children; they read the UN-sharpened resolve output).
+    -- ------------------------------------------------------------------
     local taaStoreFx = createObject("PostEffect")
     taaStoreFx:setField("shader", 0, "TAA_Copy_ShaderData"); taaStoreFx:setField("stateBlock", 0, "TAA_Copy_StateBlock")
     taaStoreFx:setField("targetScale", 0, "1.0 1.0")
@@ -136,7 +185,7 @@ function M.build()
     taaStoreVelFx:registerObject("TAA_StoreVelocityFx"); taaPreFx:add(taaStoreVelFx)
 
     taaPreFx:registerObject("TAA_PreFx")
-    M.setFrameState(1.0, 1.0, 0.0, 0.0, 0.0, 0.0)
+    M.setFrameState(1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
 end
 
 M.settings = {
@@ -157,7 +206,16 @@ M.settings = {
     directionalVariance           = 1.0,
     jitterFlickerFade             = 0.0,
     depthRejection                = 0.01,
+    -- The de-jitter of the velocity comparison is verified exact, so 1.5 is
+    -- pure safety margin. Tighten toward ~0.5 while watching DEBUG MODE 2
+    -- (static scene: R dark, B only wobbles; G only on real reveals) and 7.
     velRejection                  = 1.5,
+    -- Scales the velocity-coherent gradient noise bound in the velocity test.
+    velGradientScale              = 1.0,
+    crossTestStrength             = 0.35,  -- scales pursuit divergence vs tolerance:
+                                           -- higher = more velocity rejections. With the
+                                           -- stabilized test, 0.6-1.0 is reasonable; 0.35
+                                           -- is conservative.
     sharpness                     = 0.50,
     debugMode                     = 0.0,
     useDepthDilation              = 1.0,
@@ -168,7 +226,13 @@ M.settings = {
     colorSpaceOklab               = 1.0,
     jitterAwareVariance           = 1.0,
     velocityAlignedVariance       = 0.0,
-    alignmentFeedbackDrop         = 0.90,
+    alignmentFeedbackDrop         = 0.5,   -- planar-surface-only history drop for sub-texel
+                                           -- misalignment ([FIX 7]). Worst case feedback =
+                                           -- feedbackMax - this. Static scenes produce a
+                                           -- fixed per-pixel pattern (phase is constant);
+                                           -- motion decorrelates it. Higher = sharper
+                                           -- textures in motion, more visible noise
+                                           -- structure on smooth noisy surfaces.
     motionBlendDropSpeed          = 1.0,
     useLanczos3                   = 1.0,
     historyOvershoot              = 1.0,
@@ -191,6 +255,13 @@ function M.applySettings(inputs)
     local fin = scenetree.TAA_FinalFx
     local s = M.settings
 
+    -- Keep the shader's feedback clamp well-defined: with lo > hi, HLSL
+    -- clamp() silently collapses to hi, quietly disabling the motion /
+    -- alignment / shadow feedback reductions.
+    if s.feedbackMin and s.feedbackMax and s.feedbackMin > s.feedbackMax then
+        s.feedbackMin = s.feedbackMax
+    end
+
     if pre then
         pre:setShaderConst("$taaFeedbackMin",             s.feedbackMin)
         pre:setShaderConst("$taaFeedbackMax",             s.feedbackMax)
@@ -205,6 +276,8 @@ function M.applySettings(inputs)
         pre:setShaderConst("$taaJitterFlickerFade",       s.jitterFlickerFade)
         pre:setShaderConst("$taaDepthRejection",          s.depthRejection)
         pre:setShaderConst("$taaVelRejection",            s.velRejection)
+        pre:setShaderConst("$taaVelGradientScale",        s.velGradientScale)
+        pre:setShaderConst("$taaCrossTestStrength",       s.crossTestStrength)
         pre:setShaderConst("$taaDebugMode",               s.debugMode)
         pre:setShaderConst("$taaUseDepthDilation",        s.useDepthDilation)
         pre:setShaderConst("$taaLumaVariance",            s.lumaVariance)
@@ -239,6 +312,7 @@ function M.applySettings(inputs)
 end
 
 function M.setEnabled(enabled)
+    -- Parent only: children toggle with their parent.
     local pre = scenetree.TAA_PreFx
     if pre then
         if enabled then pre:enable() else pre:disable() end
@@ -256,7 +330,9 @@ function M.setPriority(priority)
 end
 
 function M.exists()
-    return scenetree.TAA_PreFx ~= nil and scenetree.TAA_StoreVelocityFx ~= nil
+    return scenetree.TAA_PreFx ~= nil
+       and scenetree.TAA_StoreVelocityFx ~= nil
+       and scenetree.TAA_FinalFx ~= nil
 end
 
 function M.setupHistory(state)

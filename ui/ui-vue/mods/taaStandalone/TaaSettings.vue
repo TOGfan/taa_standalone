@@ -152,7 +152,7 @@ const settingsSchema = [
   {
     name: "General & Sharpening",
     items: [
-      { id: 'sharpness', type: 'float', min: 0.0, max: 1.0, step: 0.01, default: 0.50, name: "Sharpening Strength (RCAS)", desc: "Contrast-adaptive sharpening applied to the final resolved image, clamped to the local pixel range so it cannot overshoot or ring. 0 disables." },
+      { id: 'sharpness', type: 'float', min: 0.0, max: 1.0, step: 0.01, default: 0.50, name: "Sharpening Strength (RCAS)", desc: "Contrast-adaptive sharpening (AMD FidelityFX RCAS, reference implementation) applied to the final resolved image. Runs on a tonemapped copy of the image so HDR highlights stay stable; 1.0 is maximum sharpness, 0 disables." },
       { id: 'jitterScale', type: 'float', min: 0.0, max: 2.0, step: 0.01, default: 1.0, name: "Jitter Spread Scale", desc: "Scales the sub-pixel camera offset pattern. Above 1 samples a wider area within each pixel (more edge anti-aliasing, more temporal softening); below 1 tightens it." },
       { id: 'fallbackFXAA', type: 'numBool', default: 1.0, name: "Fallback Spatial AA (FXAA)", desc: "Applies FXAA edge smoothing to pixels whose temporal history was rejected, so disoccluded areas don't alias while the history rebuilds." }
     ]
@@ -161,12 +161,12 @@ const settingsSchema = [
     name: "History & Blending",
     items: [
       { id: 'feedbackMax', type: 'float', min: 0.0, max: 0.99, step: 0.01, default: 0.97, name: "History Blend (Static Scenes)", desc: "How much of the previous frame is reused for stationary pixels. Higher = smoother and cleaner but slower to react to changes; lower = more responsive but noisier. 0.97 corresponds to roughly a 33-frame accumulation window." },
-      { id: 'feedbackMin', type: 'float', min: 0.0, max: 0.99, step: 0.01, default: 0.97, name: "History Blend (Moving Pixels)", desc: "History reuse once pixel velocity exceeds the motion transition range below. Typically set at or below the static value so motion receives less smoothing." },
+      { id: 'feedbackMin', type: 'float', min: 0.0, max: 0.99, step: 0.01, default: 0.97, name: "History Blend (Moving Pixels)", desc: "History reuse once pixel velocity exceeds the motion transition range below. Typically set at or below the static value so motion receives less smoothing. Note: while this equals the static weight, the motion and shadow feedback reductions are inert (the shader clamps them into this range); the Sub-Pixel Alignment Drop below is exempt -- it applies outside the clamp, on planar surfaces only." },
       { id: 'lumaDriftStrength', type: 'float', min: 0.0, max: 0.3, step: 0.01, default: 0.0, name: "Luma Drift Correction", desc: "Pulls history brightness toward the current image to clear ghost trails from moving shadows, exposure changes and vehicle lights, without reducing temporal smoothing. 0 = off. Only engages on large brightness mismatches on the same surface (see the chroma gate below), so it does not chase noise, jitter or ghosts. Higher values clear trails faster." },
       { id: 'lumaDriftChromaTol', type: 'float', min: 0.0, max: 0.5, step: 0.01, default: 0.1, name: "Drift Same-Surface Tolerance", desc: "Color-match tolerance for the luma drift correction, comparing color-per-brightness so that pure lighting changes (shadows, exposure) pass while a different surface does not. History from a differently-colored object (ghosts, reveal edges) fails this test and is left to the normal rejection paths -- drift only ever corrects brightness, never disguises color mismatches. Raise if legitimate shadows aren't being corrected; lower if colored ghosts linger. 0 requires an exact match (drift effectively off)." },
-      { id: 'motionBlendStart', type: 'float', min: 0.0, max: 5.0, step: 0.01, default: 1.0, name: "Motion Transition Start", desc: "Pixel velocity (in pixels per frame) at which blending starts transitioning from the static to the motion weight." },
-      { id: 'motionBlendDropSpeed', type: 'float', min: 1.0, max: 20.0, step: 0.1, default: 1.0, name: "Motion Transition End", desc: "Pixel velocity at which the blend reaches the motion weight fully." },
-      { id: 'alignmentFeedbackDrop', type: 'float', min: 0.5, max: 1.0, step: 0.01, default: 0.9, name: "Sub-Pixel Alignment Drop", desc: "Reduces history weight when the reprojected sample lands between pixels (sub-pixel misalignment), where the resampling kernel is least accurate. 1.0 disables the reduction." }
+      { id: 'motionBlendStart', type: 'float', min: 0.0, max: 5.0, step: 0.01, default: 1.0, name: "Motion Transition Start", desc: "Pixel velocity (in pixels per frame) at which blending starts transitioning from the static to the motion weight. No effect while the two History Blend weights are equal." },
+      { id: 'motionBlendDropSpeed', type: 'float', min: 1.0, max: 20.0, step: 0.1, default: 1.0, name: "Motion Transition End", desc: "Pixel velocity at which the blend reaches the motion weight fully. No effect while the two History Blend weights are equal." },
+      { id: 'alignmentFeedbackDrop', type: 'float', min: 0.0, max: 1.0, step: 0.01, default: 0.5, name: "Sub-Pixel Alignment Drop", desc: "Lowers history weight when the reprojected history sample lands between texels, where the resampling kernel is least accurate -- preserving texture sharpness in motion. Active only on planar surface interiors (the bilinear-motion path); edges and dilation zones are exempt because their current samples are aliased and dropping history there makes them flicker. Works independently of the History Blend weights. 0 disables. At 0.5, badly-phased pixels drop from a 33-frame to a ~2-frame accumulation window; the cost is a fixed texel-scale noise pattern on smooth noisy surfaces (sky gradients, shadow noise) in static scenes. Verify with debug mode 9 (red = applied drop, green = eligible); note that Lanczos 3 resampling already preserves most sub-texel detail, so the effect is most visible with Lanczos 3 off or sharpening at 0." }
     ]
   },
   {
@@ -198,7 +198,7 @@ const settingsSchema = [
       { id: 'jitterFlickerPadding', type: 'float', min: 0.0, max: 1.0, step: 0.01, default: 0.0, name: "Jitter Anti-Flicker Padding", desc: "Expands the variance bounds in proportion to the current sub-pixel jitter offset, so valid history isn't clipped away purely because of jitter phase. Reduces shimmer in fine detail." },
       { id: 'directionalVariance', type: 'numBool', default: 1.0, name: "Directional Padding", desc: "Expands the bounds along the color direction of the expected jitter shift rather than uniformly. Only active when Jitter Anti-Flicker Padding is above zero." },
       { id: 'jitterFlickerFade', type: 'numBool', default: 0.0, name: "Fade Padding in Motion", desc: "Disables the jitter anti-flicker padding as pixel velocity rises, since reprojection error dominates jitter error in motion." },
-      { id: 'lumaVariance', type: 'numBool', default: 0.0, name: "Luma-Weighted Statistics", desc: "Downweights bright samples when computing neighborhood statistics (Karis-style), keeping the bounds from being stretched by specular fireflies." },
+      { id: 'lumaVariance', type: 'numBool', default: 0.0, name: "Luma-Weighted Statistics", desc: "Downweights bright samples when computing neighborhood statistics (Karas-style), keeping the bounds from being stretched by specular fireflies." },
       { id: 'jitterAwareVariance', type: 'numBool', default: 1.0, name: "Jitter-Aware Statistics", desc: "Weights neighborhood samples by their distance from the jittered sampling position instead of the pixel center." },
       { id: 'velocityAlignedVariance', type: 'numBool', default: 0.0, name: "Velocity-Aligned Statistics", desc: "Downweights neighborhood samples that lie behind the direction of motion, tightening the bounds along motion trails." }
     ]
@@ -217,8 +217,10 @@ const settingsSchema = [
   {
     name: "Advanced Rejection",
     items: [
-      { id: 'depthRejection', type: 'float', min: 0.0, max: 0.10, step: 0.001, default: 0.01, name: "Disocclusion Sensitivity (Depth)", desc: "Threshold of the geometry-based disocclusion test: how much closer than every surface in the 1-pixel dilation zone the history must be before it is rejected as stale. 0 disables depth rejection entirely." },
-      { id: 'velRejection', type: 'float', min: 0.0, max: 10.0, step: 0.1, default: 1.5, name: "Disocclusion Threshold (Dilated Velocity)", desc: "Threshold (in pixels) for velocity consistency rejection using 3x3 dilated motion vectors (both current and historical). Rejects history if the historical dilated velocity differs from current motion, eliminating ghosts behind accelerating objects or rotating wheels. 0 disables." },
+      { id: 'depthRejection', type: 'float', min: 0.0, max: 0.10, step: 0.001, default: 0.01, name: "Disocclusion Sensitivity (Depth)", desc: "Threshold of the geometry-based disocclusion test: how much closer than the kappa-corrected transported surface the history depth must be before it is rejected as stale. Lower = more sensitive. 0 disables depth rejection entirely (the velocity test then runs standalone)." },
+      { id: 'velRejection', type: 'float', min: 0.0, max: 10.0, step: 0.1, default: 1.5, name: "Disocclusion Threshold (Velocity)", desc: "Pixel threshold of the velocity disocclusion test. History whose recorded surface motion no longer matches the current pixel is flagged, then confirmed by pursuing that surface into the current frame -- only a confirmed divergence rejects, so motion-vector noise alone cannot. 0 disables. Lower catches subtler ghosts behind accelerating occluders; too low speckles static scenes. The comparison is exactly de-jittered, so values down to ~0.5 are viable; 1.5 is conservative. Tune with debug modes 2 (green should appear only on true reveals) and 7. Known limitation: on fast-moving or rotating foregrounds, pixels in the object's edge dilation zone can trigger occasional random rejections (point-sampled motion of a fast layer); if that bothers you, raise Velocity Noise Allowance or lower Pursuit Confirmation Strength." },
+      { id: 'velGradientScale', type: 'float', min: 0.0, max: 4.0, step: 0.05, default: 1.0, name: "Velocity Noise Allowance", desc: "Scales the velocity-coherent noise allowance of the disocclusion alert (how much neighboring motion-vector variation is treated as noise rather than signal). Raise if noisy velocity content -- vegetation, particles, alpha-tested edges, or fast-foreground edge dilation zones -- causes speckled alerts in debug mode 2; lower for a stricter alert." },
+      { id: 'crossTestStrength', type: 'float', min: 0.0, max: 1.0, step: 0.05, default: 0.35, name: "Pursuit Confirmation Strength", desc: "How strongly the current-frame pursuit must confirm a flagged velocity mismatch before history is actually rejected (scales the measured divergence against its tolerance). Higher = more velocity rejections; lower makes the pursuit stricter about confirming, which also suppresses the dilation-zone false positives on fast foregrounds. 0.35 is conservative; 0.6-1.0 is reasonable once verified against debug modes 2 and 7." },
       { id: 'clipDistanceRejectionEnabled', type: 'numBool', default: 1.0, name: "Smear Rejection", desc: "Drops history weight where the clip hull had to move the history a long way -- a ghosting indicator for content without motion vectors (animated textures, particles)." },
       { id: 'clipDistanceRejectionAmount', type: 'float', min: 0.0, max: 1.0, step: 0.001, default: 0.0, name: "Smear Rejection Tolerance", desc: "How far the clip distance must exceed the minimum error before history is fully rejected." },
       { id: 'clipDistanceRejectionMinError', type: 'float', min: 0.001, max: 0.5, step: 0.001, default: 0.15, name: "Smear Rejection Min Error", desc: "Minimum clip distance before smear rejection begins to engage." },
@@ -233,17 +235,18 @@ const settingsSchema = [
         type: 'select', 
         default: 0.0, 
         name: "Debug View Mode", 
-        desc: "Visualizes internal buffers and rejection masks.\n\n0: Off (Normal)\n1: Pixel Motion Vectors\n2: Raw History Buffer\n3: Disocclusion Mask (Red=Depth, Cyan=Dilated Vel, Yellow=Both)\n4: Linear Depth (Normalized 100m)\n5: Shadow Risk Factor\n6: Historical Dilated Velocity (Diagnostics)\n7: Accumulation Blend Weight\n8: Velocity States (Red=Dilation, Cyan=Foreground Edge, Dark=Continuous)",
+        desc: "Visualizes internal buffers and rejection masks (the final sharpen pass is bypassed in every mode except 0).\n\n1: Frame Motion -- reprojection motion per pixel.\n2: Disocclusion Breakdown -- red = depth rejection, green = velocity rejection, yellow = both, faint blue = velocity error flagged but pursuit did NOT confirm (suppressed alert).\n3: Center Velocity -- current-frame motion vector magnitude.\n4: Linearized Depth -- normalized 0-100 m.\n5: History Color -- resampled history before clipping.\n6: History-Side Velocity -- effective previous-frame velocity at the history landing.\n7: Pursuit Divergence -- red intensity = divergence magnitude, green = confirmed rejection.\n8: Depth Edge State -- red = dilation zone (background behind a crest), cyan = foreground crest, dark = continuous surface.\n9: Alignment-Drop Activity -- red intensity = the sub-pixel feedback drop actually applied, green tint = planar (eligible) pixels, blue tint = edges / dilation zones (exempt).",
         options: [
           { label: 'Off (Normal Rendering)', value: 0.0 },
-          { label: 'Motion Vectors', value: 1.0 },
-          { label: 'History Buffer', value: 2.0 },
-          { label: 'Disocclusion Mask (Red:Depth, Cyan:Vel, Yel:Both)', value: 3.0 },
-          { label: 'Linearized Depth', value: 4.0 },
-          { label: 'Shadow Risk Proxy', value: 5.0 },
-          { label: 'Historical Dilated Velocity (Diagnostics)', value: 6.0 },
-          { label: 'Final Blend Weight', value: 7.0 },
-          { label: 'Velocity Classification (States / Dilation)', value: 8.0 }
+          { label: '1 - Frame Motion', value: 1.0 },
+          { label: '2 - Disocclusion Breakdown (R:depth G:velocity B:unconfirmed)', value: 2.0 },
+          { label: '3 - Center Velocity', value: 3.0 },
+          { label: '4 - Linearized Depth', value: 4.0 },
+          { label: '5 - History Color', value: 5.0 },
+          { label: '6 - History-Side Velocity', value: 6.0 },
+          { label: '7 - Pursuit Divergence', value: 7.0 },
+          { label: '8 - Depth Edge State', value: 8.0 },
+          { label: '9 - Alignment-Drop Activity', value: 9.0 }
         ]
       }
     ]
@@ -260,6 +263,10 @@ const presets = {
   Balanced: { useKDopClipping: 0, colorSpaceOklab: 0}, 
   Clarity: { feedbackMax: 0.95, feedbackMin: 0.95, },
   Smooth: { }
+}
+
+function toLuaValue(val) {
+  return typeof val === 'boolean' ? (val ? 'true' : 'false') : val
 }
 
 function formatDefault(item) {
@@ -309,14 +316,17 @@ function applyPreset(presetOverrides) {
   for (const key in presetOverrides) { config.value[key] = presetOverrides[key] }
 
   if (!window.bngApi || !window.bngApi.engineLua) return
-  let script = "local t = taa or taa_taa; if t then\n"
-  for (const key in config.value) {
-    let val = config.value[key]
-    let luaVal = typeof val === 'boolean' ? (val ? 'true' : 'false') : val
-    script += `t.uiSetSetting("${key}", ${luaVal})\n`
-  }
-  script += "end"
-  window.bngApi.engineLua(script)
+  // Single round-trip: the Lua side applies the whole table and saves once
+  // (falls back to per-key calls if the bulk API is not present).
+  const entries  = Object.entries(config.value).map(([k, v]) => `${k} = ${toLuaValue(v)}`).join(', ')
+  const fallback = Object.entries(config.value).map(([k, v]) => `t.uiSetSetting("${k}", ${toLuaValue(v)})`).join(' ')
+  window.bngApi.engineLua(`local t = taa or taa_taa; if t then if t.uiSetSettings then t.uiSetSettings({${entries}}) else ${fallback} end end`)
+}
+
+function updateSetting(key) {
+  if (!window.bngApi || !window.bngApi.engineLua) return
+  const v = toLuaValue(config.value[key])
+  window.bngApi.engineLua(`if taa then taa.uiSetSetting("${key}", ${v}) elseif taa_taa then taa_taa.uiSetSetting("${key}", ${v}) end`)
 }
 
 onMounted(() => {
@@ -339,14 +349,6 @@ function toggleTaa(val) {
   const stateStr = val ? 'true' : 'false'
   if (window.bngApi && window.bngApi.engineLua) {
     window.bngApi.engineLua(`if taa then taa.uiSetEnabled(${stateStr}) elseif taa_taa then taa_taa.uiSetEnabled(${stateStr}) end`)
-  }
-}
-
-function updateSetting(key) {
-  let val = config.value[key]
-  let luaVal = typeof val === 'boolean' ? (val ? 'true' : 'false') : val
-  if (window.bngApi && window.bngApi.engineLua) {
-    window.bngApi.engineLua(`if taa then taa.uiSetSetting("${key}", ${luaVal}) elseif taa_taa then taa_taa.uiSetSetting("${key}", ${luaVal}) end`)
   }
 }
 </script>
