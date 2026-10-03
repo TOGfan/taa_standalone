@@ -205,11 +205,11 @@ M.settings = {
     jitterFlickerPadding          = 0.0,
     directionalVariance           = 1.0,
     jitterFlickerFade             = 0.0,
-    depthRejection                = 0.01,
+    depthRejection                = 0.05,
     -- The de-jitter of the velocity comparison is verified exact, so 1.5 is
     -- pure safety margin. Tighten toward ~0.5 while watching DEBUG MODE 2
     -- (static scene: R dark, B only wobbles; G only on real reveals) and 7.
-    velRejection                  = 1.5,
+    velRejection                  = 5.0,
     -- Scales the velocity-coherent gradient noise bound in the velocity test.
     velGradientScale              = 1.0,
     crossTestStrength             = 0.35,  -- scales pursuit divergence vs tolerance:
@@ -226,7 +226,7 @@ M.settings = {
     colorSpaceOklab               = 1.0,
     jitterAwareVariance           = 1.0,
     velocityAlignedVariance       = 0.0,
-    alignmentFeedbackDrop         = 0.5,   -- planar-surface-only history drop for sub-texel
+    alignmentFeedbackDrop         = 0.25,   -- planar-surface-only history drop for sub-texel
                                            -- misalignment ([FIX 7]). Worst case feedback =
                                            -- feedbackMax - this. Static scenes produce a
                                            -- fixed per-pixel pattern (phase is constant);
