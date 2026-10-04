@@ -146,6 +146,59 @@ float2 InverseReprojectThroughCamera(float2 stableUV, CameraBasis camera, float 
 }
 
 // ============================================================================
+// CAMERA DIFFERENTIALS ([REWRITE] depth-disocclusion support)
+// ----------------------------------------------------------------------------
+// Exact differential quantities of the camera maps, used by the resolve's
+// forward-parallax fit. All pure; the stable basis yields CameraForwardAxis
+// = (0,1,0) and CameraForwardJacobian = identity -- usable as unit checks.
+// ============================================================================
+
+// The camera's forward (principal) direction: the center ray of the basis.
+float3 CameraForwardAxis(CameraBasis camera)
+{
+    return normalize(camera.rightTanFov * 0.5 + camera.forward - camera.downTanFov * 0.5);
+}
+
+// Row-major 2x2 helpers, packed as (m00, m01, m10, m11).
+float2 Apply2x2(float4 m, float2 v)
+{
+    return float2(m.x * v.x + m.y * v.y, m.z * v.x + m.w * v.y);
+}
+
+float4 Mul2x2(float4 a, float4 b)
+{
+    return float4(a.x * b.x + a.y * b.z, a.x * b.y + a.y * b.w,
+                  a.z * b.x + a.w * b.z, a.z * b.y + a.w * b.w);
+}
+
+float4 Inv2x2(float4 m)
+{
+    float det = m.x * m.w - m.y * m.z;
+    if (abs(det) < 1e-12) return float4(1.0, 0.0, 0.0, 1.0);
+    float inv = 1.0 / det;
+    return float4(m.w * inv, -m.y * inv, -m.z * inv, m.x * inv);
+}
+
+// Row-major 2x2 Jacobian of the FORWARD map u -> ReprojectThroughCamera(u,
+// camera), analytic and exact for any rotation. With r = BuildCameraRay(u):
+//   F.x = 0.5 + 0.5*r.x/(r.y*tanX),  F.y = 0.5 - 0.5*r.z/(r.y*tanY)
+//   dr/du.x = P,  dr/du.y = -R
+float4 CameraForwardJacobian(float2 u, CameraBasis camera, float tanHalfFovX, float tanHalfFovY)
+{
+    float3 r  = BuildCameraRay(u, camera);
+    float  ry = max(r.y, 1e-4);
+    float3 P  = camera.rightTanFov;
+    float3 R  = camera.downTanFov;
+    float invX = 1.0 / (ry * ry * max(tanHalfFovX, 1e-4));
+    float invY = 1.0 / (ry * ry * max(tanHalfFovY, 1e-4));
+    return float4(
+        0.5 * ( P.x * ry - r.x * P.y) * invX,   // dF.x/du.x
+        0.5 * ( r.x * R.y - R.x * ry ) * invX,  // dF.x/du.y
+       -0.5 * ( P.z * ry - r.z * P.y) * invY,   // dF.y/du.x
+        0.5 * ( R.z * ry - r.z * R.y) * invY);  // dF.y/du.y
+}
+
+// ============================================================================
 // LAYER CLASSIFICATION (the depth-curvature classifier -- THE classifier)
 // ----------------------------------------------------------------------------
 // Core classifier on a raw-depth 3x3, shared by the CURRENT frame, the

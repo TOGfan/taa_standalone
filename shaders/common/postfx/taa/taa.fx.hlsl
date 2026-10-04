@@ -58,6 +58,22 @@
 //   crest's raw sample, so the landing-side extrapolation degenerates to
 //   the anchor value there automatically (w ~ 0 -> q ~ 0).
 //
+// DEPTH DISOCCLUSION ([REWRITE], this entry):
+//   The previous-frame forward depth of a point at forward depth w on a
+//   current-frame ray d is EXACTLY w' = w * B + T_y, where B is the full
+//   relative-rotation factor from the two cbuffer bases and T_y is the
+//   layer's relative forward displacement. Lateral translation provably
+//   never appears in w' (the measured velocity already carries its screen
+//   effect), so the whole transport has ONE unknown scalar. T_y is fitted
+//   per layer from the neighborhood's dejittered parallax (the pointwise
+//   relation K*p = T_perp - T_y*s' holds exactly at any motion magnitude),
+//   with an honest sigma from the fit residual. The one-sided test (only a
+//   history surface IN FRONT rejects) is asymmetric-safe: relative recession
+//   can never false-reject; only approach can -- exactly what T_y corrects.
+//   The tolerance is a measured error budget: depth quanta, surface slope x
+//   tracked-point position error (incl. the extrapolation displacement and
+//   the ACTUAL Slepian filter footprint), plane curvature, and 2*sigma_Ty.
+//
 // OUTPUT: RGB = resolved color. A = the raw scene's acutance energy for
 // taaFinal's auto-parity sharpener, SIGN-ENCODED with the revocation bit
 // (negative = this pixel's tentative dilation was revoked).
@@ -74,12 +90,16 @@
 //
 // CHANGELOG: [MERGE] classification reverted to the old curvature rules;
 // [KEPT] dilation revocation + the foreground-edge phase rule; [RESTORE]
-// velocity disocclusion + the kappa-corrected depth score (with depthGate);
-// [FIX 9] the revocations apply to the history side (the landing's
-// ownership gate); [PORT] the two-tap similarity velocity extrapolation
-// (this entry); [KEPT] infra: inverse-map snap & reprojection base, fixed
-// jitter offset signs, RotationFlowUV prev-2, Slepian filters, acutance
-// alpha, FXAA corners.
+// velocity disocclusion (with depthGate); [FIX 9] the revocations apply to
+// the history side (the landing's ownership gate); [PORT] the two-tap
+// similarity velocity extrapolation; [KEPT] infra: inverse-map snap &
+// reprojection base, fixed jitter offset signs, RotationFlowUV prev-2,
+// Slepian filters, acutance alpha, FXAA corners; [REWRITE] the depth
+// disocclusion: exact forward-depth transport w' = w*B + T_y (B: the full
+// relative rotation from the bases; T_y: the per-layer forward-parallax
+// fit with an honest sigma) replacing the kappa/divergence/inter-layer-shear
+// machinery; the tolerance is a measured error budget including the actual
+// Slepian footprint (kHistoryTapReachPx removed).
 // ============================================================================
 
 #include "shaders/common/postFx/postFx.h.hlsl"
@@ -124,11 +144,18 @@ cbuffer perDraw
     float  taaPrevQY;                       float  taaPrevQZ;
     float  taaPrevRX;                       float  taaPrevRY;
     float  taaPrevRZ;                       float  taaHistoryOvershoot;
-    float  taaLumaDriftStrength;            float  taaLumaDriftChromaTol;
+    float  taaLumaDriftStrength;           float  taaLumaDriftChromaTol;
     float  taaClipOvershoot;                float  taaVelRejection;
-    float  taaVelGradientScale;             float  taaVelPad0;  // pad (was taaVelJitterCancel; de-jitter is always on)
-    float  taaCrossTestStrength;            float  taaJitPrev2Yaw;
-    float  taaJitPrev2Pitch;                float  taaJitPad0;
+    float  taaVelGradientScale;
+    // taaDepthParallaxStep (was the pad taaVelPad0): the camera's forward
+    // displacement this frame along the PREVIOUS frame's forward axis, in
+    // the units of 1/rawDepth (i.e. dot(eyeCur - eyePrev, prevForward) / near
+    // for a standard reversed-Z projection). 0 = not provided; the shader
+    // then measures T_y locally and falls back to a noise-bound estimate
+    // when the local fit is uninformative.
+    float  taaDepthParallaxStep;            float  taaCrossTestStrength;
+    float  taaJitPrev2Yaw;                  float  taaJitPrev2Pitch;
+    float  taaJitPad0;
 
     float2 oneOverTargetSize;
     POSTFX_UNIFORMS
@@ -159,7 +186,6 @@ static const float kMinSigma                 = 0.001;
 static const float kMinSpatialContrast       = 0.001;
 static const float kMinFootprintRange        = 1e-4;
 static const float kFireflyClampEpsilon      = 0.001;
-static const float kHistoryTapReachPx        = 1.5;     // how far a history filter footprint may reach
 
 // Fallback FXAA
 static const float kFXAAReduceMul            = 1.0 / 128.0;
@@ -203,6 +229,13 @@ static const float kVelQuantFloorPx          = 0.0625;
 // counts as ON the center (the sign(frac) quad selection there is decided by
 // reprojection residual noise, not real subpixel position). ~20x the residual.
 static const float kCenterLandingFracPx      = 0.1;
+
+// Depth transport ([REWRITE], see EstimateLayerForwardParallax): the T_y
+// slope fit needs this much positional spread (px^2) to be informative, and
+// when T_y is unmeasurable we assume |T_y|/w below this fraction -- the
+// fit's own detection floor.
+static const float kMinParallaxInfoPx2       = 2.0;
+static const float kTyUnmeasuredFrac         = 0.02;
 
 // Sign-bit transport of the revocation flag through the alpha channel:
 // negative = revoked.
@@ -1198,7 +1231,6 @@ struct ForegroundGeometry
 struct HistoryReprojection
 {
     float2 sampleUV;            // where to read the history (previous STABLE output)
-    float  prevCameraRayY;      // forward component of the previous-frame ray (depth scale)
     float2 subpixelPx;          // sub-texel offset of the history sample
     float2 subpixelAlignment;   // 1.0 at texel centers, 0 at texel corners
     float2 jitterResidualPx;    // current jitter minus history subpixel phase
@@ -1217,6 +1249,7 @@ struct HistoryLandingSurface
 
     float  effectiveDepthRaw;
     float2 effectiveVelocityJitteredPrevUV;
+    float2 gradRaw;              // stored-side minmod plane gradient (raw-z per texel)
 
     // Velocity-field shape at the landing (px).
     float maxCurvaturePx;
@@ -1372,7 +1405,6 @@ HistoryReprojection ReprojectToHistory(
                    - velocityJitteredUV.y * previousCamera.downTanFov;
 
     h.sampleUV       = ProjectRayToStableUV(prevRay, frameBaseUV + velocityJitteredUV, taaTanHalfFovX, taaTanHalfFovY);
-    h.prevCameraRayY = prevRay.y;
 
     // Net motion between the history sample and this output pixel.
     h.motionPx          = (h.sampleUV - stableUV) * vp.sizePixels;
@@ -1590,6 +1622,7 @@ HistoryLandingSurface SampleHistoryLandingSurface(
     h.snapDistPx       = 0.0;
     h.pairGradPx       = 0.0;
     h.shallowVelGradPx = 0.0;
+    h.gradRaw          = float2(0.0, 0.0);
 
     // Minimal default when no disocclusion test needs the landing: the single
     // nearest tap (debug views only). The stored value there is already the
@@ -1650,6 +1683,7 @@ HistoryLandingSurface SampleHistoryLandingSurface(
     h.effectiveVelocityJitteredPrevUV = landingLayer.effectiveVelocityUV;
     h.pairGradPx                      = landingLayer.pairGradPx;
     h.shallowVelGradPx                = landingLayer.shallowVelGradPx;
+    h.gradRaw                         = float2(landingLayer.gradX, landingLayer.gradY);
 
     // Field shape + velocity-coherent noise, anchored at the effective layer.
     // [FIX 8b]: layer-consistent differences.
@@ -1692,199 +1726,237 @@ float2 EstimateJitterTransportUV(float2 sCur, float2 sPrev, float2 sPrev2)
 }
 
 // ============================================================================
-// MOTION-COMPENSATED DEPTH DISOCCLUSION (RESTORED)
+// LAYER FORWARD-PARALLAX FIT ([REWRITE]: the depth transport's single unknown)
 // ----------------------------------------------------------------------------
-// Kappa-corrected transport: expected history depth = current depth, ray-
-// normalized into the previous frame's parameterization, times (1-kappa),
-// kappa estimated from the measured velocity divergence. One-sided (only a
-// history surface CLOSER than the transported current surface rejects).
+// For a rigid layer, the previous-frame forward depth of a point that is at
+// forward depth w on a current-frame ray d is EXACTLY
+//     w' = w * B + T_y,     B = dot(d, prevForward) / dot(d, curForward),
+// where T_y is the layer's relative forward displacement (camera dolly +
+// object motion along the view axis). LATERAL translation never enters w':
+// it shifts screen positions -- already carried by the measured velocity --
+// but not forward-axis depths. T_y is measured from the layer's own texels:
+// each texel's dejittered parallax
+//     p_i = v_i - g_i        (g: the exact relative-rotation offset field,
+//                             g(u) = G(u) - u,  G = F_prev^-1 o F_cur)
+// satisfies the pointwise linear relation
+//     K_i * p_i = T_perp - T_y * s'_i        (K = w*B, s' = prev-frame pos)
+// exactly at any motion magnitude. Regressing (K*p) against s' over the
+// layer's texels yields T_y (the slope) plus an honest sigma from the fit
+// residual. Run in PIXEL units: the per-axis angular scale cancels through
+// the per-channel intercept, so T_y comes out in world units.
+// Layer mask: velocity coherence with the resolved layer's effective field
+// (the standard layer test) plus the same depth-side rule as
+// MeasureShallowForegroundGeometry -- dilation centers are background
+// (foreground-side taps only), edge centers are the crest (not-behind taps
+// only), flat is velocity-only. Raising taaVelRejection widens the mask.
+// ============================================================================
+bool EstimateLayerForwardParallax(
+    float2 refVelocityUV,          // the resolved layer's effective (jittered) velocity
+    float2 frameBaseUV,            // the stable point's current-frame position
+    float2 stableUV,
+    float  depthRaw[9],
+    float2 velocityUV[9],
+    float2 tapUVs[9],
+    bool   isDilationZone,
+    bool   isForegroundEdge,
+    CameraBasis currentCamera,
+    CameraBasis previousCamera,
+    float  fitRadiusPx,
+    ViewportParams vp,
+    out float ty,
+    out float tySigma)
+{
+    ty = 0.0;
+    tySigma = 0.0;
+
+    // Exact relative-rotation offset field, linearized at the pixel.
+    // G(u0) is exact (F_cur(frameBase) = stableUV); the neighborhood uses the
+    // analytic Jacobian (2nd-order error ~1e-4 px, far below quantization).
+    float2 uRot0 = InverseReprojectThroughCamera(stableUV, previousCamera, taaTanHalfFovX, taaTanHalfFovY);
+    float4 jG    = Mul2x2(Inv2x2(CameraForwardJacobian(uRot0,     previousCamera, taaTanHalfFovX, taaTanHalfFovY)),
+                               CameraForwardJacobian(frameBaseUV, currentCamera, taaTanHalfFovX, taaTanHalfFovY));
+    float4 mRot  = float4(jG.x - 1.0, jG.y, jG.z, jG.w - 1.0);   // J_G - I
+    float2 g0     = uRot0 - frameBaseUV;                          // g(u0)
+
+    float3 prevForward = CameraForwardAxis(previousCamera);
+    float2 px = vp.sizePixels;
+
+    // Center tap: the subtraction origin (any fixed point works).
+    float3 dC = tapUVs[0].x * currentCamera.rightTanFov + currentCamera.forward
+              - tapUVs[0].y * currentCamera.downTanFov;
+    float  kC = (1.0 / max(depthRaw[0], kEpsilon)) * dot(dC, prevForward);
+    float2 gC = g0 + Apply2x2(mRot, tapUVs[0] - frameBaseUV);
+    float2 sC = (tapUVs[0] + velocityUV[0]) * px;
+    float2 GC = kC * ((velocityUV[0] - gC) * px);
+
+    float  n = 0.0;
+    float2 sumS = float2(0.0, 0.0), sumG = float2(0.0, 0.0);
+    float  sumS2 = 0.0, sumSG = 0.0, sumG2 = 0.0;
+
+    [unroll]
+    for (int i = 0; i < 9; ++i)
+    {
+        // Layer mask, part 1: velocity coherence with the resolved layer.
+        if (length((velocityUV[i] - refVelocityUV) * px) > fitRadiusPx)
+            continue;
+        // Layer mask, part 2: the depth-side rule (see the section header).
+        if (isDilationZone)        { if (i == 0 || depthRaw[i] <= depthRaw[0]) continue; }
+        else if (isForegroundEdge) { if (depthRaw[i] <  depthRaw[0])           continue; }
+
+        float3 d = tapUVs[i].x * currentCamera.rightTanFov + currentCamera.forward
+                 - tapUVs[i].y * currentCamera.downTanFov;
+        // B_i's cur-forward denominator is 1 +- the sub-pixel jitter only.
+        float  k = (1.0 / max(depthRaw[i], kEpsilon)) * dot(d, prevForward);
+        float2 g = g0 + Apply2x2(mRot, tapUVs[i] - frameBaseUV);
+        float2 s = (tapUVs[i] + velocityUV[i]) * px - sC;
+        float2 G = k * ((velocityUV[i] - g) * px) - GC;
+
+        sumS += s;  sumG += G;
+        sumS2 += dot(s, s);
+        sumSG += dot(s, G);
+        sumG2 += dot(G, G);
+        n += 1.0;
+    }
+
+    if (n < 3.0) return false;
+
+    float  invN  = 1.0 / n;
+    float2 meanS = sumS * invN;
+    float2 meanG = sumG * invN;
+    float  varSum = sumS2 - n * dot(meanS, meanS);
+    if (varSum < kMinParallaxInfoPx2) return false;
+
+    float  covSum = sumSG - n * dot(meanS, meanG);
+    float  yySum  = sumG2 - n * dot(meanG, meanG);
+
+    // The model: G = a - T_y * s (a: per-channel intercept = rescaled T_perp).
+    ty = -covSum / varSum;
+
+    float residSS = max(yySum - covSum * covSum / varSum, 0.0);
+    float dof     = max(2.0 * n - 3.0, 1.0);
+    tySigma       = sqrt(residSS / dof) / sqrt(varSum);
+    return true;
+}
+
+// ============================================================================
+// MOTION-COMPENSATED DEPTH DISOCCLUSION ([REWRITE]: geometric transport)
+// ----------------------------------------------------------------------------
+// w' = w*B + T_y is exact (see EstimateLayerForwardParallax). The test is
+// ONE-SIDED: only a history surface IN FRONT rejects -- which also makes it
+// asymmetric-safe (relative recession can never false-reject; only approach
+// can, exactly what T_y corrects). The tolerance is a measured error budget:
+//   (a) taaDepthRejection * w   -- the tunable relative floor (same meaning
+//       as before: a fraction of depth);
+//   (b) both sides' depth representation quanta (dw = w^2 dz);
+//   (c) the surface's slope x the tracked-point position error -- the reach
+//       contains the dejittered landing residual, the quad velocity spread,
+//       the [PORT] extrapolation displacement, the dilation anchor offset,
+//       and (foreground states only) the ACTUAL Slepian filter footprint;
+//       flat interiors need no footprint: the landing's phase-resolved
+//       bilinear makes planar surfaces position-exact;
+//   (d) deviation from the local plane (flat interiors);
+//   (e) 2*sigma of the T_y estimate.
 // Returns a continuous score; >= 1.0 rejects, and saturate((1-score)*2) is
-// the depthGate. [PORT]: extrapolationDispPx charges the active velocity
-// extrapolation's landing shift into the crest / dilation reach terms.
+// the depthGate (unchanged consumers).
 // ============================================================================
 float ComputeDepthDisocclusionScore(
-    float  resolvedDepthRaw,
-    float  historyDepthRaw,
-    float  neighborDepthRaw[9],
-    float2 neighborVelocityJitteredUV[9],
-    float2 resolvedVelocityJitteredUV,
+    float  effectiveDepthRaw,
+    float2 effectiveVelocityUV,
+    float2 frameBaseUV,
     float2 stableUV,
-    float2 historySampleUV,
-    float  prevCameraRayY,
+    float  depthRaw[9],
+    float2 velocityJitteredUV[9],
+    float2 tapUVs[9],
+    float  landingDepthRaw,
+    float2 landingGradRaw,
     float2 jitterResidualPx,
     float2 quadVelocitySpreadUV,
     float  foregroundSlope,
-    float  foregroundCrestDrop,
     float2 closestOffsetPx,
+    float  extrapolationDispPx,
     bool   isDilationZone,
     bool   isForegroundEdge,
+    float  layerGradX,
+    float  layerGradY,
     float  depthNoiseFloor,
     float  depthQuantStep,
-    float  depthPlaneGradX,
-    float  depthPlaneGradY,
-    float  surfaceLayerEps,
-    float  extrapolationDispPx,
+    CameraBasis currentCamera,
+    CameraBasis previousCamera,
+    float  fitRadiusPx,
+    float  historySupportTexels,
     ViewportParams vp)
 {
     if (taaDepthRejection <= 0.001) return 0.0;
 
-    // --- Tangent-plane coordinates of both sample positions -----------------
-    float2 curTan  = float2((stableUV.x * 2.0 - 1.0) * taaTanHalfFovX,
-                            (1.0 - stableUV.y * 2.0) * taaTanHalfFovY);
-    float2 prevTan = float2((historySampleUV.x * 2.0 - 1.0) * taaTanHalfFovX,
-                            (1.0 - historySampleUV.y * 2.0) * taaTanHalfFovY);
-    float curRadiusSq   = dot(curTan, curTan);
-    float curDenom      = 1.0 + curRadiusSq;
-    float curRayLength  = sqrt(curDenom);
-    float prevRayLength = sqrt(1.0 + dot(prevTan, prevTan));
-    float rayScale      = prevRayLength / max(curRayLength, 1e-4);
+    // --- the transport -----------------------------------------------------
+    float  wCur = 1.0 / max(effectiveDepthRaw, kEpsilon);
+    float3 dCur = frameBaseUV.x * currentCamera.rightTanFov + currentCamera.forward
+                - frameBaseUV.y * currentCamera.downTanFov;
+    float  bCur = dot(dCur, CameraForwardAxis(previousCamera))
+               / max(dot(dCur, CameraForwardAxis(currentCamera)), 1e-6);
 
-    // --- Robust one-sided depth gradients (smallest magnitude side) ---------
-    float gradLeft  = resolvedDepthRaw - neighborDepthRaw[3];
-    float gradRight = neighborDepthRaw[4] - resolvedDepthRaw;
-    float gradUp    = resolvedDepthRaw - neighborDepthRaw[1];
-    float gradDown  = neighborDepthRaw[2] - resolvedDepthRaw;
-    float robustGradX = (abs(gradLeft)  < abs(gradRight)) ? gradLeft : gradRight;
-    float robustGradY = (abs(gradUp)    < abs(gradDown))  ? gradUp   : gradDown;
+    float ty, tySigma;
+    bool  tyMeasured = EstimateLayerForwardParallax(
+        effectiveVelocityUV, frameBaseUV, stableUV,
+        depthRaw, velocityJitteredUV, tapUVs,
+        isDilationZone, isForegroundEdge,
+        currentCamera, previousCamera, fitRadiusPx, vp, ty, tySigma);
 
-    // Plane gradient in tangent units.
-    float tangentStepX = max(2.0 * taaTanHalfFovX * vp.texelSize.x, 1e-7);
-    float tangentStepY = max(2.0 * taaTanHalfFovY * vp.texelSize.y, 1e-7);
-    float2 planeGradTan = float2(depthPlaneGradX / tangentStepX, depthPlaneGradY / tangentStepY);
-
-    // --- Measured velocity divergence at the center (raw neighbor samples) --
-    float2 velocityTan = float2(resolvedVelocityJitteredUV.x * 2.0 * taaTanHalfFovX,
-                                -resolvedVelocityJitteredUV.y * 2.0 * taaTanHalfFovY);
-    float radialTerm = dot(velocityTan, curTan) / curDenom;
-
-    float divLeft  = neighborVelocityJitteredUV[0].x - neighborVelocityJitteredUV[3].x;
-    float divRight = neighborVelocityJitteredUV[4].x - neighborVelocityJitteredUV[0].x;
-    float divUp    = neighborVelocityJitteredUV[0].y - neighborVelocityJitteredUV[1].y;
-    float divDown  = neighborVelocityJitteredUV[2].y - neighborVelocityJitteredUV[0].y;
-    float divergenceX = ((abs(divLeft) < abs(divRight)) ? divLeft : divRight) * vp.sizePixels.x;
-    float divergenceY = ((abs(divUp)   < abs(divDown))  ? divUp   : divDown)  * vp.sizePixels.y;
-    float divergenceMeasured = divergenceX + divergenceY;
-
-    // --- Velocity spread across the quad -> noise estimates -----------------
-    float2 velocitySpreadPx = quadVelocitySpreadUV * vp.sizePixels;
-    float velocitySpreadTan = 0.5 * (quadVelocitySpreadUV.x * 2.0 * taaTanHalfFovX +
-                                     quadVelocitySpreadUV.y * 2.0 * taaTanHalfFovY);
-    float divergenceNoise   = quadVelocitySpreadUV.x * vp.sizePixels.x +
-                              quadVelocitySpreadUV.y * vp.sizePixels.y;
-
-    // --- Inter-layer velocity shear ------------------------------------------
-    float2 layerShear      = float2(0.0, 0.0);
-    float  layerSeparation = 0.0;
-    bool   haveLayerShear  = false;
-
-    [unroll]
-    for (int i = 1; i < 9; ++i)
+    if (!tyMeasured)
     {
-        float2 offsetPx = kOffsets3x3[i];
-        float predictedDepth = resolvedDepthRaw + depthPlaneGradX * offsetPx.x + depthPlaneGradY * offsetPx.y;
-        float planeResidual  = neighborDepthRaw[i] - predictedDepth;
-        float depthGap       = neighborDepthRaw[i] - resolvedDepthRaw;
-        if (abs(planeResidual) > surfaceLayerEps &&
-            abs(depthGap) > 0.5 * surfaceLayerEps + 1e-7 &&
-            abs(depthGap) > layerSeparation)
-        {
-            float2 neighborVelocityTan = float2(neighborVelocityJitteredUV[i].x * 2.0 * taaTanHalfFovX,
-                                                -neighborVelocityJitteredUV[i].y * 2.0 * taaTanHalfFovY);
-            layerShear      = (neighborVelocityTan - velocityTan) / depthGap;
-            layerSeparation = abs(depthGap);
-            haveLayerShear  = true;
-        }
+        // Unmeasurable (isolated fragment): the CPU prior if provided, else
+        // assume the motion is below the fit's own detection floor.
+        ty      = taaDepthParallaxStep;
+        tySigma = kTyUnmeasuredFrac * wCur;
     }
+    ty = clamp(ty, -wCur, wCur);      // degenerate-guard, not a tuning knob
+    float wExp = max(wCur * bCur + ty, 1e-4);
 
-    // Reject the shear estimate when its own noise is too large to be trusted.
-    if (haveLayerShear)
+    // --- the one-sided occlusion gap ----------------------------------------
+    float wHist = 1.0 / max(landingDepthRaw, kEpsilon);
+    float gap = wExp - wHist;         // > 0: the history surface is IN FRONT
+    if (gap <= 0.0) return 0.0;
+
+    // --- tolerance: the measured error budget --------------------------------
+    bool isFlat = !isDilationZone && !isForegroundEdge;
+
+    // (a)+(b) representation noise: both sides' depth quanta.
+    float noiseZ = max(depthQuantStep, depthNoiseFloor);
+    float quantW = 2.0 * noiseZ * wExp * wExp;
+
+    // (c) tracked-point position uncertainty x the surface's slope. The slope
+    //     is the resolved layer's: crest geometry for foreground states
+    //     (foregroundSlope already carries crestDrop/span and the layer-gap
+    //     slope -- the old edge branch's separate crestDrop term is covered
+    //     once, via slope * reach with reach >= footprint >= 1.5 >= span),
+    //     the minmod plane for flats; the landing's stored minmod measures
+    //     the same surface one frame later -- take the max.
+    float slopeZ = isFlat ? max(abs(layerGradX), abs(layerGradY)) : foregroundSlope;
+    slopeZ = max(slopeZ, max(abs(landingGradRaw.x), abs(landingGradRaw.y)));
+    float slopeW = slopeZ * wExp * wExp;   // raw-z per px -> forward units per px
+
+    float2 velSpreadPx = quadVelocitySpreadUV * vp.sizePixels;
+    float reachPx = length(jitterResidualPx)
+                  + 0.5 * length(velSpreadPx)
+                  + extrapolationDispPx
+                  + (isDilationZone ? length(closestOffsetPx) : 0.0)
+                  + (isFlat ? 0.0 : historySupportTexels - 0.5);
+
+    // (d) deviation from the local plane (curved interiors).
+    float curvZ = 0.0;
+    if (isFlat)
     {
-        float shearNoise       = 2.0 * velocitySpreadTan / max(layerSeparation, 1e-7);
-        float shearNoiseScaled = resolvedDepthRaw * length(curTan) * shearNoise / curDenom;
-        if (shearNoiseScaled > 0.25 * taaDepthRejection) haveLayerShear = false;
+        float curvH = abs(depthRaw[0] - 0.5 * (depthRaw[3] + depthRaw[4]));
+        float curvV = abs(depthRaw[0] - 0.5 * (depthRaw[1] + depthRaw[2]));
+        curvZ = max(curvH, curvV);
     }
+    float curvW = curvZ * wExp * wExp;
 
-    // --- Divergence-to-depth-scale correction (kappa) ------------------------
-    float denomNaive = max(2.0 - curRadiusSq, 0.25);
-    float kappaNaive = -(divergenceMeasured - 3.0 * radialTerm) / denomNaive;
-    float kappa;
-    float kappaSigma;
+    // (e) the parallax estimate's own error (2 sigma, ~97% one-sided).
+    float sigmaW = 2.0 * abs(tySigma);
 
-    if (haveLayerShear)
-    {
-        float shearTerm = resolvedDepthRaw * dot(curTan, layerShear) / curDenom;
-        kappa = shearTerm
-              + 0.5 * (-(divergenceMeasured - 3.0 * radialTerm)
-                       - dot(layerShear, 3.0 * resolvedDepthRaw * curTan / curDenom - planeGradTan));
-        float shearNoise = 2.0 * velocitySpreadTan / max(layerSeparation, 1e-7);
-        kappaSigma = divergenceNoise / denomNaive
-                   + resolvedDepthRaw * length(curTan) * shearNoise / curDenom
-                   + velocitySpreadTan * length(curTan) / max(prevRayLength, 1e-3);
-    }
-    else
-    {
-        float denomPlane = max(2.0 - curRadiusSq + curDenom * dot(planeGradTan, curTan) / max(resolvedDepthRaw, 1e-6),
-                               0.5 * denomNaive);
-        float kappaPlane = -(divergenceMeasured - 3.0 * radialTerm) / denomPlane;
-        kappa = kappaPlane * (5.0 - curRadiusSq) / 6.0;
-        kappaSigma = divergenceNoise / denomNaive
-                   + abs(kappaNaive) * (1.0 + curRadiusSq) / 6.0
-                   + abs(kappaPlane - kappaNaive)
-                   + velocitySpreadTan * length(curTan) / max(prevRayLength, 1e-3);
-    }
-
-    kappa = clamp(kappa, -0.25, 0.25);
-
-    // --- Expected history depth from the transported current surface --------
-    float safePrevRayY = (prevCameraRayY > 1e-4) ? prevCameraRayY : 1.0;
-    float expectedDepthRaw = (resolvedDepthRaw / safePrevRayY) * rayScale * (1.0 - kappa);
-    expectedDepthRaw = max(expectedDepthRaw, 1e-6);
-
-    float invExpected = 1.0 / expectedDepthRaw;
-    // Only a history surface CLOSER than the transported current surface counts
-    // as a disocclusion (history occluding what we now see).
-    float relativeDepthExcess = max(historyDepthRaw - expectedDepthRaw, 0.0) * invExpected;
-
-    float baseThreshold = taaDepthRejection + kappaSigma;
-
-    // --- State-dependent tolerances ------------------------------------------
-    float allowances = 0.0;
-    if (!isDilationZone && !isForegroundEdge)
-    {
-        // Flat interior: residual jitter mismatch + local depth curvature.
-        float jitterAllowance = abs(robustGradX * jitterResidualPx.x + robustGradY * jitterResidualPx.y);
-        float curvatureH = abs(resolvedDepthRaw - 0.5 * (neighborDepthRaw[3] + neighborDepthRaw[4]));
-        float curvatureV = abs(resolvedDepthRaw - 0.5 * (neighborDepthRaw[1] + neighborDepthRaw[2]));
-        float curvatureAllowance = max(curvatureH, curvatureV);
-        allowances = (jitterAllowance + curvatureAllowance) * invExpected;
-    }
-    else if (isForegroundEdge)
-    {
-        // The center is the crest: the history footprint may legitimately reach
-        // down the front face within the filter support. The extrapolation's
-        // landing shift is charged into the reach.
-        float reachPx = kHistoryTapReachPx
-                      + (abs(jitterResidualPx.x) + abs(jitterResidualPx.y))
-                      + 0.5 * length(velocitySpreadPx)
-                      + extrapolationDispPx;
-        allowances = (foregroundCrestDrop + foregroundSlope * reachPx) * invExpected;
-    }
-    else // dilation zone: background behind a crest
-    {
-        float reachPx = length(closestOffsetPx)
-                      + kHistoryTapReachPx
-                      + length(jitterResidualPx)
-                      + 0.5 * length(velocitySpreadPx)
-                      + extrapolationDispPx;
-        allowances = (foregroundSlope * reachPx) * invExpected;
-    }
-
-    float threshold = baseThreshold + allowances;
-
-    if (depthQuantStep > 0.0)
-        threshold += 2.0 * depthQuantStep * (invExpected + 1.0 / max(historyDepthRaw, 1e-6));
-
-    return relativeDepthExcess / max(threshold, 1e-6);
+    float tolW = taaDepthRejection * wExp + quantW + slopeW * reachPx + curvW + sigmaW;
+    return gap / max(tolW, 1e-9);
 }
 
 // ============================================================================
@@ -2708,7 +2780,6 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
 
     // Post-revocation single-layer state (a revoked candidate acts flat).
     bool currentSingleLayer = !(currentLayer.isDilationZone || currentLayer.isForegroundEdge);
-    float surfaceLayerEps = taaDepthRejection * max(currentLayer.effectiveDepth, 1e-6) + 3.0 * edge.depthNoiseFloor;
 
     if (taaDebugMode > 7.5 && taaDebugMode < 8.5)
     {
@@ -2738,22 +2809,23 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
     }
 
     // ------------------------------------------------------------------
-    // 10) Disocclusion tests: RESTORED kappa-corrected depth score (the
-    //     layering oracle / depthGate) + the RESTORED velocity rejection.
-    //     Binary union of both rejections.
+    // 10) Disocclusion tests: the [REWRITE] geometric depth score (the
+    //     layering oracle / depthGate) + the velocity rejection. Binary
+    //     union of both rejections.
     // ------------------------------------------------------------------
     float depthDisocclusionScore = ComputeDepthDisocclusionScore(
-        currentLayer.effectiveDepth, landing.effectiveDepthRaw,
-        neighborhood.depthRaw, neighborhood.velocityJitteredUV,
-        currentLayer.effectiveVelocityUV,
-        IN.uv0, repro.sampleUV, repro.prevCameraRayY,
+        currentLayer.effectiveDepth, currentLayer.effectiveVelocityUV,
+        stableInFrameUV, IN.uv0,
+        neighborhood.depthRaw, neighborhood.velocityJitteredUV, tapUVs,
+        landing.effectiveDepthRaw, landing.gradRaw,
         repro.jitterResidualPx, quadVelocitySpreadUV,
-        foreground.slope, foreground.crestDrop, neighborhood.closestOffsetPx,
-        currentLayer.isDilationZone, currentLayer.isForegroundEdge,
-        edge.depthNoiseFloor, edge.depthQuantStep,
-        edge.planeGradX, edge.planeGradY,
-        surfaceLayerEps,
+        foreground.slope, neighborhood.closestOffsetPx,
         currentLayer.extrapolationDispPx,
+        currentLayer.isDilationZone, currentLayer.isForegroundEdge,
+        currentLayer.gradX, currentLayer.gradY,
+        edge.depthNoiseFloor, edge.depthQuantStep,
+        currentCamera, previousCamera,
+        coherenceRadiusPx, historySupportTexels,
         vp);
     bool depthRejected = (depthDisocclusionScore >= 1.0);
 
