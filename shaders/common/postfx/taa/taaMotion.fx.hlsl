@@ -1,39 +1,34 @@
 // ============================================================================
 // TAA motion-field writer (#TAA_HistMotion)
 // ----------------------------------------------------------------------------
-// Writes, per stable texel, the layer-resolved (dilated / bilinear) effective
-// velocity (xy), effective depth (z) and layer flag (w) of the CURRENT frame:
-//     flag 0.0 = background / continuous surface
-//     flag 1.0 = foreground edge (silhouette crest texel)
-//     flag 2.0 = dilation zone (owned by the foreground crest)
-// These are exactly the values the resolve pass used to reproject this texel,
-// so next frame's resolve reads the authoritative layer data at the history
-// landing instead of re-deriving it from raw history depth/velocity.
+// Writes, per STABLE texel, the CURRENT frame's RAW layer-classification
+// inputs, re-indexed into stable texel space (via the inverse-map snap):
+//     xy = raw jittered velocity of the content at that stable texel
+//     z  = raw rendered depth of that content
+//     w  = layer flag (0 background/flat, 1 foreground edge,
+//          2 dilation zone) from the SHARED old classifier
+// EXCEPT where the resolve's post-validation state must persist:
+//     * a KEPT dilation candidate stores the CREST's raw sample (velocity AND
+//       depth of the closest tap, flag 2): the anchor the next frame's
+//       own-history gate validates through, and the baked foreground the
+//       history landing resolves to inside the object's dilation band.
+//     * a REVOKED candidate is reverted to its OWN raw background sample
+//       (flag 0) -- exactly the values the resolve re-projected with after
+//       revoking (RevokeDilation's background state), so the revocation
+//       PERSISTS: the next frame's gate re-reads background at that texel and
+//       stays revoked instead of re-entering the dilation cycle every frame.
 //
-// FIX -- POST-VALIDATION STATE: the field now stores the state AFTER the
-// resolve's own-history dilation gate. A dilation candidate the resolve
-// REVOKED is detected through the SIGN of #TAA_Result.a at this texel
-// (negative = revoked -- every resolve return path transports the bit,
-// including debug views) and is stored as BACKGROUND here, so the revocation
-// PERSISTS: the next frame's gate re-reads background at that texel and
-// stays revoked, instead of re-entering the dilation cycle from raw depth
-// every frame. The bit is ignored for non-candidates, so the conservative
-// "revoked" encodings of early/debug resolve returns are always safe.
+// The field is therefore raw everywhere except dilation bands (crest
+// re-attribution) and revoked texels (background reversion) -- clean input for
+// the resolve's landing-side re-classification with the old depth-curvature
+// rules, with the layer/revocation semantics baked in.
 //
-// FIX -- PHASE-DEPENDENT EDGE VALUES: foreground-edge effective values follow
-// the sub-texel phase rule in taaShared.h.hlsl (bilinear toward the flat
-// part, the pixel's own center samples toward the silhouette). This pass
-// snaps the SAME inverse-map position as the resolve and calls the SAME
-// classification with the SAME fracPx, so it stores exactly what the resolve
-// reprojected with -- the stored field cannot disagree.
-//
-// Runs as a child AFTER the resolve (it must not overwrite the field before
+// Runs as a child AFTER the resolve: it must not overwrite the field before
 // the resolve has read the previous frame's, and it needs the resolve's
-// output for the revocation bit). Shares its classification code with
-// taa.fx.hlsl via taaShared.h.hlsl -- identical inputs, identical logic:
-// both passes snap the SAME forward-map position, so the classifications are
-// guaranteed identical (the resolve only uses the INVERSE map as its
-// reprojection base -- never for sampling).
+// output for the revocation bit (#TAA_Result.a < 0 = this texel's tentative
+// dilation was revoked; the writer ignores the bit for non-candidates, so the
+// conservative "revoked" encodings of the resolve's early/debug returns are
+// always safe).
 // ============================================================================
 
 #include "shaders/common/postFx/postFx.h.hlsl"
@@ -42,14 +37,12 @@
 
 uniform_sampler2D(depthTex,    0);
 uniform_sampler2D(velocityTex, 1);
-uniform_sampler2D(resultTex,   2); // FIX: #TAA_Result -- the resolve's output
-                                   // from THIS frame; sign of .a carries the
-                                   // revocation bit (negative = this texel's
-                                   // tentative dilation was revoked).
+uniform_sampler2D(resultTex,   2); // #TAA_Result -- the resolve's output from
+                                   // THIS frame; sign of .a = revocation bit.
 
 cbuffer perDraw
 {
-    float taaUseDepthDilation;  float taaDepthRejection;
+    float taaUseDepthDilation;  float taaDepthRejection;  // slot kept; unused
     float taaCurPX;             float taaCurPY;
     float taaCurPZ;             float taaCurQX;
     float taaCurQY;             float taaCurQZ;
@@ -69,13 +62,6 @@ cbuffer perDraw
   #define mainP main
 #endif
 
-float EncodeLayerFlag(LayerSurface layer)
-{
-    if (layer.isDilationZone)   return 2.0;
-    if (layer.isForegroundEdge) return 1.0;
-    return 0.0;
-}
-
 float4 mainP(PFXVertToPix IN) : SV_TARGET0
 {
     ViewportParams vp = GetViewportParams(oneOverTargetSize);
@@ -86,11 +72,11 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
     currentCamera.downTanFov  = float3(taaCurRX, taaCurRY, taaCurRZ);
 
     // Inverse map (stable-UV -> frame-UV), snapped -- the SAME value the
-    // resolve snaps, so this pass classifies the identical texel with the
-    // identical fracPx. (Snapping the forward map breaks wherever the
+    // resolve snaps, so this pass classifies the identical texel and picks the
+    // identical crest tap. (Snapping the forward map breaks wherever the
     // rotational jitter exceeds half a texel -- the screen perimeter.)
     float2 stableInFrameUV = InverseReprojectThroughCamera(IN.uv0, currentCamera, taaTanHalfFovX, taaTanHalfFovY);
-    SnappedCoord pixel       = SnapUVToTexel(stableInFrameUV, vp);
+    SnappedCoord pixel     = SnapUVToTexel(stableInFrameUV, vp);
 
     float2 tapUVs[9];
     Build3x3TapUVs(pixel.snappedUV, vp.texelSize, vp.minUV, vp.maxUV, tapUVs);
@@ -107,22 +93,39 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
         velocities[i] = tex2Dlod(velocityTex, float4(tapUVs[i], 0.0, 0.0)).rg;
     }
 
-    LayerSurface layer = ClassifyLayerSurface(
-        depths, velocities,
-        pixel.fracPx, vp.sizePixels,
-        (taaUseDepthDilation > 0.5), taaDepthRejection,
-        false); // spread is measured at the landing, never stored
+    // THE classifier (old depth-curvature rules) -- identical to the resolve's.
+    SurfaceEdgeState edge = AnalyzeSurfaceEdgesCore(depths, (taaUseDepthDilation > 0.5));
 
-    // FIX: consume the revocation bit and store the POST-VALIDATION state.
-    // A revoked candidate is stored as background (flag 0, subpixel bg
-    // depth, bilerp bg velocity -- the exact values the resolve re-projected
-    // with after revoking, via the shared RevokeDilation helper).
-    bool revoked = (layer.isDilationZone &&
-                    (tex2Dlod(resultTex, float4(IN.uv0, 0.0, 0.0)).a < 0.0));
+    // Closest (foreground) tap -- identical scan to the resolve's.
+    float closestDepth = depths[0];
+    int   closestIdx   = 0;
+    [unroll]
+    for (int j = 1; j < 9; ++j)
+    {
+        if (depths[j] > closestDepth) { closestDepth = depths[j]; closestIdx = j; }
+    }
+
+    // Consume the revocation bit and store the POST-VALIDATION state.
+    bool revoked = edge.isDilationZone &&
+                   (tex2Dlod(resultTex, float4(IN.uv0, 0.0, 0.0)).a < 0.0);
+
     if (revoked)
-        RevokeDilation(layer, depths[0], velocities, pixel.fracPx);
+    {
+        // RevokeDilation's background state: the texel's OWN raw sample
+        // (the center always was the background layer; the dilation only
+        // borrowed the crest's values). The resolve re-projected with exactly
+        // these values after revoking.
+        return float4(velocities[0], depths[0], 0.0);
+    }
+    if (edge.isDilationZone)
+    {
+        // Kept candidate: the crest's raw sample -- the anchor.
+        return float4(velocities[closestIdx], depths[closestIdx], 2.0);
+    }
 
-    return float4(layer.effectiveVelocityUV, layer.effectiveDepth, EncodeLayerFlag(layer));
+    // Flat / foreground edge: the raw center sample (the landing re-classifies
+    // and re-resolves with its own phase; no pre-resolution needed here).
+    return float4(velocities[0], depths[0], edge.isForegroundEdge ? 1.0 : 0.0);
 }
 
 PFXVertToPix mainV(PFXVert IN) { return processPostFxVert(IN); }
