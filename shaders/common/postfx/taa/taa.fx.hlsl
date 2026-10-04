@@ -1,5 +1,5 @@
 // ============================================================================
-// TAA (Temporal Anti-Aliasing) post effect
+// TAA (Temporal Anti-Aliasing) post effect -- resolve pass
 // ----------------------------------------------------------------------------
 // CONTEXT: this mod produces sub-pixel jitter by PHYSICALLY ROTATING the
 // in-game camera every frame (there is no projection-matrix jitter). The
@@ -13,24 +13,105 @@
 // ProjectRayToStableUV(BuildCameraRay(uv, cam)) = uv exactly for a STABLE
 // basis. normalize(Q) points at the corner, NOT forward.
 //
+// FIX -- MAP DIRECTIONS (read before touching the reprojection):
+//   ReprojectThroughCamera(uv, cam)     frame-UV -> stable-UV (the stable
+//                                       position of the frame pixel's content).
+//   InverseReprojectThroughCamera(u, c) stable-UV -> frame-UV (where the
+//                                       stable point sits in that frame).
+//   They differ by 2x the frame's jitter and are NOT interchangeable. The
+//   snap hides the difference for SAMPLING (both select the same texel while
+//   |jitter| < 0.5 px, and fracPx remains the content's sub-texel offset
+//   either way), but the REPROJECTION BASE must be the INVERSE: passing the
+//   forward map leaks +2*jitter into every landing (static scenes landed at
+//   IN.uv0 + 2*jitter instead of the identity), displacing every stored-field
+//   read by up to a full texel -- which is what made the depth envelope fire
+//   on stationary jitter while the own-history gate validated through the
+//   neighbor's entry (and re-rejected the very revocations it issued).
+//
+// STORED MOTION FIELD (#TAA_HistMotion, written by taaMotion.fx.hlsl):
+//   Per stable texel: layer-resolved effective velocity (xy), effective
+//   depth (z), layer flag (w: 0 background/continuous, 1 foreground edge,
+//   2 dilation zone) -- exactly the values that produced that texel's
+//   history sample. The field stores the POST-VALIDATION state: a dilation
+//   revoked by the landing gate is stored as background (the writer samples
+//   the sign of #TAA_Result.a -- negative = revoked), so the revocation
+//   PERSISTS -- a phase-artifact dilation is rejected once ("no history")
+//   and stays rejected, instead of re-entering the dilation cycle from raw
+//   depth every frame. Dilation zones are already baked into the stored
+//   depths, so a landing inside an object's previous dilation band resolves
+//   directly to the foreground depth. The revocation bit travels to the
+//   writer through the sign of #TAA_Result.a (negative = revoked; the
+//   magnitude is the acutance metric, recovered with abs()). EVERY return
+//   path -- including all debug views -- transports the bit.
+//   FIX: foreground-edge effective values are sub-texel PHASE dependent
+//   (see LAYER SEMANTICS) -- both passes make the identical choice through
+//   the shared classification and the identical snap, so the stored field
+//   always matches what the resolve reprojected with.
+//
 // LAYER SEMANTICS (the disocclusion contract):
 //   * A dilation zone acts as part of the object it dilates to. A pixel that
 //     WAS foreground and lands in that object's previous dilation zone is
 //     NOT disoccluded (the landing resolves to the foreground on both sides).
-//   * 2x2 Enclosing Quad Gating: Dilation is strictly disabled if the 2x2
-//     bilinear reconstruction quad in history contains zero foreground.
+//   * Own-History Dilation Validation: a dilation candidate validates
+//     through the history it would have if it stayed dilated -- its OWN
+//     stored texel (the identity landing puts the candidate's reprojection
+//     on its own texel; previously the +2*jitter displacement made it read
+//     the neighbor's entry instead). A LAYER-MATCHED support tap validates
+//     iff it is foreground-OWNED (flag >= 1), or its stored depth is at the
+//     object itself (crest-anchored threshold). The support degenerates from
+//     the 2x2 quad to a 1x2/2x1 pair to the center texel alone near the
+//     texel center (kCenterLandingFracPx) -- static landings sit on the
+//     center (the de-jittered reprojection of a static point is the
+//     identity, now actually enforced by the inverse reprojection base).
 //   * Dual-sided subpixel slant tolerance accounts for camera jitter phase
 //     on continuous surfaces across both current and history frames.
+//   * FIX -- Effective-value phase rule (foreground edges): an edge texel
+//     whose jitter phase points TOWARD its own silhouette uses its ACTUAL
+//     sample (own center depth + own center velocity -- the dilation's
+//     point-sample rule, anchored to the own texel instead of the crest).
+//     With the phase toward the flat part it takes the full sub-pixel
+//     bilinear treatment (quad-interpolated velocity + minmod sub-pixel
+//     depth) exactly like a continuous surface -- the sign-selected quad
+//     then lies entirely on the object. The effective values never blend
+//     across the silhouette in either phase. Extrapolating the minmod slope
+//     ACROSS the limb was what falsely fired the depth envelope on the
+//     sides of round poles: at a silhouette the minmod gradient is the
+//     FLAT-side step, a 2-5x underestimate of a curved flank's outer slope
+//     (a round pole's raw-depth slope blows up toward the limb), and the
+//     phase-dependent error desynced current vs stored every frame.
+//   * Dilated effective values stay the crest's RAW sample (closest texel's
+//     depth AND velocity, never phase-interpolated): the landing is then
+//     base(own stable position) + crest velocity = the T-1 RING's position,
+//     whose stored entry is the T-1 CREST's raw sample -- an EXACT anchor
+//     match (crest-center material vs crest-center material, tracked
+//     rigidly with the object). See ClassifyLayerSurface.
+//   * FIX -- Velocity disocclusion gates on the CURRENT side only
+//     (continuous-background pixels); the HISTORY side is deliberately NOT
+//     flag-gated. The layer-gated landing reconstruction handles mixed
+//     quads: a background-centered landing excludes foreground-owned taps
+//     (the comparison stays background-vs-background), while a foreground-
+//     OWNED centered landing reconstructs the OCCLUDER's stored velocity --
+//     exactly the thin-occluder reveal signal. The old historyIsForeground
+//     gate disabled the test on every thin/curved/edge-flagged occluder
+//     (wires, poles, characters), i.e. on precisely its canonical cases.
+//
+// OUTPUT: RGB = resolved color. A = the raw scene's local acutance energy
+// (cross high-pass of RCAS-luma in SRTM space) consumed by taaFinal.fx.hlsl's
+// auto-parity sharpener, SIGN-ENCODED with the revocation bit for the motion
+// writer (debug views carry the bit on their depth magnitude instead).
+// Debug mode 9 visualizes the gate: R = revoked candidate, G = kept
+// candidate (full = flag branch, half = depth branch), B = depth-rejected.
 // ============================================================================
 
 #include "shaders/common/postFx/postFx.h.hlsl"
 #include "shaders/common/hlsl.h"
+#include "shaders/common/postFx/taa/taaShared.h.hlsl"
 
-uniform_sampler2D(sceneTex,        0);
-uniform_sampler2D(depthTex,        1);
-uniform_sampler2D(historyTex,      2);
-uniform_sampler2D(velocityTex,     3);
-uniform_sampler2D(prevVelocityTex, 4);
+uniform_sampler2D(sceneTex,         0);
+uniform_sampler2D(depthTex,         1);
+uniform_sampler2D(historyTex,       2);
+uniform_sampler2D(velocityTex,      3);
+uniform_sampler2D(historyMotionTex, 4); // previous frame's stored motion field
 
 // ============================================================================
 // CBUFFER (engine-set constants -- fixed layout)
@@ -47,7 +128,7 @@ cbuffer perDraw
     float  taaLumaVariance;                 float  taaUseCovarianceClipping;
     float  taaColorSpaceOklab;              float  taaJitterAwareVariance;
     float  taaVelocityAlignedVariance;      float  taaAlignmentFeedbackDrop;
-    float  taaMotionBlendDropSpeed;         float  taaUseLanczos3;
+    float  taaMotionBlendDropSpeed;         float  taaUseSlepian3;
     float  taaFireflyClamp;                 float  taaShadowTemporalMult;
     float  taaShadowSpatialMult;            float  taaDirectionalVariance;
     float  taaClipDistanceRejectionEnabled; float  taaClipDistanceRejectionAmount;
@@ -85,7 +166,6 @@ cbuffer perDraw
 // ============================================================================
 // CONSTANTS
 // ============================================================================
-static const float kEpsilon                 = 1e-6;
 static const float kLargeValue              = 32000.0;
 static const float kSqrt2                   = 1.41421356;
 static const float kLog2E                   = 1.44269504;
@@ -95,6 +175,24 @@ static const float kShadowThresholdMin      = 0.001;
 static const float kFlickerPadThreshold     = 0.001;
 static const float kMinMotionBlendDropSpeed = 0.1;
 static const float kMotionFullStrengthPx    = 8.0;
+
+// Landing within this fraction of the texel center (per axis; fracPx units,
+// texel half-width = 0.5) counts as ON the center: the neighbors' bilinear
+// weights are negligible, and the sign(frac) quad selection there is decided
+// by reprojection residual noise (~0.005 px) rather than real subpixel
+// position -- the full 2x2 gate is unstable exactly there. ~20x the residual.
+// Any real drift >= 0.1 px/frame displaces the landing past this and
+// legitimately extends the support (layer-matched).
+static const float kCenterLandingFracPx     = 0.1;
+
+// Sign-bit transport of the revocation flag: #TAA_Result.a is negative iff
+// this pixel's tentative dilation was revoked (or could not be validated:
+// offscreen history, or a debug view that returns before validation). The
+// epsilon separates "revoked, zero magnitude" from +0.0; the magnitude is
+// either the acutance metric (normal path) or the debug view's depth
+// magnitude (debug paths). The writer ignores the bit for non-candidates,
+// so conservative "revoked" encodings are always safe.
+static const float kRevokedAlphaEpsilon     = 1e-30;
 
 static const float kMinSigma                = 0.001;
 static const float kMinSpatialContrast      = 0.001;
@@ -117,14 +215,6 @@ static const float kLumaDriftChromaFadeWidth = 2.0;
 static const float kDebugVelocityScale      = 0.1;
 static const float kDebugLinearDepthRange   = 100.0;
 
-static const float2 kOffsets3x3[9] =
-{
-    float2( 0,  0), float2( 0, -1), float2( 0,  1),
-    float2(-1,  0), float2( 1,  0), float2(-1, -1),
-    float2( 1, -1), float2(-1,  1), float2( 1,  1)
-};
-
-static const float kInvOffsetLenSq[9] = { 0.0, 1.0, 1.0, 1.0, 1.0, 0.5, 0.5, 0.5, 0.5 };
 static const float kStdWeights[9]     = { 1.0, 0.36787944, 0.36787944, 0.36787944, 0.36787944, 0.13533528, 0.13533528, 0.13533528, 0.13533528 };
 static const float kInvLength[9]      = { 0.0, 1.0, 1.0, 1.0, 1.0, 0.70710678, 0.70710678, 0.70710678, 0.70710678 };
 
@@ -143,18 +233,6 @@ static const float3 kDopAxes[16] =
 // ============================================================================
 // SMALL REUSABLE MATH HELPERS
 // ============================================================================
-float LumaRGB(float3 rgb) { return dot(rgb, float3(0.2126, 0.7152, 0.0722)); }
-
-float2 Bilerp2x2(float2 c00, float2 c10, float2 c01, float2 c11, float2 fraction)
-{
-    return lerp(lerp(c00, c10, fraction.x), lerp(c01, c11, fraction.x), fraction.y);
-}
-
-float Minmod(float a, float b)
-{
-    return (a * b > 0.0) ? ((abs(a) < abs(b)) ? a : b) : 0.0;
-}
-
 float SoftClipUnitScale(float overshootUnits, float softClipAmount, float motionFactor)
 {
     float softLimit = 1.0 + softClipAmount * (1.0 - exp2(-(overshootUnits - 1.0) * kLog2E));
@@ -192,6 +270,22 @@ float3x3 InverseSymmetric3x3(float3x3 m, out bool invertible)
     inv[2][1] = inv[1][2];
     inv[2][2] = (m[0][0] * m[1][1] - m[0][1] * m[0][1]) * invDet;
     return inv;
+}
+
+// ============================================================================
+// REVOCATION TRANSPORT
+// ----------------------------------------------------------------------------
+// EVERY return path must transport the revocation bit through the alpha sign
+// -- including debug returns. The writer reads the sign every frame; a debug
+// return with plain positive alpha makes it store the RAW classification,
+// poisoning the motion field with unvalidated flag-2 entries that the next
+// frame's own-history gate then trusts. The writer ignores the bit for
+// non-candidates, so a conservative "revoked" is safe on returns that fire
+// before validation has run.
+// ============================================================================
+float TransportAlpha(bool revoked, float magnitude)
+{
+    return revoked ? -(magnitude + kRevokedAlphaEpsilon) : magnitude;
 }
 
 // ============================================================================
@@ -260,15 +354,21 @@ float3 CompressGamut(float3 historyColorSpace)
 float LinearizeDepth(float rawDepth) { return 1.0 / max(rawDepth, kEpsilon); }
 
 // ============================================================================
+// RAW-SCENE ACUTANCE METRIC (auto-parity sharpener input)
+// ----------------------------------------------------------------------------
+// FSR SRTM + RCAS luma (x2) -- the exact space taaFinal.fx.hlsl measures the
+// resolved image in, so the energy ratio between the two is meaningful.
+// ============================================================================
+float SrtmLumaFSR(float3 rgb)
+{
+    float3 c = max(rgb, 0.0);
+    c *= 1.0 / (max(c.r, max(c.g, c.b)) + 1.0);
+    return c.b * 0.5 + (c.r * 0.5 + c.g);
+}
+
+// ============================================================================
 // CAMERA BASIS & REPROJECTION
 // ============================================================================
-struct CameraBasis
-{
-    float3 rightTanFov;   // P: full-width right axis
-    float3 forward;       // Q: top-left corner ray
-    float3 downTanFov;    // R: full-height up axis
-};
-
 CameraBasis GetCurrentFrameCameraBasis()
 {
     CameraBasis c;
@@ -287,197 +387,20 @@ CameraBasis GetPreviousFrameCameraBasis()
     return c;
 }
 
-float2 ProjectRayToStableUV(float3 ray, float2 fallbackUV)
-{
-    if (ray.y <= kEpsilon) return fallbackUV;
-    return float2((ray.x / (ray.y * max(taaTanHalfFovX, kEpsilon))) * 0.5 + 0.5,
-                  0.5 - (ray.z / (ray.y * max(taaTanHalfFovY, kEpsilon))) * 0.5);
-}
-
-float3 BuildCameraRay(float2 uv, CameraBasis camera)
-{
-    return uv.x * camera.rightTanFov + camera.forward - uv.y * camera.downTanFov;
-}
-
-float2 ReprojectThroughCamera(float2 uv, CameraBasis camera, float2 fallbackUV)
-{
-    return ProjectRayToStableUV(BuildCameraRay(uv, camera), fallbackUV);
-}
-
-float RayLengthFromUV(float2 uv, float tanHalfFovX, float tanHalfFovY)
-{
-    float2 tanXY = float2((uv.x * 2.0 - 1.0) * tanHalfFovX, (1.0 - uv.y * 2.0) * tanHalfFovY);
-    return sqrt(1.0 + dot(tanXY, tanXY));
-}
-
-// ============================================================================
-// VIEWPORT & PIXEL GEOMETRY
-// ============================================================================
-struct ViewportParams
-{
-    float2 texelSize;
-    float2 sizePixels;
-    float2 minUV;
-    float2 maxUV;
-};
-
-ViewportParams GetViewportParams()
-{
-    ViewportParams vp;
-    vp.texelSize  = oneOverTargetSize;
-    vp.sizePixels = 1.0 / max(oneOverTargetSize, 1e-6);
-    vp.minUV      = 0.5 * vp.texelSize;
-    vp.maxUV      = 1.0 - vp.minUV;
-    return vp;
-}
-
-struct SnappedCoord
-{
-    float2 snappedUV;
-    float2 fracPx;
-    float  fracDist;
-};
-
-SnappedCoord SnapUVToTexel(float2 uv, ViewportParams vp)
-{
-    SnappedCoord sc;
-    float2 pixelPos  = uv * vp.sizePixels;
-    float2 baseTexel = floor(pixelPos) + 0.5;
-    sc.snappedUV     = clamp(baseTexel * vp.texelSize, vp.minUV, vp.maxUV);
-    sc.fracPx        = pixelPos - baseTexel;
-    sc.fracDist      = length(sc.fracPx);
-    return sc;
-}
-
-void Build3x3TapUVs(float2 centerUV, float2 texelSize, float2 minUV, float2 maxUV, out float2 tapUVs[9])
-{
-    float2 uvMinus = clamp(centerUV - texelSize, minUV, maxUV);
-    float2 uvPlus  = clamp(centerUV + texelSize, minUV, maxUV);
-    tapUVs[0] = centerUV;
-    tapUVs[1] = float2(centerUV.x, uvMinus.y);
-    tapUVs[2] = float2(centerUV.x, uvPlus.y);
-    tapUVs[3] = float2(uvMinus.x, centerUV.y);
-    tapUVs[4] = float2(uvPlus.x,  centerUV.y);
-    tapUVs[5] = float2(uvMinus.x, uvMinus.y);
-    tapUVs[6] = float2(uvPlus.x,  uvMinus.y);
-    tapUVs[7] = float2(uvMinus.x, uvPlus.y);
-    tapUVs[8] = float2(uvPlus.x,  uvPlus.y);
-}
-
-// ============================================================================
-// GEOMETRIC LAYER CLASSIFICATION & SURFACE ANALYSIS
-// ============================================================================
-struct LayerSurface
-{
-    bool   isDilationZone;
-    bool   isForegroundEdge;
-    bool   isForeground;
-    int    closestIdx;
-    float  closestDepth;
-    float  gradX;
-    float  gradY;
-    float  effectiveDepth;
-    float2 effectiveVelocityUV;
-    float  layerVelSpreadPx;
-};
-
-void ComputeSurfaceGradients(float depthRaw[9], out float gradX, out float gradY)
-{
-    float centerDepth = depthRaw[0];
-    float dxL = centerDepth - depthRaw[3];
-    float dxR = depthRaw[4] - centerDepth;
-    gradX = Minmod(dxL, dxR);
-
-    float dyD = centerDepth - depthRaw[1];
-    float dyU = depthRaw[2] - centerDepth;
-    gradY = Minmod(dyD, dyU);
-}
-
-float2 BilerpVelocityQuad(float2 velocityUV[9], float2 fracPx)
-{
-    float2 v00 = velocityUV[0];
-    float2 v10 = (fracPx.x >= 0.0) ? velocityUV[4] : velocityUV[3];
-    float2 v01 = (fracPx.y >= 0.0) ? velocityUV[2] : velocityUV[1];
-    float2 v11 = (fracPx.x >= 0.0)
-        ? ((fracPx.y >= 0.0) ? velocityUV[8] : velocityUV[6])
-        : ((fracPx.y >= 0.0) ? velocityUV[7] : velocityUV[5]);
-    return Bilerp2x2(v00, v10, v01, v11, abs(fracPx));
-}
-
-LayerSurface ClassifyLayerSurface(
-    float  depthRaw[9],
-    float2 velocityUV[9],
-    float2 fracPx,
-    float2 sizePixels,
-    bool   useDepthDilation,
-    float  depthRejectionThresh,
-    bool   measureVelSpread)
-{
-    LayerSurface s;
-    float centerDepth = depthRaw[0];
-
-    // 1. Surface gradients via minmod limiter across cardinal neighbors
-    ComputeSurfaceGradients(depthRaw, s.gradX, s.gradY);
-
-    // 2. Identify closest (foreground) neighbor and detect discontinuities in one pass
-    s.closestDepth = centerDepth;
-    s.closestIdx   = 0;
-    float depthEps = depthRejectionThresh * centerDepth;
-    bool hasCloserNeighbor  = false;
-    bool hasFartherNeighbor = false;
-    float depthDiff[9];
-
-    [unroll]
-    for (int i = 1; i < 9; ++i)
-    {
-        if (depthRaw[i] > s.closestDepth)
-        {
-            s.closestDepth = depthRaw[i];
-            s.closestIdx   = i;
-        }
-
-        float predDepth = centerDepth + s.gradX * kOffsets3x3[i].x + s.gradY * kOffsets3x3[i].y;
-        float diff      = depthRaw[i] - predDepth;
-        depthDiff[i]    = diff;
-        hasCloserNeighbor  = hasCloserNeighbor  || (diff > depthEps);
-        hasFartherNeighbor = hasFartherNeighbor || (diff < -depthEps);
-    }
-
-    s.isDilationZone   = useDepthDilation && hasCloserNeighbor;
-    s.isForegroundEdge = !s.isDilationZone && hasFartherNeighbor;
-    s.isForeground     = s.isDilationZone || s.isForegroundEdge;
-
-    // 3. Resolve effective layer depth and velocity
-    float subpixelDepth = centerDepth + s.gradX * fracPx.x + s.gradY * fracPx.y;
-    s.effectiveDepth = s.isDilationZone ? s.closestDepth : subpixelDepth;
-
-    s.effectiveVelocityUV = s.isDilationZone   ? velocityUV[s.closestIdx]
-                          : (s.isForegroundEdge ? velocityUV[0]
-                          : BilerpVelocityQuad(velocityUV, fracPx));
-
-    // 4. Measure layer-coherent spatial velocity spread (bypassed if velocity testing is disabled)
-    s.layerVelSpreadPx = 0.0;
-    if (measureVelSpread)
-    {
-        float maxVelDiffSq = 0.0;
-        [unroll]
-        for (int k = 1; k < 9; ++k)
-        {
-            bool sameLayer = s.isDilationZone ? (depthRaw[k] > centerDepth) : (abs(depthDiff[k]) <= depthEps);
-            if (sameLayer)
-            {
-                float2 diffPx = (velocityUV[k] - s.effectiveVelocityUV) * sizePixels;
-                maxVelDiffSq = max(maxVelDiffSq, dot(diffPx, diffPx) * kInvOffsetLenSq[k]);
-            }
-        }
-        s.layerVelSpreadPx = sqrt(maxVelDiffSq);
-    }
-
-    return s;
-}
-
 // ============================================================================
 // HISTORY REPROJECTION
+// ----------------------------------------------------------------------------
+// FIX: frameBaseUV must be the CURRENT-FRAME position of the stable point
+// stableUV (InverseReprojectThroughCamera), NOT the forward map. With the
+// inverse as the velocity base, the jitter components of the velocity cancel
+// EXACTLY and a static scene lands at stableUV (the identity). For a locally
+// uniform rotational flow the landing is stableUV - trueMotion regardless of
+// WHICH effective velocity (own bilerp / crest / dilated) is passed:
+//     landing = S_{t-1}( (g - a_t) + (a_t - a_{t-1} - m) ) = g - m
+// so velocity dilation follows the object, while the background
+// re-reprojection after a revocation lands back on the pixel's own texel.
+// (The velocity may be sampled at ANY nearby texel -- its evaluation base
+// cancels in the chain; only the frameBaseUV matters.)
 // ============================================================================
 struct HistoryReprojection
 {
@@ -491,16 +414,17 @@ struct HistoryReprojection
 
 HistoryReprojection ReprojectToHistory(
     float2 stableUV,
-    float2 jitteredUV,
+    float2 frameBaseUV,        // FIX: renamed -- current-frame position of the
+                               // stable point (inverse map), the velocity base.
     float2 velocityJitteredUV,
     CameraBasis previousCamera,
     ViewportParams vp)
 {
     HistoryReprojection h;
 
-    float3 prevRay    = BuildCameraRay(jitteredUV + velocityJitteredUV, previousCamera);
-    float2 fallbackUV = jitteredUV + velocityJitteredUV;
-    h.sampleUV        = ProjectRayToStableUV(prevRay, fallbackUV);
+    float3 prevRay    = BuildCameraRay(frameBaseUV + velocityJitteredUV, previousCamera);
+    float2 fallbackUV = frameBaseUV + velocityJitteredUV;
+    h.sampleUV        = ProjectRayToStableUV(prevRay, fallbackUV, taaTanHalfFovX, taaTanHalfFovY);
 
     h.motionPx          = (h.sampleUV - stableUV) * vp.sizePixels;
     h.motionMagnitudePx = length(h.motionPx);
@@ -781,6 +705,103 @@ float3 SampleHistoryColor_Slepian3_Fused21Tap(
 }
 
 // ============================================================================
+// HISTORY MOTION FIELD SAMPLING (layer-resolved landing analysis)
+// ----------------------------------------------------------------------------
+// Four taps of the enclosing bilinear quad around the landing. The
+// reconstruction is LAYER-GATED: the stored field already carries the dilated
+// foreground in its zones, so a subpixel landing must never blend across an
+// ownership boundary -- taps whose layer class (foreground-owned: flag >= 1)
+// differs from the landing texel's are excluded from the interpolation
+// (weights renormalized), from the gradients, AND from the support gate:
+// a foreign-layer tap must never validate a dilation while the depth
+// reconstruction excludes that same tap.
+// ============================================================================
+struct HistoryMotion
+{
+    float2 velocityUV;      // layer-gated bilinear stored effective velocity
+    float  depth;           // layer-gated bilinear stored effective depth
+    float  depthMax;        // enclosing-quad max (closest surface present; ~= old closestDepth)
+    float  supportDepthMax; // LAYER-MATCHED bilinear-support max depth
+    float  supportMaxFlag;  // LAYER-MATCHED max layer flag within the support
+    float  gradX, gradY;    // layer-gated minmod gradients of the stored field
+    float  spreadPx;        // max matched-tap velocity deviation from the reconstruction (px)
+    float  centerFlag;      // layer flag of the snapped landing texel
+    float  maxFlag;         // max layer flag in the quad
+};
+
+HistoryMotion SampleHistoryMotion(SnappedCoord landing, ViewportParams vp)
+{
+    HistoryMotion m;
+
+    float sx = (landing.fracPx.x >= 0.0) ? 1.0 : -1.0;
+    float sy = (landing.fracPx.y >= 0.0) ? 1.0 : -1.0;
+
+    float2 uv10 = clamp(landing.snappedUV + float2(sx, 0.0) * vp.texelSize, vp.minUV, vp.maxUV);
+    float2 uv01 = clamp(landing.snappedUV + float2(0.0, sy) * vp.texelSize, vp.minUV, vp.maxUV);
+    float2 uv11 = clamp(landing.snappedUV + float2(sx, sy) * vp.texelSize, vp.minUV, vp.maxUV);
+
+    float4 m00 = tex2Dlod(historyMotionTex, float4(landing.snappedUV, 0.0, 0.0));
+    float4 m10 = tex2Dlod(historyMotionTex, float4(uv10, 0.0, 0.0));
+    float4 m01 = tex2Dlod(historyMotionTex, float4(uv01, 0.0, 0.0));
+    float4 m11 = tex2Dlod(historyMotionTex, float4(uv11, 0.0, 0.0));
+
+    bool fgCenter = (m00.w >= 0.75);
+    bool match10  = ((m10.w >= 0.75) == fgCenter);
+    bool match01  = ((m01.w >= 0.75) == fgCenter);
+    bool match11  = ((m11.w >= 0.75) == fgCenter);
+
+    float2 f   = abs(landing.fracPx);
+    float  w00 = (1.0 - f.x) * (1.0 - f.y);
+    float  w10 = f.x * (1.0 - f.y) * (match10 ? 1.0 : 0.0);
+    float  w01 = (1.0 - f.x) * f.y * (match01 ? 1.0 : 0.0);
+    float  w11 = f.x * f.y * (match11 ? 1.0 : 0.0);
+    float  invW = 1.0 / max(w00 + w10 + w01 + w11, 1e-4);
+
+    m.depth      = (m00.z  * w00 + m10.z  * w10 + m01.z  * w01 + m11.z  * w11) * invW;
+    m.velocityUV = (m00.xy * w00 + m10.xy * w10 + m01.xy * w01 + m11.xy * w11) * invW;
+
+    float dx0 = match10 ? (m10.z - m00.z) : 0.0;
+    float dx1 = (match01 && match11) ? (m11.z - m01.z) : 0.0;
+    m.gradX = Minmod(dx0, dx1);
+
+    float dy0 = match01 ? (m01.z - m00.z) : 0.0;
+    float dy1 = (match10 && match11) ? (m11.z - m10.z) : 0.0;
+    m.gradY = Minmod(dy0, dy1);
+
+    // Quad-wide extents are deliberately NOT layer-gated: they answer "is any
+    // foreground-owned surface present in the quad at all".
+    m.depthMax   = max(max(m00.z, m10.z), max(m01.z, m11.z));
+    m.centerFlag = m00.w;
+    m.maxFlag    = max(max(m00.w, m10.w), max(m01.w, m11.w));
+
+    // LAYER-MATCHED bilinear reconstruction support: the subset of the quad
+    // the landing's reconstruction actually reads, degenerating with
+    // position -- full 2x2 (landing between texels), 1x2 / 2x1 (landing on
+    // a center axis: the noise-selected perpendicular neighbor's weight is
+    // negligible), center texel alone (landing at the center). Foreign-
+    // layer taps are excluded by the SAME match masks the depth
+    // reconstruction uses.
+    bool xOffCenter = (f.x >= kCenterLandingFracPx);
+    bool yOffCenter = (f.y >= kCenterLandingFracPx);
+    float supportDepthMax = m00.z;
+    float supportMaxFlag  = m00.w;
+    if (xOffCenter && match10)               { supportDepthMax = max(supportDepthMax, m10.z); supportMaxFlag = max(supportMaxFlag, m10.w); }
+    if (yOffCenter && match01)               { supportDepthMax = max(supportDepthMax, m01.z); supportMaxFlag = max(supportMaxFlag, m01.w); }
+    if (xOffCenter && yOffCenter && match11) { supportDepthMax = max(supportDepthMax, m11.z); supportMaxFlag = max(supportMaxFlag, m11.w); }
+    m.supportDepthMax = supportDepthMax;
+    m.supportMaxFlag  = supportMaxFlag;
+
+    // Bilinear mixing error of the reconstruction (px) -- the landing-side
+    // replacement for the old raw-history layer velocity spread.
+    float2 d10 = (m10.xy - m.velocityUV) * vp.sizePixels * (match10 ? 1.0 : 0.0);
+    float2 d01 = (m01.xy - m.velocityUV) * vp.sizePixels * (match01 ? 1.0 : 0.0);
+    float2 d11 = (m11.xy - m.velocityUV) * vp.sizePixels * (match11 ? 1.0 : 0.0);
+    m.spreadPx = sqrt(max(max(dot(d10, d10), dot(d01, d01)), dot(d11, d11)));
+
+    return m;
+}
+
+// ============================================================================
 // COLOR NEIGHBORHOOD STATISTICS
 // ============================================================================
 struct ColorNeighborhoodStats
@@ -856,8 +877,10 @@ ColorNeighborhoodStats ComputeColorNeighborhoodStats(
     {
         float3 fireflyMin = stats.mean - taaFireflyClamp * stats.sigma;
         float3 fireflyMax = stats.mean + taaFireflyClamp * stats.sigma;
+        // FIX: the second clamp fed aabbMin into aabbMax, collapsing the box
+        // onto its min end whenever the firefly clamp was active.
         stats.aabbMin = clamp(stats.aabbMin, fireflyMin, fireflyMax);
-        stats.aabbMax = clamp(stats.aabbMin, fireflyMin, fireflyMax);
+        stats.aabbMax = clamp(stats.aabbMax, fireflyMin, fireflyMax);
     }
 
     stats.spatialContrast = max(stats.aabbMax.x - stats.aabbMin.x, kMinSpatialContrast);
@@ -1149,12 +1172,13 @@ float4 DebugViewHistoryColor(float3 historyColorSpace, float centerDepthRaw)
     return float4(saturate(FromSpace(historyColorSpace)), centerDepthRaw);
 }
 
-float4 DebugViewEdgeState(float3 currentColorRGB, bool isDilationZone, bool isForegroundEdge, bool isForeground, float centerDepthRaw)
+float4 DebugViewEdgeState(float3 currentColorRGB, bool wasRevoked, bool isDilationZone, bool isForegroundEdge, bool isForeground, float centerDepthRaw)
 {
     float3 debugColor = currentColorRGB * 0.25;
-    if (isDilationZone)        debugColor = float3(1.0, 0.05, 0.05); // Red: confirmed dilation zone
-    else if (isForegroundEdge) debugColor = float3(0.0, 0.85, 1.0);  // Cyan: silhouette edge
-    else if (isForeground)     debugColor = float3(0.1, 0.95, 0.1);  // Green: object body
+    if (wasRevoked)             debugColor = float3(1.0, 0.6, 0.0);  // Orange: REVOKED dilation candidate
+    else if (isDilationZone)    debugColor = float3(1.0, 0.05, 0.05); // Red: kept dilation zone
+    else if (isForegroundEdge)  debugColor = float3(0.0, 0.85, 1.0);  // Cyan: silhouette edge
+    else if (isForeground)      debugColor = float3(0.1, 0.95, 0.1);  // Green: object body
     return float4(debugColor, centerDepthRaw);
 }
 
@@ -1174,25 +1198,55 @@ float4 DebugViewDisocclusionBreakdown(
 // ============================================================================
 float4 mainP(PFXVertToPix IN) : SV_TARGET0
 {
-    ViewportParams vp          = GetViewportParams();
+    ViewportParams vp          = GetViewportParams(oneOverTargetSize);
     CameraBasis currentCamera  = GetCurrentFrameCameraBasis();
     CameraBasis previousCamera = GetPreviousFrameCameraBasis();
 
     // ------------------------------------------------------------------
     // 1) Current Pixel Geometry
     // ------------------------------------------------------------------
-    float2 currentJitteredUV = ReprojectThroughCamera(IN.uv0, currentCamera, IN.uv0);
-    SnappedCoord pixel       = SnapUVToTexel(currentJitteredUV, vp);
+    // Forward map (frame-UV -> stable-UV): the stable position of the content
+    // at the frame texel under IN.uv0. Used ONLY as the +b jitter offset
+    // (velocity cancel + variance machinery). NEVER snapped: the rotational
+    // jitter flow is amplified (1+tan^2) toward the screen edges (~2.3x at
+    // the sides for 65 deg / 16:9 -> ~+-1.1 px there, vs +-0.5 px aimed at
+    // screen center), and beyond half a texel a forward-map snap selects a
+    // texel whose content is up to ~2 px from the output pixel.
+    float2 currentJitteredUV = ReprojectThroughCamera(IN.uv0, currentCamera, IN.uv0, taaTanHalfFovX, taaTanHalfFovY);
+    // Inverse map (stable-UV -> frame-UV): where the stable grid point sits in
+    // the CURRENT frame. This is BOTH the reprojection base AND the sampling
+    // snap: snap(u_t(g)) is the texel whose content lies nearest to stable
+    // position g, so the sampled content stays within +-0.5 px of the output
+    // pixel everywhere on screen. (Restores the original mod's sampling
+    // semantics -- its basis(+angles) current basis was the mirrored map,
+    // an inverse stand-in, which is why its snap was correct.) fracPx =
+    // stableInFrameUV - snapped is identical to the original mod's fracPx,
+    // so all tuning against it still applies.
+    float2 stableInFrameUV  = InverseReprojectThroughCamera(IN.uv0, currentCamera, taaTanHalfFovX, taaTanHalfFovY);
+    SnappedCoord pixel       = SnapUVToTexel(stableInFrameUV, vp);
 
     float3 currentColorRGB          = max(tex2Dlod(sceneTex,    float4(pixel.snappedUV, 0.0, 0.0)).rgb, 0.0);
     float  centerDepthRaw           =       tex2Dlod(depthTex,    float4(pixel.snappedUV, 0.0, 0.0)).r;
     float3 currentColorSpace        = ToSpace(currentColorRGB);
     float2 centerVelocityJitteredUV =       tex2Dlod(velocityTex, float4(pixel.snappedUV, 0.0, 0.0)).rg;
 
+    // Debug modes 3/4 fire before any classification exists. They still must
+    // not poison the transport: encode conservative "revoked" (the writer
+    // ignores the bit for non-candidates, so this only forces candidates
+    // into their background state during these views -- the band rebuilds
+    // one hit phase after leaving).
     if (taaDebugMode > 3.5 && taaDebugMode < 4.5)
-        return DebugViewLinearDepth(centerDepthRaw);
+    {
+        float4 v = DebugViewLinearDepth(centerDepthRaw);
+        v.a = -(centerDepthRaw + kRevokedAlphaEpsilon);
+        return v;
+    }
     if (taaDebugMode > 2.5 && taaDebugMode < 3.5)
-        return DebugViewVelocity(centerVelocityJitteredUV, vp.sizePixels, 1.0, centerDepthRaw);
+    {
+        float4 v = DebugViewVelocity(centerVelocityJitteredUV, vp.sizePixels, 1.0, centerDepthRaw);
+        v.a = -(centerDepthRaw + kRevokedAlphaEpsilon);
+        return v;
+    }
 
     // ------------------------------------------------------------------
     // 2) Current Neighborhood Gather
@@ -1229,173 +1283,208 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
     // ------------------------------------------------------------------
     // 4) Reprojection to History Buffer
     // ------------------------------------------------------------------
+    // FIX: base = stableInFrameUV (the inverse map). Static scenes now land
+    // on their own texel (the identity); motion is measured jitter-free.
     HistoryReprojection repro = ReprojectToHistory(
-        IN.uv0, currentJitteredUV, currentLayer.effectiveVelocityUV, previousCamera, vp);
+        IN.uv0, stableInFrameUV, currentLayer.effectiveVelocityUV, previousCamera, vp);
 
+    // Debug mode 1 fires after classification but before validation:
+    // conservative per-candidate encoding.
     if (taaDebugMode > 0.5 && taaDebugMode < 1.5)
-        return DebugViewVelocity(repro.motionPx, vp.sizePixels, 1.0, centerDepthRaw);
+    {
+        // FIX: motionPx is already in PIXELS; DebugViewVelocity multiplies by
+        // sizePixels internally (its other callers pass UV-space vectors), so
+        // convert to UV first -- otherwise the view amplifies ~150x and
+        // saturates at the 0.005 px reprojection noise floor.
+        float4 v = DebugViewVelocity(repro.motionPx * vp.texelSize, vp.sizePixels, 1.0, centerDepthRaw);
+        v.a = TransportAlpha(currentLayer.isDilationZone, centerDepthRaw);
+        return v;
+    }
 
     // ------------------------------------------------------------------
     // 5) Exact Jitter Plumbing
     // ------------------------------------------------------------------
-    float2 jitterOffsetCurUV   = currentJitteredUV - IN.uv0;
-    float2 jitterOffsetPrevUV  = IN.uv0 - ReprojectThroughCamera(IN.uv0, previousCamera, IN.uv0);
-    float2 jitterCancelUV      = float2(0.0, 0.0);
-    float2 jitterTransportUV   = float2(0.0, 0.0);
+    // All offsets in the SAME sense: a_tau = S_tau(g) - g (the per-frame
+    // content shift). jitterOffsetCurUV = S_t(g) - g is exactly that.
+    float2 jitterOffsetCurUV  = currentJitteredUV - IN.uv0;
+    // FIX: jitterOffsetPrevUV was computed NEGATED (IN.uv0 - map), flipping
+    // the middle term of the second difference below: the cancel subtracted
+    // a_t + 2*a_{t-1} + a_{t-2} instead of a_t - 2*a_{t-1} + a_{t-2}, leaving
+    // 4*a_{t-1} of uncancelled jitter in the velocity test on static scenes.
+    float2 jitterOffsetPrevUV = ReprojectThroughCamera(IN.uv0, previousCamera, IN.uv0, taaTanHalfFovX, taaTanHalfFovY) - IN.uv0;
+    float2 jitterCancelUV     = float2(0.0, 0.0);
+    float2 jitterTransportUV  = float2(0.0, 0.0);
 
     bool needJitterCancel = velocityTestEnabled || (taaDebugMode > 1.5 && taaDebugMode < 2.5)
                                                 || (taaDebugMode > 11.5 && taaDebugMode < 12.5);
     if (needJitterCancel)
     {
+        // a_{t-2} from the t-2 jitter angles. MUST match the sense of the two
+        // offsets above (= S_{t-2}(g) - g); RotationFlowUV(theta) equals that
+        // iff the engine's per-frame basis rotation matches RotationFlowUV's
+        // rotation convention. VERIFY with debug mode 12 on a static scene:
+        // the residual must collapse to noise -- if it DOUBLES, negate the
+        // angles on the C++ side (or negate this term here).
         float2 jitterOffsetPrev2UV = RotationFlowUV(taaJitPrev2Yaw, taaJitPrev2Pitch, IN.uv0);
+
+        // Static-scene velocity difference (both frames' jitter in V):
+        //   V_t - V_{t-1} = (a_t - a_{t-1}) - (a_{t-1} - a_{t-2})
+        //                 =  a_t - 2*a_{t-1} + a_{t-2}
         jitterCancelUV    = jitterOffsetCurUV - 2.0 * jitterOffsetPrevUV + jitterOffsetPrev2UV;
         jitterTransportUV = jitterOffsetPrev2UV - jitterOffsetPrevUV;
     }
 
     // ------------------------------------------------------------------
     // 6) Color Neighborhood Gather (Zero-Redundancy Shared FXAA Corners)
+    //    + raw-scene acutance energy for the auto-parity sharpener
     // ------------------------------------------------------------------
     float3 neighborhoodColorSpace[9];
     neighborhoodColorSpace[0] = currentColorSpace;
 
     float3 fxaaCornersRGB[4]; // 0:NW(5), 1:NE(6), 2:SW(7), 3:SE(8)
+    float  rawCrossLumaSum = 0.0; // cross taps 1..4, RCAS-luma of SRTM'd raw
 
     [unroll]
     for (int c = 1; c < 9; ++c)
     {
         float3 tapRGB = max(tex2Dlod(sceneTex, float4(tapUVs[c], 0.0, 0.0)).rgb, 0.0);
         neighborhoodColorSpace[c] = ToSpace(tapRGB);
+        if (c <= 4)
+            rawCrossLumaSum += SrtmLumaFSR(tapRGB);
         if (fxaaEnabled && c >= 5)
             fxaaCornersRGB[c - 5] = tapRGB;
     }
 
+    // Parity target for taaFinal.fx.hlsl: local high-pass energy of the raw
+    // scene, in the same SRTM/RCAS-luma space the final pass measures the
+    // resolved image in. Transported via the alpha channel (sign-encoded
+    // with the revocation bit -- see the final return).
+    float rawHighPass        = SrtmLumaFSR(currentColorRGB) - rawCrossLumaSum * 0.25;
+    float rawSharpnessEnergy = rawHighPass * rawHighPass;
+
     // ------------------------------------------------------------------
     // 7) Validate History Sample Bounds
     // ------------------------------------------------------------------
-    float  historySupportTexels = (taaUseLanczos3 > 0.5) ? 3.0 : 2.0;
+    float  historySupportTexels = (taaUseSlepian3 > 0.5) ? 3.0 : 2.0;
     float2 historyMinUV = historySupportTexels * vp.texelSize;
     float2 historyMaxUV = 1.0 - historyMinUV;
     bool historyValid = all(repro.sampleUV >= historyMinUV) && all(repro.sampleUV <= historyMaxUV);
 
     if (!historyValid)
     {
+        // Offscreen history = no history support: a tentative dilation here
+        // can never be validated, so encode it as revoked for the writer.
+        float earlyAlpha = currentLayer.isDilationZone
+            ? -(rawSharpnessEnergy + kRevokedAlphaEpsilon)
+            : rawSharpnessEnergy;
+
         if (fxaaEnabled)
         {
             float3 fxaaColorRGB = ApplyFXAA(pixel.snappedUV, vp.texelSize, currentColorRGB, fxaaCornersRGB, vp.minUV, vp.maxUV);
-            return float4(max(fxaaColorRGB, 0.0), centerDepthRaw);
+            return float4(max(fxaaColorRGB, 0.0), earlyAlpha);
         }
-        return float4(currentColorRGB, centerDepthRaw);
+        return float4(currentColorRGB, earlyAlpha);
     }
 
     // ------------------------------------------------------------------
-    // 8) Geometrically Exact Disocclusion & Shared History Landing
+    // 8) History Landing Analysis (stored layer-resolved motion field)
     // ------------------------------------------------------------------
     SnappedCoord landing = SnapUVToTexel(repro.sampleUV, vp);
+    HistoryMotion histMotion = SampleHistoryMotion(landing, vp);
 
-    float2 histTapUVs[9];
-    Build3x3TapUVs(landing.snappedUV, vp.texelSize, vp.minUV, vp.maxUV, histTapUVs);
-
-    float  histDepths[9];
-    float2 histVelocities[9];
-    bool   needLandingVelocity = velocityTestEnabled || (taaDebugMode > 1.5 && taaDebugMode < 2.5)
-                                                  || (taaDebugMode > 5.5 && taaDebugMode < 6.5)
-                                                  || (taaDebugMode > 11.5 && taaDebugMode < 12.5);
-
-    [unroll]
-    for (int h = 0; h < 9; ++h)
-    {
-        histDepths[h] = tex2Dlod(historyTex, float4(histTapUVs[h], 0.0, 0.0)).a;
-        float2 velUV  = clamp(histTapUVs[h] + jitterOffsetPrevUV, vp.minUV, vp.maxUV);
-        histVelocities[h] = needLandingVelocity ? tex2Dlod(prevVelocityTex, float4(velUV, 0.0, 0.0)).rg : float2(0.0, 0.0);
-    }
-
-    // ------------------------------------------------------------------
-    // History 2x2 Enclosing Quad + Paired Dilation Validation:
-    // A continuous subpixel landing is bilinearly reconstructed strictly
-    // from the 4 texels of the 2x2 quad enclosing it. If none of those 4 texels
-    // touches foreground, nor does the paired relative dilated tap touch foreground,
-    // the history sample contains 0.0% foreground history. Dilation is revoked,
-    // preventing camera jitter from activating phantom disocclusions.
-    // ------------------------------------------------------------------
     float rayLenCur  = RayLengthFromUV(IN.uv0, taaTanHalfFovX, taaTanHalfFovY);
     float rayLenPrev = RayLengthFromUV(repro.sampleUV, taaTanHalfFovX, taaTanHalfFovY);
     float perspScale = rayLenPrev / max(rayLenCur, 1e-6);
 
-    // Initial tentative classification at landing
-    LayerSurface tentativeHistLayer = ClassifyLayerSurface(
-        histDepths, histVelocities,
-        landing.fracPx, vp.sizePixels,
-        useDepthDilation, taaDepthRejection,
-        velocityTestEnabled);
+    // Set when the tentative dilation is revoked below; travels to the
+    // motion writer through the alpha sign so the revocation PERSISTS in
+    // the stored field.
+    bool dilationRevoked = false;
+
+    // Debug bookkeeping (mode 9): pre-mutation candidacy and which gate
+    // branch kept the dilation.
+    bool dilationCandidate = false;
+    bool gateViaFlag       = false;
 
     if (currentLayer.isDilationZone)
     {
-        // 1. Enclosing 2x2 bilinear quad depths around repro.sampleUV
-        float d00 = histDepths[0];
-        float d10 = (landing.fracPx.x >= 0.0) ? histDepths[4] : histDepths[3];
-        float d01 = (landing.fracPx.y >= 0.0) ? histDepths[2] : histDepths[1];
-        float d11 = (landing.fracPx.x >= 0.0)
-            ? ((landing.fracPx.y >= 0.0) ? histDepths[8] : histDepths[6])
-            : ((landing.fracPx.y >= 0.0) ? histDepths[7] : histDepths[5]);
+        dilationCandidate = true;
 
-        float maxHistDepth2x2 = max(max(d00, d10), max(d01, d11));
-
+        // Own-History Dilation Validation: the candidate validates through
+        // the history it would have if it stayed dilated -- its own stored
+        // texel. (With the fixed base, a static candidate lands EXACTLY on
+        // its own texel; under motion it follows the object.)
         float rawExpClosest = currentLayer.closestDepth * perspScale;
-        float rawExpLimb    = centerDepthRaw * perspScale;
-        float sagitta       = abs(rawExpClosest - rawExpLimb);
-        float tolObject     = max(taaDepthRejection * rawExpClosest, 1e-5) + sagitta;
-        float fgThreshold   = min(rawExpLimb, rawExpClosest) - tolObject;
 
-        // Conservative test:
-        // A) Does any of the 4 enclosing 2x2 bilinear texels touch foreground?
-        bool quadTouchesForeground = (maxHistDepth2x2 >= fgThreshold);
-        // B) Does the paired relative dilated tap in history touch foreground?
-        bool pairedTapTouchesForeground = (histDepths[currentLayer.closestIdx] >= fgThreshold);
-        // C) Did the landing touch an already-dilated zone of this foreground object?
-        bool touchesAlreadyDilated = tentativeHistLayer.isDilationZone && (tentativeHistLayer.closestDepth >= fgThreshold);
+        // Object-side slant allowance: the depth spread across the object
+        // between the candidate and its crest, from the slope-limited
+        // gradients. The minmod limiter zeroes the gradients across a
+        // silhouette cliff, so background-side candidates (own center =
+        // background -- every silhouette's outside neighbor) get NO slant
+        // allowance and a strict crest anchor.
+        float2 crestOffset = kOffsets3x3[currentLayer.closestIdx];
+        float  objectSlant = (abs(currentLayer.gradX * crestOffset.x) + abs(currentLayer.gradY * crestOffset.y)) * perspScale;
+        float  tolObject   = max(taaDepthRejection * rawExpClosest, 1e-5) + objectSlant;
+        float  fgThreshold = rawExpClosest - tolObject;
 
-        bool historyHasForeground = quadTouchesForeground || pairedTapTouchesForeground || touchesAlreadyDilated;
+        // A) Own-history support gate (LAYER-MATCHED). A support tap
+        //    validates the dilation iff it is foreground-OWNED (flag >= 1:
+        //    sampled edge or persisted dilation band -- the record of
+        //    "stayed dilated"), or its stored depth is at the object itself
+        //    (crest-anchored). The candidate's own background history fails
+        //    both -> revoke. Foreign-layer taps are excluded by the same
+        //    match masks the depth reconstruction uses.
+        gateViaFlag = (histMotion.supportMaxFlag >= 0.75);
+        bool quadTouchesForeground = gateViaFlag
+                                  || (histMotion.supportDepthMax >= fgThreshold);
+
+        // C) The landing itself was inside the object's dilation band.
+        bool touchesAlreadyDilated = (histMotion.centerFlag >= 1.5) && (histMotion.depth >= fgThreshold);
+
+        bool historyHasForeground = quadTouchesForeground
+                                  || touchesAlreadyDilated;
 
         if (!historyHasForeground)
         {
-            // History bilinear quad has zero foreground: revoke dilation
-            currentLayer.isDilationZone      = false;
-            currentLayer.isForeground        = false;
-            currentLayer.effectiveDepth      = centerDepthRaw + currentLayer.gradX * pixel.fracPx.x + currentLayer.gradY * pixel.fracPx.y;
-            currentLayer.effectiveVelocityUV = BilerpVelocityQuad(curVelocities, pixel.fracPx);
+            // Own history contains neither ownership nor object depth:
+            // revoke dilation. The revocation persists via the stored field
+            // (taaMotion consumes the alpha sign and writes this texel as
+            // background), so a phase-artifact dilation is rejected once
+            // and stays rejected.
+            dilationRevoked = true;
+            RevokeDilation(currentLayer, centerDepthRaw, curVelocities, pixel.fracPx);
 
-            // Re-reproject using true continuous background velocity
-            repro   = ReprojectToHistory(IN.uv0, currentJitteredUV, currentLayer.effectiveVelocityUV, previousCamera, vp);
-            landing = SnapUVToTexel(repro.sampleUV, vp);
-            Build3x3TapUVs(landing.snappedUV, vp.texelSize, vp.minUV, vp.maxUV, histTapUVs);
-
-            [unroll]
-            for (int h2 = 0; h2 < 9; ++h2)
-            {
-                histDepths[h2] = tex2Dlod(historyTex, float4(histTapUVs[h2], 0.0, 0.0)).a;
-                float2 velUV2  = clamp(histTapUVs[h2] + jitterOffsetPrevUV, vp.minUV, vp.maxUV);
-                histVelocities[h2] = needLandingVelocity ? tex2Dlod(prevVelocityTex, float4(velUV2, 0.0, 0.0)).rg : float2(0.0, 0.0);
-            }
+            // Re-reproject using the true continuous background velocity.
+            // FIX: same base -- the revoked candidate now lands back on its
+            // OWN texel, so CASE 2 compares background against background
+            // instead of landing on the previous dilation band's baked
+            // crest depth (occludedByDilationZone) and rejecting.
+            repro      = ReprojectToHistory(IN.uv0, stableInFrameUV, currentLayer.effectiveVelocityUV, previousCamera, vp);
+            landing    = SnapUVToTexel(repro.sampleUV, vp);
+            histMotion = SampleHistoryMotion(landing, vp);
 
             rayLenPrev = RayLengthFromUV(repro.sampleUV, taaTanHalfFovX, taaTanHalfFovY);
             perspScale = rayLenPrev / max(rayLenCur, 1e-6);
-
-            // Re-classify history layer at the true background landing
-            tentativeHistLayer = ClassifyLayerSurface(
-                histDepths, histVelocities,
-                landing.fracPx, vp.sizePixels,
-                useDepthDilation, taaDepthRejection,
-                velocityTestEnabled);
         }
     }
 
-    LayerSurface historyLayer = tentativeHistLayer;
+    bool landingIsDilationZone = (histMotion.centerFlag >= 1.5);
 
+    // Debug modes 8 and 6 fire after validation: transport the actual
+    // verdict.
     if (taaDebugMode > 7.5 && taaDebugMode < 8.5)
-        return DebugViewEdgeState(currentColorRGB, currentLayer.isDilationZone, currentLayer.isForegroundEdge, currentLayer.isForeground, centerDepthRaw);
+    {
+        float4 v = DebugViewEdgeState(currentColorRGB, dilationRevoked, currentLayer.isDilationZone, currentLayer.isForegroundEdge, currentLayer.isForeground, centerDepthRaw);
+        v.a = TransportAlpha(dilationRevoked, centerDepthRaw);
+        return v;
+    }
 
     if (taaDebugMode > 5.5 && taaDebugMode < 6.5)
-        return DebugViewVelocity(historyLayer.effectiveVelocityUV, vp.sizePixels, 2.0, centerDepthRaw);
+    {
+        float4 v = DebugViewVelocity(histMotion.velocityUV, vp.sizePixels, 2.0, centerDepthRaw);
+        v.a = TransportAlpha(dilationRevoked, centerDepthRaw);
+        return v;
+    }
 
     bool  depthRejected      = false;
     bool  velocityRejected   = false;
@@ -1406,78 +1495,92 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
         float rawExp = currentLayer.effectiveDepth * perspScale;
 
         // Exact dual-sided subpixel slant tolerance:
-        // Accounts for subpixel jitter phase on slanted/curved surfaces in both current and history frames
+        // Accounts for subpixel jitter phase on slanted/curved surfaces in
+        // both current and history frames.
         float tolCurSlant  = (abs(currentLayer.gradX * pixel.fracPx.x) + abs(currentLayer.gradY * pixel.fracPx.y)) * perspScale;
-        float tolHistSlant = abs(historyLayer.gradX * landing.fracPx.x) + abs(historyLayer.gradY * landing.fracPx.y);
+        float tolHistSlant = abs(histMotion.gradX * landing.fracPx.x) + abs(histMotion.gradY * landing.fracPx.y);
         float tolSlant     = tolCurSlant + tolHistSlant;
         float tolDepth     = max(taaDepthRejection * rawExp, 1e-5) + tolSlant;
 
         if (currentLayer.isForeground)
         {
-            // CASE 1: Current pixel is FOREGROUND (Silhouette Edge or Confirmed Dilation Zone)
-            // Symmetrized Physical Depth Envelope:
-            // When subpixel jitter shifts a steep surface between a direct limb hit and a dilated
-            // crest hit in either direction, taking the bounds across both frames ensures consistency.
+            // CASE 1: Current pixel is FOREGROUND (Silhouette Edge or Confirmed
+            // Dilation Zone). Symmetrized Physical Depth Envelope.
+            // Because the stored field bakes the dilated crest depth into last
+            // frame's dilation zones, the landing sample alone resolves the
+            // envelope: a landing in the object's previous dilation band reads
+            // foreground depth directly (NOT disoccluded), a landing on pure
+            // background reads background depth (the object was not there).
             float curLimb  = min(currentLayer.effectiveDepth, currentLayer.closestDepth) * perspScale;
             float curCrest = max(currentLayer.effectiveDepth, currentLayer.closestDepth) * perspScale;
 
-            // An occluder in front of the object was present at t-1:
-            bool occludedInFront = (historyLayer.effectiveDepth > curCrest + tolDepth);
+            bool occludedInFront = (histMotion.depth > curCrest + tolDepth); // an occluder was present at t-1
+            bool missingBehind   = (histMotion.depth < curLimb - tolDepth);  // the object was not present at t-1
 
-            // The foreground object was not present at t-1 (history closest depth is strictly behind limb):
-            bool missingBehind = (historyLayer.closestDepth < curLimb - tolDepth);
-
-            if (occludedInFront || missingBehind)
-            {
-                depthRejected = true;
-            }
-            else
-            {
-                float histLimb  = min(historyLayer.effectiveDepth, historyLayer.closestDepth);
-                float histCrest = max(historyLayer.effectiveDepth, historyLayer.closestDepth);
-
-                float fgMin = min(curLimb, histLimb) - tolDepth;
-                float fgMax = max(curCrest, histCrest) + tolDepth;
-
-                bool histMatches = (historyLayer.effectiveDepth >= fgMin && historyLayer.effectiveDepth <= fgMax) ||
-                                   (historyLayer.closestDepth   >= fgMin && historyLayer.closestDepth   <= fgMax);
-
-                depthRejected = !histMatches;
-            }
+            depthRejected = occludedInFront || missingBehind;
         }
         else
         {
             // CASE 2: Current pixel is BACKGROUND / CONTINUOUS SURFACE
-            // Contract: "a dilation zone gets replaced with background on the next frame this pixel is disoccluded."
-            // Only rejected if the current pixel is strictly farther than the historical occluder/dilation zone.
-            bool occludedByDilationZone = historyLayer.isDilationZone && (historyLayer.closestDepth > rawExp + tolDepth);
-            bool occludedByGeometry     = (historyLayer.effectiveDepth - rawExp) > tolDepth;
+            // Contract: "a dilation zone gets replaced with background on the
+            // next frame this pixel is disoccluded." Only rejected if the
+            // current pixel is strictly farther than the historical
+            // occluder/dilation zone.
+            bool occludedByDilationZone = landingIsDilationZone && (histMotion.depthMax > rawExp + tolDepth);
+            bool occludedByGeometry     = (histMotion.depth - rawExp) > tolDepth;
+
             depthRejected = occludedByDilationZone || occludedByGeometry;
         }
     }
 
-    // Velocity rejection is restricted strictly to continuous background surfaces.
-    // Silhouette edges experience motion boundary cliffs and angular parallax acceleration;
-    // their presence is validated by the geometric depth envelope, not by velocity continuity.
-    if (!depthRejected && velocityTestEnabled && !currentLayer.isForeground && !historyLayer.isForeground)
+    // Velocity rejection is restricted to continuous background surfaces ON THE
+    // CURRENT SIDE ONLY: silhouette edges experience motion boundary cliffs
+    // and angular parallax acceleration; their presence is validated by the
+    // geometric depth envelope, not by velocity continuity.
+    //
+    // FIX -- THE HISTORY SIDE IS NO LONGER FLAG-GATED. Skipping the test when
+    // the landing quad contained any foreground-owned stored texel disabled
+    // the test exactly on its canonical cases: thin / curved / edge-flagged
+    // occluders (wires, poles, characters -- their stored texels are all
+    // flag 1/2), so a revealed background pixel's landing always read a
+    // flagged texel and velocity disocclusion never fired where it mattered
+    // (the depth test misses those at similar depths, where its threshold is
+    // deliberately loose to spare curved flanks). The layer-gated
+    // reconstruction already handles the mixed case correctly: a
+    // background-centered landing excludes foreground-owned taps (the
+    // comparison stays background-vs-background -- no silhouette
+    // velocity-cliff mixing), while a foreground-OWNED centered landing
+    // reconstructs the OCCLUDER's stored velocity, so the error term becomes
+    // the relative motion and the reveal rejects. Pixels landing in stale
+    // dilation bands were already rejected by the depth test's
+    // occludedByDilationZone; the extra coverage is strictly the previously
+    // missed disocclusions.
+    if (!depthRejected && velocityTestEnabled && !currentLayer.isForeground)
     {
-        float2 errVecPx = (currentLayer.effectiveVelocityUV - historyLayer.effectiveVelocityUV - jitterCancelUV) * vp.sizePixels;
+        float2 errVecPx = (currentLayer.effectiveVelocityUV - histMotion.velocityUV - jitterCancelUV) * vp.sizePixels;
         float  errPx    = length(errVecPx);
 
         velocityErrorRatio = errPx / max(taaVelRejection, 1e-4);
 
-        float maxGrad = max(currentLayer.layerVelSpreadPx, historyLayer.layerVelSpreadPx);
+        float maxGrad = max(currentLayer.layerVelSpreadPx, histMotion.spreadPx);
         float velTol  = taaVelRejection + maxGrad * landing.fracDist;
 
         if (errPx > velTol)
         {
             if (taaCrossTestStrength > 0.001)
             {
-                // Exact round-trip pursuit confirmation
-                float2 pursuitUV = repro.sampleUV - (historyLayer.effectiveVelocityUV + jitterTransportUV);
+                // Exact round-trip pursuit confirmation. On coherent motion:
+                //   landing    = g - m
+                //   storedVel  = a_{t-1} - a_{t-2} - m
+                //   transport  = a_{t-2} - a_{t-1}
+                //   pursuitUV  = g - m - (storedVel + transport) = g
+                // FIX: the round trip returns EXACTLY to the stable pixel
+                // IN.uv0 (it previously chased currentJitteredUV, leaving a
+                // systematic jitter-magnitude bias in the divergence).
+                float2 pursuitUV = repro.sampleUV - (histMotion.velocityUV + jitterTransportUV);
                 if (all(pursuitUV >= vp.minUV) && all(pursuitUV <= vp.maxUV))
                 {
-                    float roundTripDivergencePx = length(pursuitUV - currentJitteredUV) * vp.sizePixels;
+                    float roundTripDivergencePx = length((pursuitUV - IN.uv0) * vp.sizePixels);
                     velocityRejected = (roundTripDivergencePx * saturate(taaCrossTestStrength) > (1.0 + landing.fracDist));
                 }
                 else
@@ -1494,16 +1597,41 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
 
     bool disoccluded = depthRejected || velocityRejected;
 
+    // Debug modes 2 and 12 fire after the tests: transport the actual
+    // verdict.
     if (taaDebugMode > 1.5 && taaDebugMode < 2.5)
-        return DebugViewDisocclusionBreakdown(
+    {
+        float4 v = DebugViewDisocclusionBreakdown(
             currentColorRGB, depthRejected, velocityRejected,
             (velocityErrorRatio > 1.0 && !velocityRejected),
             centerDepthRaw);
+        v.a = TransportAlpha(dilationRevoked, centerDepthRaw);
+        return v;
+    }
 
     if (taaDebugMode > 11.5 && taaDebugMode < 12.5)
     {
-        float2 residualPx = (currentLayer.effectiveVelocityUV - historyLayer.effectiveVelocityUV - jitterCancelUV) * vp.sizePixels;
-        return float4(saturate(length(residualPx) * 0.5), saturate(length(residualPx) * 0.5), 0.0, centerDepthRaw);
+        float2 residualPx = (currentLayer.effectiveVelocityUV - histMotion.velocityUV - jitterCancelUV) * vp.sizePixels;
+        float4 v = float4(saturate(length(residualPx) * 0.5), saturate(length(residualPx) * 0.5), 0.0, 0.0);
+        v.a = TransportAlpha(dilationRevoked, centerDepthRaw);
+        return v;
+    }
+
+    // Debug mode 9: the dilation gate breakdown.
+    //   R = revoked candidate
+    //   G = kept candidate (full = via flag branch, half = via depth branch)
+    //   B = depth test rejected this pixel
+    // Red ring at a silhouette's outside edge = revocation working.
+    // Cyan (G+B) = kept AND rejected -- a gate/test divergence.
+    // Blue only = rejected non-candidate -- the boundary texel's own CASE 1.
+    if (taaDebugMode > 8.5 && taaDebugMode < 9.5)
+    {
+        float3 debugColor = currentColorRGB * 0.1;
+        if (dilationRevoked)                                  debugColor.r = 1.0;
+        if (dilationCandidate && !dilationRevoked)
+            debugColor.g = gateViaFlag ? 1.0 : 0.5;
+        if (depthRejected)                                    debugColor.b = 1.0;
+        return float4(debugColor, TransportAlpha(dilationRevoked, centerDepthRaw));
     }
 
     // ------------------------------------------------------------------
@@ -1514,13 +1642,17 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
     float3 clipMargin = taaClipOvershoot * max(colorStats.aabbMax - colorStats.aabbMin, 0.0);
 
     float3 historyColorSpace =
-        (taaUseLanczos3 > 0.5)
+        (taaUseSlepian3 > 0.5)
         ? SampleHistoryColor_Slepian3_Fused21Tap(repro.sampleUV, vp, historyMinUV, historyMaxUV)
         : SampleHistoryColor_Slepian2_Fast9Tap(repro.sampleUV, vp, historyMinUV, historyMaxUV);
     historyColorSpace = CompressGamut(historyColorSpace);
 
     if (taaDebugMode > 4.5 && taaDebugMode < 5.5)
-        return DebugViewHistoryColor(historyColorSpace, centerDepthRaw);
+    {
+        float4 v = DebugViewHistoryColor(historyColorSpace, centerDepthRaw);
+        v.a = TransportAlpha(dilationRevoked, centerDepthRaw);
+        return v;
+    }
 
     // ------------------------------------------------------------------
     // 10) Color Clipping & Luma Drift Correction
@@ -1556,12 +1688,18 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
     }
 
     // ------------------------------------------------------------------
-    // 12) Final Blend Output
+    // 12) Final Blend Output (alpha = acutance metric for the auto-parity
+    //     sharpener in taaFinal.fx.hlsl, SIGN-ENCODED with the revocation
+    //     bit for the motion writer: negative = this pixel's tentative
+    //     dilation was revoked)
     // ------------------------------------------------------------------
     float3 blendedColorSpace = lerp(clippedHistorySpace, currentFrameColorSpace, currentBlendWeight);
     blendedColorSpace.x = max(blendedColorSpace.x, 0.0);
     float3 outputRGB = max(FromSpace(blendedColorSpace), 0.0);
-    return float4(outputRGB, centerDepthRaw);
+    float outAlpha = dilationRevoked
+        ? -(rawSharpnessEnergy + kRevokedAlphaEpsilon)
+        : rawSharpnessEnergy;
+    return float4(outputRGB, outAlpha);
 }
 
 // ============================================================================

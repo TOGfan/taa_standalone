@@ -149,14 +149,14 @@ const hoveredItem = ref(null)
 const openDropdown = ref(null)
 
 const settingsSchema = [
-  {
-    name: "General & Sharpening",
-    items: [
-      { id: 'sharpness', type: 'float', min: 0.0, max: 1.0, step: 0.01, default: 0.50, name: "Sharpening Strength (RCAS)", desc: "Contrast-adaptive sharpening (AMD FidelityFX RCAS, reference implementation) applied to the final resolved image. Runs on a tonemapped copy of the image so HDR highlights stay stable; 1.0 is maximum sharpness, 0 disables." },
-      { id: 'jitterScale', type: 'float', min: 0.0, max: 2.0, step: 0.01, default: 1.0, name: "Jitter Spread Scale", desc: "Scales the sub-pixel camera offset pattern. Above 1 samples a wider area within each pixel (more edge anti-aliasing, more temporal softening); below 1 tightens it." },
-      { id: 'fallbackFXAA', type: 'numBool', default: 1.0, name: "Fallback Spatial AA (FXAA)", desc: "Applies FXAA edge smoothing to pixels whose temporal history was rejected, so disoccluded areas don't alias while the history rebuilds." }
-    ]
-  },
+{
+  name: "General & Sharpening",
+  items: [
+    { id: 'sharpness', type: 'float', min: 0.0, max: 1.0, step: 0.01, default: 1.0, name: "Sharpness (Auto Parity)", desc: "Automatically sharpens the resolved image back to the raw frame's local sharpness. Each pixel's sharpening amount is derived in closed form from the measured blur -- the ratio of local high-frequency (acutance) energy between the raw scene and the resolved image -- so heavily accumulated (blurred) areas get boosted while fresh, disoccluded and border pixels get almost none. Aliasing is not re-introduced: the target never exceeds the raw image's own energy, sub-perceptual detail is ignored via a noise floor, and RCAS's contrast limiter and noise suppression only ever reduce the boost further. 1.0 = full perceptual parity with the raw image, 0 disables." },
+    { id: 'jitterScale', type: 'float', min: 0.0, max: 2.0, step: 0.01, default: 1.0, name: "Jitter Spread Scale", desc: "Scales the sub-pixel camera offset pattern. Above 1 samples a wider area within each pixel (more edge anti-aliasing, more temporal softening); below 1 tightens it." },
+    { id: 'fallbackFXAA', type: 'numBool', default: 1.0, name: "Fallback Spatial AA (FXAA)", desc: "Applies FXAA edge smoothing to pixels whose temporal history was rejected, so disoccluded areas don't alias while the history rebuilds." }
+  ]
+},
   {
     name: "History & Blending",
     items: [
@@ -169,16 +169,16 @@ const settingsSchema = [
       { id: 'alignmentFeedbackDrop', type: 'float', min: 0.0, max: 1.0, step: 0.01, default: 0.25, name: "Sub-Pixel Alignment Drop", desc: "Lowers history weight when the reprojected history sample lands between texels, where the resampling kernel is least accurate -- preserving texture sharpness in motion. Active only on planar surface interiors (the bilinear-motion path); edges and dilation zones are exempt because their current samples are aliased and dropping history there makes them flicker. Works independently of the History Blend weights. 0 disables. At 0.5, badly-phased pixels drop from a 33-frame to a ~2-frame accumulation window; the cost is a fixed texel-scale noise pattern on smooth noisy surfaces (sky gradients, shadow noise) in static scenes. Verify with debug mode 9 (red = applied drop, green = eligible); note that Lanczos 3 resampling already preserves most sub-texel detail, so the effect is most visible with Lanczos 3 off or sharpening at 0." }
     ]
   },
-  {
-    name: "Jitter & Sampling",
-    items: [
-      { id: 'useJitter', type: 'bool', default: true, name: "Sub-Pixel Camera Jitter", desc: "Offsets the camera by a sub-pixel amount each frame so successive frames sample different positions within each pixel. This is the source of TAA's supersampling -- without it, TAA only stabilizes noise, it does not anti-alias." },
-      { id: 'useR2Jitter', type: 'bool', default: true, name: "R2 Jitter Sequence", desc: "Uses the R2 low-discrepancy sequence instead of Halton(2,3) for the jitter pattern. R2 spreads samples more evenly across its 32-frame cycle." },
-      { id: 'useLanczos3', type: 'numBool', default: 1.0, name: "Lanczos 3 History Resampling", desc: "36-tap Lanczos resampling of the history buffer. Retains noticeably more detail in motion than the 5-tap Catmull-Rom fallback (the two differ only for moving pixels), at roughly 7x the sampling cost." },
-      { id: 'historyOvershoot', type: 'float', min: 0.0, max: 1.0, step: 0.01, default: 1.0, name: "History Resampling Overshoot Margin", desc: "Soft anti-ringing margin for history resampling, shared by both the Lanczos and Catmull-Rom paths and applied equally to brightness and color, as a fraction of the local color range. Band-limited overshoot -- the edge detail the filter reconstructs -- survives, while ringing and color fringing are compressed. Higher = sharper history, lower = fewer halos." },
-      { id: 'useDepthDilation', type: 'numBool', default: 1.0, name: "Depth-Dilated Motion Search", desc: "Searches the 3x3 neighborhood for the closest surface and uses its motion vector, so silhouette edges reproject with the foreground's motion instead of the background's." }
-    ]
-  },
+{
+  name: "Jitter & Sampling",
+  items: [
+    { id: 'useJitter', type: 'bool', default: true, name: "Sub-Pixel Camera Jitter", desc: "Offsets the camera by a sub-pixel amount each frame so successive frames sample different positions within each pixel. This is the source of TAA's supersampling -- without it, TAA only stabilizes noise, it does not anti-alias." },
+    { id: 'useR2Jitter', type: 'bool', default: true, name: "R2 Jitter Sequence", desc: "Uses the R2 low-discrepancy sequence instead of Halton(2,3) for the jitter pattern. R2 spreads samples more evenly across its 32-frame cycle." },
+    { id: 'useSlepian3', type: 'numBool', default: 1.0, name: "Slepian 3 History Resampling", desc: "21-tap Slepian (DPSS-windowed) resampling of the history buffer. Retains noticeably more detail in motion than the 9-tap Slepian-2 fallback (the two differ only for moving pixels), at over twice the sampling cost." },
+    { id: 'historyOvershoot', type: 'float', min: 0.0, max: 1.0, step: 0.01, default: 1.0, name: "History Resampling Overshoot Margin", desc: "Soft anti-ringing margin for history resampling, shared by both Slepian paths and applied equally to brightness and color, as a fraction of the local color range. Band-limited overshoot -- the edge detail the filter reconstructs -- survives, while ringing and color fringing are compressed. Higher = sharper history, lower = fewer halos." },
+    { id: 'useDepthDilation', type: 'numBool', default: 1.0, name: "Depth-Dilated Motion Search", desc: "Searches the 3x3 neighborhood for the closest surface and uses its motion vector, so silhouette edges reproject with the foreground's motion instead of the background's. The resolved per-pixel motion, depth and layer classification are stored in a dedicated buffer each frame and become the authoritative data the next frame's disocclusion and history-validation tests read at the reprojection landing." }
+  ]
+},
   {
     name: "Variance Clipping",
     items: [
@@ -263,7 +263,7 @@ settingsSchema.forEach(cat => {
 })
 
 const presets = {
-  Performance: { feedbackMax: 0.95, feedbackMin: 0.95, useLanczos3: 0, useKDopClipping: 0, colorSpaceOklab: 0 },
+  Performance: { feedbackMax: 0.95, feedbackMin: 0.95, useSlepian3: 0, useKDopClipping: 0, colorSpaceOklab: 0 },
   Balanced: { useKDopClipping: 0, colorSpaceOklab: 0}, 
   Clarity: { feedbackMax: 0.95, feedbackMin: 0.95, },
   Smooth: { }
