@@ -23,9 +23,14 @@
 // checked exactness certificate; the fallback is a safe upper bound, so the
 // clip can never over-clip.
 //
-// OUTPUT: RGB = resolved color. A = the raw scene's acutance energy for
-// taaFinal's auto-parity sharpener, SIGN-ENCODED with the revocation bit
-// (negative = this pixel's tentative dilation was revoked).
+// OUTPUT: RGB = the resolved color -- ALWAYS, also while a debug mode is
+// active (the history-copy child stores this RGB into #TAA_History
+// unconditionally, so a debug color here would poison the accumulation).
+// A = the raw scene's acutance energy for taaFinal's auto-parity sharpener,
+// SIGN-ENCODED with the revocation bit; while a debug mode is active, A
+// instead carries the packed view payload (PackDebugAlpha, taaShared) --
+// the sign still encodes the revocation (the motion writer reads the sign
+// only) and the auto-sharpener is bypassed in debug.
 //
 // PIPELINE (mainP): (1) resolve the jittered render position via the
 // inverse map + snap; (2) gather the raw current-frame neighborhood; (3)
@@ -39,16 +44,21 @@
 // resampling (taaResample), clipping (taaClip), drift; (12) feedback and
 // the temporal blend; (13) output.
 //
-// DEBUG MODES (taaDebugMode):
+// DEBUG MODES (taaDebugMode): rendered by taaFinal from a payload the
+// resolve stashes into #TAA_Result.a; the resolve's RGB is always the real
+// blend, so the accumulation continues while debugging and debug switches
+// off with zero recovery time. View bases are the resolved output:
 //   0 off | 1 frame motion | 2 disocclusion breakdown (R=depth, G=velocity,
 //   B=suppressed pursuit alert) | 3 center velocity | 4 linearized depth |
-//   5 history color | 6 landing effective velocity | 7 pursuit divergence |
-//   8 layer state (orange=revoked candidate, red=kept dilation zone, cyan=
-//   crest, magenta=depth-flat but velocity-straddled) | 9 dilation-gate
-//   breakdown (R=revoked, G=kept candidate: full=flag branch, half=depth
-//   branch, B=depth-rejected) | 10 alignment-drop activity | 11 hull clipper
-//   state (G=exact certificate, half-G=supporting-only bound, R=unconverged
-//   fallback, B=pivots used) | 12 dejittered residual (jitter-cancel
+//   5 history color (the STORED #TAA_History buffer, read by taaFinal) |
+//   6 landing effective velocity | 7 pursuit divergence | 8 layer state
+//   (orange=revoked candidate, red=kept dilation zone, cyan=crest,
+//   magenta=depth-flat but velocity-straddled) | 9 dilation-gate breakdown
+//   (R=revoked, G=kept candidate: full=flag branch, half=depth branch,
+//   B=depth-rejected) | 10 alignment-drop activity | 11 hull clipper state
+//   (G=exact -- simplex certificate or the collinear 1D solve, half-G=
+//   certified dual-descent bound, R=defensive fallback that should never
+//   fire, B=iterations used) | 12 dejittered residual (jitter-cancel
 //   verification).
 //
 // FILE ARCHITECTURE (flat includes, this file is the only include issuer):
@@ -62,7 +72,8 @@
 //   taaLayers.h.hlsl     layer classification, current-frame gather
 //   taaDisocclusion.h.hlsl motion-field gate, landing, parallax fit, pursuit
 //   taaClip.h.hlsl       color stats, exact-hull clip, feedback, drift
-//   taaDebug.h.hlsl      debug views
+//   taaDebug.h.hlsl      debug view rendering from the packed alpha payload
+//                         (included by taaFinal.fx.hlsl, NOT the resolve)
 // The fragment headers are NOT standalone shaders; they compile only in this
 // file's context (the samplers and cbuffer below) and are included in
 // dependency order.
@@ -129,7 +140,6 @@ cbuffer perDraw
 #include "shaders/common/postFx/taa/taaLayers.h.hlsl"
 #include "shaders/common/postFx/taa/taaDisocclusion.h.hlsl"
 #include "shaders/common/postFx/taa/taaClip.h.hlsl"
-#include "shaders/common/postFx/taa/taaDebug.h.hlsl"
 
 #ifdef SHADER_STAGE_VS
 #define mainV main
@@ -140,9 +150,10 @@ cbuffer perDraw
 // ============================================================================
 // REVOCATION TRANSPORT
 // ----------------------------------------------------------------------------
-// EVERY return path must transport the revocation bit through the alpha sign
-// -- including debug returns. The writer ignores the bit for non-candidates,
-// so a conservative "revoked" is safe on returns that fire before validation.
+// EVERY return path must transport the revocation bit through the alpha's
+// SIGN -- including the debug paths, where PackDebugAlpha carries it in the
+// same bit. The writer ignores the bit for non-candidates, so a
+// conservative "revoked" is safe on returns that fire before validation.
 // ============================================================================
 float TransportAlpha(bool revoked, float magnitude)
 {
@@ -160,6 +171,21 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
     float  coherenceRadiusPx   = max(taaVelRejection, kMinVelCoherenceRadiusPx);
 
     // ------------------------------------------------------------------
+    // DEBUG PAYLOAD STASH: while a debug mode is active the output's RGB
+    // must stay the REAL blended color (the history-copy child stores it
+    // into #TAA_History unconditionally), so no view early-returns. Each
+    // view stashes its state into (dbgCode, dbgA, dbgB) as soon as its data
+    // exists; the exits compose it into the alpha via PackDebugAlpha
+    // (which preserves the revocation sign for the motion writer), and
+    // taaFinal renders the view. dbgCode 0 = nothing stashed (taaFinal
+    // shows the resolved color). The pipeline therefore always runs to the
+    // blend during debug, the accumulation stays live, and the views
+    // observe (and switch off from) the true converged state.
+    // ------------------------------------------------------------------
+    bool  debugActive = (taaDebugMode > 0.5);
+    float dbgCode = 0.0, dbgA = 0.0, dbgB = 0.0;
+
+    // ------------------------------------------------------------------
     // 1) Resolve the jittered render position of this stable output pixel.
     //    Forward map: ONLY the s_t jitter offset source. Inverse map: the
     //    sampling snap AND the reprojection base (static landings = identity).
@@ -173,19 +199,18 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
     float3 currentColorSpace        = ToSpace(currentColorRGB);
     float2 centerVelocityJitteredUV =       tex2Dlod(velocityTex, float4(pixel.snappedUV, 0.0, 0.0)).rg;
 
-    // Debug modes 3/4 fire before any classification exists: conservative
-    // "revoked" (safe: the writer ignores the bit for non-candidates).
+    // Modes 3/4 need nothing beyond step 1 -- stash and fall through.
     if (taaDebugMode > 3.5 && taaDebugMode < 4.5)
     {
-        float4 v = DebugViewLinearDepth(centerDepthRaw);
-        v.a = -(centerDepthRaw + kRevokedAlphaEpsilon);
-        return v;
+        dbgCode = 4.0;
+        dbgA    = saturate(LinearizeDepth(centerDepthRaw) / kDebugLinearDepthRange);
     }
-    if (taaDebugMode > 2.5 && taaDebugMode < 3.5)
+    else if (taaDebugMode > 2.5 && taaDebugMode < 3.5)
     {
-        float4 v = DebugViewVelocity(centerVelocityJitteredUV, vp.sizePixels, 1.0, centerDepthRaw);
-        v.a = -(centerDepthRaw + kRevokedAlphaEpsilon);
-        return v;
+        float2 vPx = abs(centerVelocityJitteredUV * vp.sizePixels) * kDebugVelocityScale;
+        dbgCode = 3.0;
+        dbgA    = saturate(vPx.x);
+        dbgB    = saturate(vPx.y);
     }
 
     // ------------------------------------------------------------------
@@ -247,15 +272,13 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
     HistoryReprojection repro = ReprojectToHistory(
         IN.uv0, stableInFrameUV, pixel.fracPx, currentLayer.effectiveVelocityUV, previousCamera, vp);
 
-    // Debug mode 1 fires after classification but before validation:
-    // conservative per-candidate encoding.
+    // Mode 1 (frame motion): repro exists; motionPx is already in pixels.
     if (taaDebugMode > 0.5 && taaDebugMode < 1.5)
     {
-        // motionPx is already in PIXELS; DebugViewVelocity multiplies by
-        // sizePixels internally, so convert to UV first.
-        float4 v = DebugViewVelocity(repro.motionPx * vp.texelSize, vp.sizePixels, 1.0, centerDepthRaw);
-        v.a = TransportAlpha(currentLayer.isDilationZone, centerDepthRaw);
-        return v;
+        float2 vPx = abs(repro.motionPx) * kDebugVelocityScale;
+        dbgCode = 1.0;
+        dbgA    = saturate(vPx.x);
+        dbgB    = saturate(vPx.y);
     }
 
     // ------------------------------------------------------------------
@@ -291,11 +314,15 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
 
     if (!historyValid)
     {
-        // Offscreen history = no support: a tentative dilation here can never
-        // be validated, so encode it as revoked for the writer.
-        float earlyAlpha = currentLayer.isDilationZone
-            ? -(rawSharpnessEnergy + kRevokedAlphaEpsilon)
-            : rawSharpnessEnergy;
+        // Offscreen history = no support: a tentative dilation here can
+        // never be validated, so encode it as revoked for the writer. The
+        // payloads stashed so far (modes 1/3/4 all predate this point) still
+        // travel through the packed alpha; later modes have no data on this
+        // path and taaFinal falls back to showing the resolved color.
+        bool  earlyRevoked = currentLayer.isDilationZone;
+        float earlyAlpha  = debugActive
+            ? PackDebugAlpha(earlyRevoked, dbgCode, saturate(dbgA), saturate(dbgB))
+            : TransportAlpha(earlyRevoked, rawSharpnessEnergy);
 
         if (fxaaEnabled)
         {
@@ -403,19 +430,23 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
             currentLayer.isForeground);
     }
 
+    // Mode 6 (landing effective velocity): the landing exists now.
     if (taaDebugMode > 5.5 && taaDebugMode < 6.5)
     {
-        float4 v = DebugViewVelocity(landing.effectiveVelocityJitteredPrevUV, vp.sizePixels, 2.0, centerDepthRaw);
-        v.a = TransportAlpha(dilationRevoked, centerDepthRaw);
-        return v;
+        float2 vPx = abs(landing.effectiveVelocityJitteredPrevUV * vp.sizePixels) * (kDebugVelocityScale * 2.0);
+        dbgCode = 6.0;
+        dbgA    = saturate(vPx.x);
+        dbgB    = saturate(vPx.y);
     }
 
     // Post-revocation single-layer state (a revoked candidate acts flat).
     bool currentSingleLayer = !(currentLayer.isDilationZone || currentLayer.isForegroundEdge);
 
+    // Mode 8 (layer state + straddle). A bit field: 4 = dilation zone,
+    // 2 = foreground edge, 1 = velocity-straddled; the revocation rides the
+    // alpha sign.
     if (taaDebugMode > 7.5 && taaDebugMode < 8.5)
     {
-        // Layer state + straddle visualization.
         bool velocityStraddled = false;
         if (!currentLayer.isDilationZone && !currentLayer.isForegroundEdge)
         {
@@ -424,20 +455,22 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
             velocityStraddled = QuadStraddlesVelocityStep(
                 v00, v10, v01, v11, neighborhood.velocityJitteredUV, vp.sizePixels, coherenceRadiusPx);
         }
-        float4 v = DebugViewEdgeState(currentColorRGB, dilationRevoked,
-            currentLayer.isDilationZone, currentLayer.isForegroundEdge, velocityStraddled, centerDepthRaw);
-        v.a = TransportAlpha(dilationRevoked, centerDepthRaw);
-        return v;
+        float f = (currentLayer.isDilationZone   ? 4.0 : 0.0)
+                + (currentLayer.isForegroundEdge ? 2.0 : 0.0)
+                + (velocityStraddled              ? 1.0 : 0.0);
+        dbgCode = 8.0;
+        dbgA    = f * 0.125;
     }
 
+    // Mode 10 (alignment-drop activity).
     if (taaDebugMode > 9.5 && taaDebugMode < 10.5)
     {
         float dropAmount = currentSingleLayer
             ? taaAlignmentFeedbackDrop * (1.0 - repro.subpixelAlignment)
             : 0.0;
-        float4 v = DebugViewAlignmentDrop(currentColorRGB, dropAmount, currentSingleLayer, centerDepthRaw);
-        v.a = TransportAlpha(dilationRevoked, centerDepthRaw);
-        return v;
+        dbgCode = 10.0;
+        dbgA    = saturate(dropAmount);
+        dbgB    = currentSingleLayer ? 1.0 : 0.0;
     }
 
     // ------------------------------------------------------------------
@@ -492,41 +525,43 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
 
     bool disoccluded = depthRejected || velocityRejection.rejected;
 
+    // Mode 2 (disocclusion breakdown). A bit field: 4 = depth rejected,
+    // 2 = velocity rejected, 1 = suppressed pursuit alert.
     if (taaDebugMode > 1.5 && taaDebugMode < 2.5)
     {
-        float4 v = DebugViewDisocclusionBreakdown(
-            currentColorRGB, depthRejected, velocityRejection.rejected,
-            (velocityRejection.errorRatio > 1.0 && !velocityRejection.rejected),
-            centerDepthRaw);
-        v.a = TransportAlpha(dilationRevoked, centerDepthRaw);
-        return v;
+        float f = (depthRejected ? 4.0 : 0.0)
+                + (velocityRejection.rejected ? 2.0 : 0.0)
+                + ((velocityRejection.errorRatio > 1.0 && !velocityRejection.rejected) ? 1.0 : 0.0);
+        dbgCode = 2.0;
+        dbgA    = f * 0.125;
     }
 
+    // Mode 7 (pursuit divergence).
     if (taaDebugMode > 6.5 && taaDebugMode < 7.5)
     {
-        float4 v = DebugViewPursuit(currentColorRGB, velocityRejection.divergencePx, velocityRejection.rejected, centerDepthRaw);
-        v.a = TransportAlpha(dilationRevoked, centerDepthRaw);
-        return v;
+        dbgCode = 7.0;
+        dbgA    = saturate(velocityRejection.divergencePx * 0.5);
+        dbgB    = velocityRejection.rejected ? 1.0 : 0.0;
     }
 
+    // Mode 12 (dejittered residual -- jitter-cancel verification).
     if (taaDebugMode > 11.5 && taaDebugMode < 12.5)
     {
-        // Jitter-cancel verification (see RotationFlowUV).
         float2 residualPx = (currentLayer.effectiveVelocityUV - landing.effectiveVelocityJitteredPrevUV - jitterCancelUV) * vp.sizePixels;
-        float rr = saturate(length(residualPx) * 0.5);
-        return float4(rr, rr, 0.0, TransportAlpha(dilationRevoked, centerDepthRaw));
+        dbgCode = 12.0;
+        dbgA    = saturate(length(residualPx) * 0.5);
     }
 
+    // Mode 9 (dilation-gate breakdown). A bit field: 4 = kept candidate,
+    // 2 = kept via the flag branch (else the depth branch), 1 = depth
+    // rejected; the revocation rides the alpha sign.
     if (taaDebugMode > 8.5 && taaDebugMode < 9.5)
     {
-        // Dilation-gate breakdown: R=revoked, G=kept candidate (full=flag
-        // branch, half=depth branch), B=depth-rejected.
-        float3 debugColor = currentColorRGB * 0.1;
-        if (dilationRevoked)                                  debugColor.r = 1.0;
-        if (dilationCandidate && !dilationRevoked)
-            debugColor.g = gateViaFlag ? 1.0 : 0.5;
-        if (depthRejected)                                    debugColor.b = 1.0;
-        return float4(debugColor, TransportAlpha(dilationRevoked, centerDepthRaw));
+        float f = ((dilationCandidate && !dilationRevoked) ? 4.0 : 0.0)
+                + (gateViaFlag ? 2.0 : 0.0)
+                + (depthRejected ? 1.0 : 0.0);
+        dbgCode = 9.0;
+        dbgA    = f * 0.125;
     }
 
     // ------------------------------------------------------------------
@@ -548,11 +583,12 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
     if (taaHistoryOvershoot > 0.001)
         historyColorSpace = CompressGamut(historyColorSpace);
 
+    // Mode 5 (history color) carries no numeric payload: taaFinal renders it
+    // directly from the stored #TAA_History buffer (the exact input of this
+    // frame's blend). The code only routes the dispatch.
     if (taaDebugMode > 4.5 && taaDebugMode < 5.5)
     {
-        float4 v = DebugViewHistoryColor(historyColorSpace, centerDepthRaw);
-        v.a = TransportAlpha(dilationRevoked, centerDepthRaw);
-        return v;
+        dbgCode = 5.0;
     }
 
     float2 hullDiag = float2(0.0, 0.0);
@@ -560,11 +596,12 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
         historyColorSpace, colorStats, repro.motionNormalized, taaVarianceGamma,
         neighborhoodColorSpace, clipMargin, hullDiag);
 
+    // Mode 11 (hull clipper state): A = hullDiag.x / 4, B = pivots.
     if (taaDebugMode > 10.5 && taaDebugMode < 11.5)
     {
-        float4 v = DebugViewHullClip(currentColorRGB, hullDiag, centerDepthRaw);
-        v.a = TransportAlpha(dilationRevoked, centerDepthRaw);
-        return v;
+        dbgCode = 11.0;
+        dbgA    = hullDiag.x * 0.25;
+        dbgB    = saturate(hullDiag.y * 0.2);
     }
 
     float clipDistanceRejection = 0.0;
@@ -595,15 +632,21 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
     }
 
     // ------------------------------------------------------------------
-    // 13) Final blend & output: alpha = acutance metric, SIGN-ENCODED with
-    //     the revocation bit (negative = this texel's tentative dilation
-    //     was revoked).
+    // 13) Final blend & output: RGB is ALWAYS the real resolved color (also
+    //     during debug -- this is what makes the history store
+    //     poison-proof). Alpha = the acutance metric, SIGN-ENCODED with the
+    //     revocation bit; while a debug mode is active it carries the packed
+    //     view payload instead (PackDebugAlpha keeps the sign, so the motion
+    //     writer is unaffected; the magnitude's only other consumer,
+    //     taaFinal's auto-sharpener, is bypassed in debug).
     // ------------------------------------------------------------------
     float3 blendedColorSpace = lerp(clippedHistorySpace, currentFrameColorSpace, currentBlendWeight);
     // Clamp scalar luminance only; do NOT clamp signed chrominance channels.
     blendedColorSpace.x = max(blendedColorSpace.x, 0.0);
     float3 outputRGB = max(FromSpace(blendedColorSpace), 0.0);
-    float outAlpha = TransportAlpha(dilationRevoked, rawSharpnessEnergy);
+    float outAlpha = debugActive
+        ? PackDebugAlpha(dilationRevoked, dbgCode, saturate(dbgA), saturate(dbgB))
+        : TransportAlpha(dilationRevoked, rawSharpnessEnergy);
     return float4(outputRGB, outAlpha);
 }
 

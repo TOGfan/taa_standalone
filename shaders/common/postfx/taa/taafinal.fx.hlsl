@@ -1,7 +1,23 @@
+// ============================================================================
+// TAA final pass (#TAA_Result -> $backBuffer). Two jobs, in order:
+//   1) DEBUG VIEW RENDERING (taaDebugMode > 0): the resolve stashed the view
+//      state into #TAA_Result.a (PackDebugAlpha) and kept RGB as the REAL
+//      blended color; decode the payload and render the view here. This pass
+//      is the only place a debug color ever exists -- the history-copy child
+//      stores the untouched RGB, so the accumulation simply continues while
+//      debugging.
+//   2) Sharpening: auto-parity (acutance-driven) or manual RCAS.
+// ============================================================================
 #include "shaders/common/postFx/postFx.h.hlsl"
 #include "shaders/common/hlsl.h"
+#include "shaders/common/postFx/taa/taaShared.h.hlsl"
+#include "shaders/common/postFx/taa/taaDebug.h.hlsl"
 
 uniform_sampler2D(taaResultTex, 0);
+// The stored history buffer (read-only) for the mode-5 view. This child runs
+// BEFORE the history-copy child in the resolve's pass chain, so this is
+// exactly the buffer contents the resolve consumed this frame.
+uniform_sampler2D(taaHistoryTex, 1);
 
 cbuffer perDraw {
     float taaAutoSharpen;
@@ -77,6 +93,7 @@ cbuffer perDraw {
 #define AF3_(a) AF3(a, a, a)
 
 #define A_STATIC static
+
 #define outAU4 out AU4
 
 #define AExp2F1(x)      exp2(x)
@@ -305,9 +322,27 @@ static const AF1 kSharpRefFreqTerm = 0.58578644;
 
 float4 mainP(PFXVertToPix IN) : SV_TARGET0
 {
-    // Debug view: raw resolve output, sharpening bypassed.
-    if (taaDebugMode > 0.5) {
-        return float4(max(0.0, tex2Dlod(taaResultTex, float4(IN.uv0, 0.0, 0.0)).rgb), 1.0);
+    // ------------------------------------------------------------------
+    // Debug views: decode the alpha payload the resolve stashed and render
+    // the view (taaDebug.h.hlsl). The tap's RGB is the real blended color --
+    // the history store stays clean and the views watch the live
+    // accumulation.
+    // ------------------------------------------------------------------
+    if (taaDebugMode > 0.5)
+    {
+        float4 t = tex2Dlod(taaResultTex, float4(IN.uv0, 0.0, 0.0));
+        float3 resultRGB = max(t.rgb, 0.0);
+
+        uint  code;
+        float pa, pb;
+        UnpackDebugAlpha(t.a, code, pa, pb);
+        bool revoked = (t.a < 0.0);          // the sign stays genuine
+
+        // Mode 5's subject: the stored history as the resolve read it this
+        // frame (the history-copy child runs after this pass).
+        float3 historyRGB = max(tex2Dlod(taaHistoryTex, float4(IN.uv0, 0.0, 0.0)).rgb, 0.0);
+
+        return float4(RenderDebugView(code, pa, pb, revoked, resultRGB, historyRGB), 1.0);
     }
 
     AF1 amount = AF1_(saturate(taaSharpness));

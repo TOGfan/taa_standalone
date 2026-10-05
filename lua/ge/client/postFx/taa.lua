@@ -145,6 +145,9 @@ function M.build()
         -- final pass (FsrRcasLoadF fetches exact texel centers; edge offsets
         -- clamp to the border texel, matching integer-load semantics).
         sb:setField("samplerStates", 0, "SamplerClampPoint")
+        -- Slot 1: the mode-5 history view fetch (exact texel read; the
+        -- packed debug alpha must never be filtered).
+        sb:setField("samplerStates", 1, "SamplerClampPoint")
     end)
 
     getOrCreateStateBlock("TAA_Motion_StateBlock", function(sb)
@@ -184,16 +187,20 @@ function M.build()
     taaPreFx:setField("targetClear", 0, "PFXTargetClear_OnDraw")
 
     -- ------------------------------------------------------------------
-    -- Final pass (auto-parity / manual sharpening): #TAA_Result ->
-    -- $backBuffer. MUST be a CHILD of the resolve pass: children execute
-    -- immediately after their parent, inside the parent's pass, i.e.
-    -- strictly after #TAA_Result is written and before anything else touches
-    -- $backBuffer. No own renderTime / renderBin / priority / targetScale:
-    -- a child inherits the parent's scheduling.
+    -- Final pass (debug view rendering / auto-parity / manual sharpening):
+    -- #TAA_Result -> $backBuffer. MUST be a CHILD of the resolve pass:
+    -- children execute immediately after their parent, inside the parent's
+    -- pass, i.e. strictly after #TAA_Result is written and before anything
+    -- else touches $backBuffer. No own renderTime / renderBin / priority /
+    -- targetScale: a child inherits the parent's scheduling.
     -- ------------------------------------------------------------------
     local taaFinalFx = createObject("PostEffect")
     taaFinalFx:setField("shader", 0, "TAA_Final_ShaderData"); taaFinalFx:setField("stateBlock", 0, "TAA_Copy_StateBlock")
     taaFinalFx:setField("texture", 0, "#TAA_Result")
+    -- Read-only view of the stored history for debug mode 5. This child runs
+    -- BEFORE the history-copy child in the pass chain, so it sees exactly the
+    -- buffer contents the resolve consumed this frame (never races the copy).
+    taaFinalFx:setField("texture", 1, "#TAA_History")
     taaFinalFx:setField("target", 0, "$backBuffer")
     taaFinalFx:registerObject("TAA_FinalFx"); taaPreFx:add(taaFinalFx)
 
@@ -291,7 +298,7 @@ M.defaultSettings = {
     clipDistanceRejectionEnabled  = 1.0,
     clipDistanceRejectionAmount   = 0.0,
     clipDistanceRejectionMinError = 0.15,
-    motionBlendStart              = 1.0,
+    motionBlendStart               = 1.0,
     fallbackFXAA                  = 1.0
 }
 
@@ -360,10 +367,10 @@ function M.applySettings(inputs)
         pre:setShaderConst("$taaClipDistanceRejectionMinError", s.clipDistanceRejectionMinError)
         pre:setShaderConst("$taaMotionBlendStart",        s.motionBlendStart)
         pre:setShaderConst("$taaFallbackFXAA",            s.fallbackFXAA)
-        -- Keep the history source consistent with the debug state: the ge
-        -- warmup only re-runs setupHistory at mission start / resolution
-        -- changes, but debug toggles arrive here.
-        pre:setField("texture", 2, (tonumber(s.debugMode) or 0.0) > 0.5 and "$backBuffer" or "#TAA_History")
+        -- Debug modes no longer rebind the history source: the resolve's RGB
+        -- is always the real blend (views ride the alpha, rendered by
+        -- TAA_FinalFx), so the accumulation simply keeps running while a
+        -- debug mode is active.
     end
 
     -- The motion-field writer must classify with the SAME parameters as the
@@ -409,25 +416,12 @@ end
 function M.setupHistory(state)
     local pre = scenetree.TAA_PreFx
     if pre then
-        local isHistory = (state == "history")
-        -- Debug views write diagnostic colors into #TAA_Result, and the
-        -- history-copy child stores that into #TAA_History unconditionally:
-        -- while a debug mode is active, the clip's history input would be
-        -- garbage that also feeds the debug pattern back into itself (red
-        -- pixels write red-ish history, whose rays stay red). While
-        -- debugging, read the RAW CURRENT FRAME as the history instead:
-        -- the clip rays stay real (converged-regime directions), nothing
-        -- accumulates, and normal operation resumes one frame after debug
-        -- is switched off (the poisoned #TAA_History is fully rejected on
-        -- that first frame).
-        local debugActive = (tonumber(M.settings.debugMode) or 0.0) > 0.5
-        local source
-        if not isHistory then
-            source = "$backBuffer"                          -- warmup reset
-        else
-            source = debugActive and "$backBuffer" or "#TAA_History"
-        end
-        pre:setField("texture", 2, source)
+        -- Warmup bookkeeping ONLY. On a reset the raw current frame stands in
+        -- as the history (a fresh / resized canvas can contain anything);
+        -- after the warmup the stored buffer takes over. Debug modes never
+        -- touch this: they are pure views rendered by TAA_FinalFx from the
+        -- alpha payload, and the history stays the live accumulation.
+        pre:setField("texture", 2, (state == "history") and "#TAA_History" or "$backBuffer")
         -- texture 4 (#TAA_HistMotion) is permanently bound: the stored
         -- motion field is always last frame's data.
     end
