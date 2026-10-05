@@ -1,5 +1,6 @@
 // ============================================================================
-// TAA shared math (included by taa.fx.hlsl and taaMotion.fx.hlsl)
+// TAA shared math (included by taa.fx.hlsl, taaMotion.fx.hlsl and
+// taaFinal.fx.hlsl)
 // ----------------------------------------------------------------------------
 // PURE functions only -- no cbuffer or sampler access. Everything the layer
 // classification needs is passed in, so the resolve pass and the motion-field
@@ -50,6 +51,36 @@ float  Bilerp2x2(float  c00, float  c10, float  c01, float  c11, float2 fraction
 float2 Bilerp2x2(float2 c00, float2 c10, float2 c01, float2 c11, float2 fraction)
 {
     return lerp(lerp(c00, c10, fraction.x), lerp(c01, c11, fraction.x), fraction.y);
+}
+
+// ============================================================================
+// DEBUG PAYLOAD TRANSPORT (through #TAA_Result.a while a debug mode is on)
+// ----------------------------------------------------------------------------
+// The resolve's single render target must always carry the REAL blended
+// color (the history-copy child stores it into #TAA_History unconditionally
+// -- debug colors in RGB would poison the accumulation). The view state
+// rides the alpha instead: the magnitude's only consumers are taaFinal's
+// auto-sharpener (bypassed in debug) and the writer's revocation SIGN (kept
+// genuine). Bit layout: 31 = revocation sign; 30..27 = 0111 (finite,
+// non-subnormal, never NaN/Inf); 26..23 = state code; 22..13 = payload A
+// [0,1]; 12..0 = payload B [0,1]. Exact through an RGBA32F target with
+// point sampling (no filtering on the store path).
+// ============================================================================
+float PackDebugAlpha(bool revoked, float code, float a, float b)
+{
+    uint u = 0x38000000u
+           | ((uint(code + 0.5) & 0xFu)   << 23)
+           | ((uint(a * 1023.0 + 0.5) & 0x3FFu) << 13)
+           |  (uint(b * 8191.0 + 0.5) & 0x1FFFu);
+    return asfloat(revoked ? (u | 0x80000000u) : u);
+}
+
+void UnpackDebugAlpha(float alpha, out uint code, out float a, out float b)
+{
+    uint u = asuint(alpha);
+    code = (u >> 23) & 0xFu;
+    a    = (float)((u >> 13) & 0x3FFu) * (1.0 / 1023.0);
+    b    = (float)(u & 0x1FFFu) * (1.0 / 8191.0);
 }
 
 // ============================================================================
@@ -135,18 +166,17 @@ float2 ReprojectThroughCamera(float2 uv, CameraBasis camera, float2 fallbackUV, 
 }
 
 // INVERSE map: stable-UV -> frame-UV (where the stable point sits in that
-// frame). First-order reflection + one Newton refinement; residual ~1e-7 px
-// for rotational sub-pixel jitter (the reflection alone is ~1e-4 px, already
-// 20x below the 0.005 px reprojection noise floor).
+// frame). First-order reflection; residual ~1e-4 px for rotational sub-pixel
+// jitter -- 20x below the 0.005 px reprojection noise floor and orders below
+// every consumer's quantization (the snap grid is 0.5 px, the velocity
+// encoding floor is ~0.06 px).
 float2 InverseReprojectThroughCamera(float2 stableUV, CameraBasis camera, float tanHalfFovX, float tanHalfFovY)
 {
-    float2 inv  = 2.0 * stableUV - ReprojectThroughCamera(stableUV, camera, stableUV, tanHalfFovX, tanHalfFovY);
-    float2 fwd2 = ReprojectThroughCamera(inv, camera, inv, tanHalfFovX, tanHalfFovY);
-    return inv - (fwd2 - stableUV);
+    return 2.0 * stableUV - ReprojectThroughCamera(stableUV, camera, stableUV, tanHalfFovX, tanHalfFovY);
 }
 
 // ============================================================================
-// CAMERA DIFFERENTIALS ([REWRITE] depth-disocclusion support)
+// CAMERA DIFFERENTIALS (depth-disocclusion support)
 // ----------------------------------------------------------------------------
 // Exact differential quantities of the camera maps, used by the resolve's
 // forward-parallax fit. All pure; the stable basis yields CameraForwardAxis
@@ -212,8 +242,6 @@ struct SurfaceEdgeState
     bool  isDilationZone;        // center BEHIND neighbors: background behind a foreground crest
     bool  isForegroundEdge;      // center IN FRONT of neighbors: the crest itself
     float edgeEps;               // depth separation that counts as an edge between layers
-    float planeGradX;            // central-difference depth plane gradient (per texel)
-    float planeGradY;
     float maxNeighborDepthSlope; // largest depth slope across neighbor pairs ("per-2-texel" units)
     float planeDepthNoise;       // depth noise estimate from the max slope
     float depthNoiseFloor;       // lower bound of measurable depth noise
@@ -252,10 +280,6 @@ SurfaceEdgeState AnalyzeSurfaceEdgesCore(float depthRaw[9], bool useDepthDilatio
     // Center in front of its neighbors -> the crest itself: the center tap is
     // the most representative sample.
     s.isForegroundEdge = !s.isDilationZone && (maxCurvature > s.edgeEps);
-
-    // Central-difference plane fit of the depth field around the center.
-    s.planeGradX = 0.5 * (depthRaw[4] - depthRaw[3]);
-    s.planeGradY = 0.5 * (depthRaw[2] - depthRaw[1]);
 
     // Lower bound of measurable depth noise.
     float minAbsCurvature = min(min(abs(curvatureH), abs(curvatureV)),

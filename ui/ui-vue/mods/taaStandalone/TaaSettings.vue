@@ -38,7 +38,7 @@
           >
             <!-- Top Half: Label & Switches -->
             <div class="row-header">
-              <div class="option-label">{{ item.name }}</div>
+              <div class="option-label">{{ displayItem(item).name }}</div>
 
               <div v-if="item.type === 'bool' || item.type === 'numBool'" class="inline-controls">
                 <BngSwitch 
@@ -127,10 +127,10 @@
     <div class="options-info-panel">
       <template v-if="hoveredItem">
         <div class="info-header">
-          <span class="info-title">{{ hoveredItem.name }}</span>
-          <span class="info-default">Default: {{ formatDefault(hoveredItem) }}</span>
+          <span class="info-title">{{ displayItem(hoveredItem).name }}</span>
+          <span class="info-default">Default: {{ formatDefault(displayItem(hoveredItem)) }}</span>
         </div>
-        <div class="info-desc">{{ hoveredItem.desc }}</div>
+        <div class="info-desc">{{ displayItem(hoveredItem).desc }}</div>
       </template>
       <div v-else class="info-empty">
         Hover over a setting to see details.
@@ -148,11 +148,25 @@ const config = ref({})
 const hoveredItem = ref(null)
 const openDropdown = ref(null)
 
+// The sharpness slider changes meaning with the Auto Sharpening toggle:
+// auto = parity target fraction, manual = fixed RCAS strength.
+const sharpnessAuto = {
+  id: 'sharpness', type: 'float', min: 0.0, max: 1.0, step: 0.01, default: 1.0,
+  name: "Sharpness (Auto Parity Target)",
+  desc: "Target fraction of the raw frame's local sharpness to restore (Auto Sharpening on). The sharpening amount is derived per pixel in closed form from the measured blur -- the ratio of local high-frequency (acutance) energy between the raw scene and the resolved image -- so heavily accumulated (blurred) areas get boosted while fresh, disoccluded and border pixels get almost none. Aliasing is not re-introduced: the target never exceeds the raw image's own energy, sub-perceptual detail is ignored via a noise floor, and RCAS's contrast limiter and noise suppression only ever reduce the boost further. 1.0 = full perceptual parity with the raw image, 0 disables sharpening."
+}
+const sharpnessManual = {
+  id: 'sharpness', type: 'float', min: 0.0, max: 1.0, step: 0.01, default: 1.0,
+  name: "Sharpness (Manual Strength)",
+  desc: "Fixed FSR RCAS sharpening strength (Auto Sharpening off), applied uniformly to every pixel with no acutance measurement: 0 disables, 1.0 is the maximum lobe RCAS permits (very strong). RCAS's built-in contrast limiter and noise suppression remain active, so edges are protected from ringing and grain amplification. Values around 0.3-0.5 are a typical manual starting point."
+}
+
 const settingsSchema = [
 {
   name: "General & Sharpening",
   items: [
-    { id: 'sharpness', type: 'float', min: 0.0, max: 1.0, step: 0.01, default: 1.0, name: "Sharpness (Auto Parity)", desc: "Automatically sharpens the resolved image back to the raw frame's local sharpness. Each pixel's sharpening amount is derived in closed form from the measured blur -- the ratio of local high-frequency (acutance) energy between the raw scene and the resolved image -- so heavily accumulated (blurred) areas get boosted while fresh, disoccluded and border pixels get almost none. Aliasing is not re-introduced: the target never exceeds the raw image's own energy, sub-perceptual detail is ignored via a noise floor, and RCAS's contrast limiter and noise suppression only ever reduce the boost further. 1.0 = full perceptual parity with the raw image, 0 disables." },
+    sharpnessAuto,
+    { id: 'autoSharpen', type: 'numBool', default: 1.0, name: "Auto Sharpening", desc: "Selects how the Sharpness slider drives the final FSR RCAS pass. On: the slider is an auto-parity target -- each pixel's sharpening amount is derived from the measured acutance ratio between the raw and resolved images, restoring accumulated blur without ever exceeding the raw frame's sharpness. Off: the slider is a plain manual sharpening strength applied uniformly (also slightly cheaper -- the acutance measurement is skipped)." },
     { id: 'jitterScale', type: 'float', min: 0.0, max: 2.0, step: 0.01, default: 1.0, name: "Jitter Spread Scale", desc: "Scales the sub-pixel camera offset pattern. Above 1 samples a wider area within each pixel (more edge anti-aliasing, more temporal softening); below 1 tightens it." },
     { id: 'fallbackFXAA', type: 'numBool', default: 1.0, name: "Fallback Spatial AA (FXAA)", desc: "Applies FXAA edge smoothing to pixels whose temporal history was rejected, so disoccluded areas don't alias while the history rebuilds." }
   ]
@@ -161,39 +175,38 @@ const settingsSchema = [
     name: "History & Blending",
     items: [
       { id: 'feedbackMax', type: 'float', min: 0.0, max: 0.99, step: 0.01, default: 0.97, name: "History Blend (Static Scenes)", desc: "How much of the previous frame is reused for stationary pixels. Higher = smoother and cleaner but slower to react to changes; lower = more responsive but noisier. 0.97 corresponds to roughly a 33-frame accumulation window." },
-      { id: 'feedbackMin', type: 'float', min: 0.0, max: 0.99, step: 0.01, default: 0.97, name: "History Blend (Moving Pixels)", desc: "History reuse once pixel velocity exceeds the motion transition range below. Typically set at or below the static value so motion receives less smoothing. Note: while this equals the static weight, the motion and shadow feedback reductions are inert (the shader clamps them into this range); the Sub-Pixel Alignment Drop below is exempt -- it applies outside the clamp, on planar surfaces only." },
+      { id: 'feedbackMin', type: 'float', min: 0.0, max: 0.99, step: 0.01, default: 0.97, name: "History Blend (Moving Pixels)", desc: "History reuse once pixel velocity exceeds the motion transition range below. Typically set at or below the static value so motion receives less smoothing. While the two weights are equal the motion reduction is inert (the shader clamps it into this range); the Sub-Pixel Alignment Drop below is exempt -- it applies outside the clamp, on planar surfaces only." },
       { id: 'lumaDriftStrength', type: 'float', min: 0.0, max: 0.3, step: 0.01, default: 0.0, name: "Luma Drift Correction", desc: "Pulls history brightness toward the current image to clear ghost trails from moving shadows, exposure changes and vehicle lights, without reducing temporal smoothing. 0 = off. Only engages on large brightness mismatches on the same surface (see the chroma gate below), so it does not chase noise, jitter or ghosts. Higher values clear trails faster." },
       { id: 'lumaDriftChromaTol', type: 'float', min: 0.0, max: 0.5, step: 0.01, default: 0.1, name: "Drift Same-Surface Tolerance", desc: "Color-match tolerance for the luma drift correction, comparing color-per-brightness so that pure lighting changes (shadows, exposure) pass while a different surface does not. History from a differently-colored object (ghosts, reveal edges) fails this test and is left to the normal rejection paths -- drift only ever corrects brightness, never disguises color mismatches. Raise if legitimate shadows aren't being corrected; lower if colored ghosts linger. 0 requires an exact match (drift effectively off)." },
       { id: 'motionBlendStart', type: 'float', min: 0.0, max: 5.0, step: 0.01, default: 1.0, name: "Motion Transition Start", desc: "Pixel velocity (in pixels per frame) at which blending starts transitioning from the static to the motion weight. No effect while the two History Blend weights are equal." },
       { id: 'motionBlendDropSpeed', type: 'float', min: 1.0, max: 20.0, step: 0.1, default: 1.0, name: "Motion Transition End", desc: "Pixel velocity at which the blend reaches the motion weight fully. No effect while the two History Blend weights are equal." },
-      { id: 'alignmentFeedbackDrop', type: 'float', min: 0.0, max: 1.0, step: 0.01, default: 0.25, name: "Sub-Pixel Alignment Drop", desc: "Lowers history weight when the reprojected history sample lands between texels, where the resampling kernel is least accurate -- preserving texture sharpness in motion. Active only on planar surface interiors (the bilinear-motion path); edges and dilation zones are exempt because their current samples are aliased and dropping history there makes them flicker. Works independently of the History Blend weights. 0 disables. At 0.5, badly-phased pixels drop from a 33-frame to a ~2-frame accumulation window; the cost is a fixed texel-scale noise pattern on smooth noisy surfaces (sky gradients, shadow noise) in static scenes. Verify with debug mode 9 (red = applied drop, green = eligible); note that Lanczos 3 resampling already preserves most sub-texel detail, so the effect is most visible with Lanczos 3 off or sharpening at 0." }
+      { id: 'alignmentFeedbackDrop', type: 'float', min: 0.0, max: 1.0, step: 0.01, default: 0.25, name: "Sub-Pixel Alignment Drop", desc: "Lowers history weight when the reprojected history sample lands between texels, where the resampling kernel is least accurate -- preserving texture sharpness in motion. Active only on planar surface interiors (the bilinear-motion path); edges and dilation zones are exempt because their current samples are aliased and dropping history there makes them flicker. Works independently of the History Blend weights. 0 disables. At 0.5, badly-phased pixels drop from a 33-frame to a ~2-frame accumulation window; the cost is a fixed texel-scale noise pattern on smooth noisy surfaces (sky gradients, shadow noise) in static scenes. Verify with debug mode 10 (red = applied drop, green = eligible); note that the Kaiser-6 resampler already preserves most sub-texel detail, so the effect is most visible with Kaiser-6 off or sharpening at 0." }
     ]
-  },
+},
 {
   name: "Jitter & Sampling",
   items: [
     { id: 'useJitter', type: 'bool', default: true, name: "Sub-Pixel Camera Jitter", desc: "Offsets the camera by a sub-pixel amount each frame so successive frames sample different positions within each pixel. This is the source of TAA's supersampling -- without it, TAA only stabilizes noise, it does not anti-alias." },
     { id: 'useR2Jitter', type: 'bool', default: true, name: "R2 Jitter Sequence", desc: "Uses the R2 low-discrepancy sequence instead of Halton(2,3) for the jitter pattern. R2 spreads samples more evenly across its 32-frame cycle." },
-    { id: 'useSlepian3', type: 'numBool', default: 1.0, name: "Slepian 3 History Resampling", desc: "21-tap Slepian (DPSS-windowed) resampling of the history buffer. Retains noticeably more detail in motion than the 9-tap Slepian-2 fallback (the two differ only for moving pixels), at over twice the sampling cost." },
-    { id: 'historyOvershoot', type: 'float', min: 0.0, max: 1.0, step: 0.01, default: 1.0, name: "History Resampling Overshoot Margin", desc: "Soft anti-ringing margin for history resampling, shared by both Slepian paths and applied equally to brightness and color, as a fraction of the local color range. Band-limited overshoot -- the edge detail the filter reconstructs -- survives, while ringing and color fringing are compressed. Higher = sharper history, lower = fewer halos." },
-    { id: 'useDepthDilation', type: 'numBool', default: 1.0, name: "Depth-Dilated Motion Search", desc: "Searches the 3x3 neighborhood for the closest surface and uses its motion vector, so silhouette edges reproject with the foreground's motion instead of the background's. The resolved per-pixel motion, depth and layer classification are stored in a dedicated buffer each frame and become the authoritative data the next frame's disocclusion and history-validation tests read at the reprojection landing." }
+    { id: 'useKaiser6', type: 'numBool', default: 1.0, name: "Kaiser-6 History Resampling", desc: "21-tap Kaiser-windowed sinc resampling of the history buffer. Retains noticeably more detail in motion than the 9-tap Kaiser-4 fallback (the two differ only for moving pixels), at over twice the sampling cost." },
+    { id: 'historyOvershoot', type: 'float', min: 0.0, max: 1.0, step: 0.01, default: 1.0, name: "History Resampling Overshoot Margin", desc: "Soft anti-ringing margin for history resampling, shared by both Kaiser paths and applied equally to brightness and color, as a fraction of the local color range. Band-limited overshoot -- the edge detail the filter reconstructs -- survives, while ringing and color fringing are compressed. Higher = sharper history, lower = fewer halos." },
+    { id: 'useDepthDilation', type: 'numBool', default: 1.0, name: "Depth-Dilated Motion Search", desc: "Searches the 3x3 neighborhood for the closest surface and uses its motion vector, so silhouette edges reproject with the foreground's motion instead of the background's. The resolved per-pixel motion, depth and layer classification are stored in the motion field each frame and become the authoritative data the next frame's disocclusion and history-validation tests read at the reprojection landing. With Motion-Field Validation disabled, dilation runs unvalidated." }
   ]
 },
   {
     name: "Variance Clipping",
     items: [
-      { id: 'useKDopClipping', type: 'numBool', default: 1.0, name: "k-DOP History Clipping", desc: "Clips history against a 16-direction convex hull of the neighborhood colors instead of a simple bounding box. A tighter bound on valid history at higher cost." },
-      { id: 'kdopVarianceClipping', type: 'numBool', default: 0.0, name: "k-DOP Variance Extents", desc: "Builds the k-DOP bounds from statistical variance instead of the absolute min/max of the neighborhood -- more forgiving of single outlier samples." },
-      { id: 'useCovarianceClipping', type: 'numBool', default: 0.0, name: "Covariance Clipping (Ellipsoid)", desc: "Clips history against an ellipsoid fit of the neighborhood color distribution. Only active when k-DOP clipping is disabled -- the k-DOP path supersedes it." },
+      { id: 'useHullClipping', type: 'numBool', default: 1.0, name: "Exact Convex Hull Clipping", desc: "Clips the history color to the EXACT convex hull of the 3x3 neighborhood samples along the reprojection ray, via a small per-pixel simplex with a CHECKED exactness certificate: when it converges (green in debug mode 11 -- the common case) the clip point is the true hull boundary, tighter than any fixed-axis bounding volume; when it does not converge it falls back to a guaranteed-safe loose bound, so it can never clip history that is still inside the hull. Slightly more aggressive than the old k-DOP (which was always a bit loose) -- if ghosts give way to flicker on noisy content, raise Clip Overshoot Margin a notch. Disable for the plain mean/variance box." },
       { id: 'colorSpaceOklab', type: 'numBool', default: 1.0, name: "Oklab Clipping Color Space", desc: "Performs history clipping in Oklab (perceptually uniform) instead of YCoCg. Slightly higher GPU cost." },
       { id: 'varianceGamma', type: 'float', min: 0.0, max: 3.0, step: 0.01, default: 1.50, name: "Variance Box Scale", desc: "Scales the size of the color bounds that clamp history. Higher = looser clamp (history survives more, with more smear potential); lower = tighter (sharper, but more history rejection)." },
       { id: 'chromaVarianceMod', type: 'float', min: 0.5, max: 2.0, step: 0.01, default: 1.0, name: "Chroma Bounds Scale", desc: "Independent multiplier for the color (non-brightness) axes of the variance bounds." },
       { id: 'softClip', type: 'float', min: 0.0, max: 1.0, step: 0.01, default: 0.0, name: "Soft Clip Strength", desc: "Eases history into the variance bounds instead of snapping hard, in near-static scenes. Reduces clipping 'popping' at the cost of a slight ghost linger; fades out with motion." },
-      { id: 'clipOvershoot', type: 'float', min: 0.0, max: 0.5, step: 0.01, default: 0.0, name: "Clip Overshoot Margin", desc: "Lets accumulated history exceed the neighborhood color bounds by this fraction of the local color range. The resampling kernel's negative lobes reconstruct edges steeper than any single frame's samples; a strict per-frame bound flattens that reconstruction. With a margin, frame-consistent edge overshoot accumulates (sharper edges over multiple reprojections) while frame-inconsistent ringing averages away -- at the cost of some visible ringing on thin high-contrast geometry. On the k-DOP path this margin plus the hull is the entire color bound (there is no outer safety clamp). Raise if fine detail looks soft; lower if edges halo, crawl, or ghosts linger. If ghost trails lengthen, enable Smear Rejection under Advanced Rejection." }
+      { id: 'clipOvershoot', type: 'float', min: 0.0, max: 0.5, step: 0.01, default: 0.0, name: "Clip Overshoot Margin", desc: "Lets accumulated history exceed the neighborhood color bounds by this fraction of the local color range. The resampling kernel's negative lobes reconstruct edges steeper than any single frame's samples; a strict per-frame bound flattens that reconstruction. With a margin, frame-consistent edge overshoot accumulates (sharper edges over multiple reprojections) while frame-inconsistent ringing averages away -- at the cost of some visible ringing on thin high-contrast geometry. On the k-DOP path this margin plus the hull is the entire color bound (there is no outer safety clamp). Raise if fine detail looks soft; lower if edges halo, crawl, or ghosts linger. If ghost trails lengthen, enable Smear Rejection under Advanced Rejection." },
+      { id: 'fireflyClamp', type: 'float', min: 1.0, max: 10.0, step: 0.1, default: 4.0, name: "Firefly Clamp", desc: "Clamps the variance bounds against extreme bright outliers, in standard deviations of the neighborhood. Lower = tighter (fewer fireflies, more clipping of legitimate highlights)." }
     ]
   },
   {
-    name: "Motion & Anti-Flicker",
+    name: "Motion & Anti-flicker",
     items: [
       { id: 'jitterFlickerPadding', type: 'float', min: 0.0, max: 1.0, step: 0.01, default: 0.0, name: "Jitter Anti-Flicker Padding", desc: "Expands the variance bounds in proportion to the current sub-pixel jitter offset, so valid history isn't clipped away purely because of jitter phase. Reduces shimmer in fine detail." },
       { id: 'directionalVariance', type: 'numBool', default: 1.0, name: "Directional Padding", desc: "Expands the bounds along the color direction of the expected jitter shift rather than uniformly. Only active when Jitter Anti-Flicker Padding is above zero." },
@@ -204,27 +217,16 @@ const settingsSchema = [
     ]
   },
   {
-    name: "Shadows & SSAO Mitigation",
-    items: [
-      { id: 'shadowMitigation', type: 'numBool', default: 0.0, name: "Shadow & SSAO Flicker Mitigation", desc: "Detects flickering shadows and ambient occlusion and reduces their history weight so they settle faster, at the cost of some temporal smoothing in dark areas. Note: Luma Drift Correction (History & Blending) clears stuck shadows without that trade -- try it first." },
-      { id: 'shadowDarknessThreshold', type: 'float', min: 0.05, max: 0.8, step: 0.01, default: 0.25, name: "Shadow Detection Threshold", desc: "Brightness below this is treated as shadow for mitigation purposes." },
-      { id: 'shadowBlendStrength', type: 'float', min: 0.5, max: 0.99, step: 0.01, default: 0.95, name: "Shadow History Weight", desc: "History weight applied inside detected unstable shadows. Lower = shadows respond faster to change but flicker more." },
-      { id: 'shadowTemporalMult', type: 'float', min: 1.0, max: 20.0, step: 0.1, default: 10.0, name: "Shadow Temporal Risk Mult", desc: "Sensitivity of the temporal brightness-change test that flags unstable shadows." },
-      { id: 'shadowSpatialMult', type: 'float', min: 1.0, max: 20.0, step: 0.1, default: 5.0, name: "Shadow Spatial Safety Mult", desc: "How strongly spatial texture suppresses shadow mitigation -- textured dark areas are left alone." },
-      { id: 'shadowVarianceBase', type: 'float', min: 0.0, max: 2.0, step: 0.01, default: 0.2, name: "Shadow Variance Floor", desc: "Minimum variance scale forced inside unstable shadows, loosening the clamp so dark detail isn't crushed." }
-    ]
-  },
-  {
     name: "Advanced Rejection",
     items: [
-      { id: 'depthRejection', type: 'float', min: 0.0, max: 1.0, step: 0.001, default: 0.05, name: "Disocclusion Sensitivity (Depth)", desc: "Threshold of the geometry-based disocclusion test: how much closer than the kappa-corrected transported surface the history depth must be before it is rejected as stale. Lower = more sensitive. 0 disables depth rejection entirely (the velocity test then runs standalone)." },
-      { id: 'velRejection', type: 'float', min: 0.0, max: 10.0, step: 0.1, default: 5.0, name: "Disocclusion Threshold (Velocity)", desc: "Pixel threshold of the velocity disocclusion test. History whose recorded surface motion no longer matches the current pixel is flagged, then confirmed by pursuing that surface into the current frame -- only a confirmed divergence rejects, so motion-vector noise alone cannot. 0 disables. Lower catches subtler ghosts behind accelerating occluders; too low speckles static scenes. The comparison is exactly de-jittered, so values down to ~0.5 are viable; 1.5 is conservative. Tune with debug modes 2 (green should appear only on true reveals) and 7. Known limitation: on fast-moving or rotating foregrounds, pixels in the object's edge dilation zone can trigger occasional random rejections (point-sampled motion of a fast layer); if that bothers you, raise Velocity Noise Allowance or lower Pursuit Confirmation Strength." },
+      { id: 'useMotionField', type: 'numBool', default: 1.0, name: "Motion-Field Validation", desc: "Runs the extra motion-field pass (a fullscreen write storing each texel's resolved motion, depth and layer state) and uses last frame's field in the resolve to validate depth-dilated motion, gate history ownership, and run the depth and velocity disocclusion tests below. Disabling removes that pass plus all landing-side analysis in the resolve -- a large fraction of the total TAA cost -- at the price of disocclusion being detected only through color clipping (more ghosting behind moving objects and at reveals). The Performance preset disables this." },
+      { id: 'depthRejection', type: 'float', min: 0.0, max: 1.0, step: 0.001, default: 0.05, name: "Disocclusion Sensitivity (Depth)", desc: "Threshold of the geometry-based depth disocclusion test: how much closer than the current surface transported one frame forward (exact under camera rotation; the layer's forward motion is fitted per surface from the neighborhood's measured parallax) the history depth must be before it is rejected as stale. Lower = more sensitive. 0 disables the depth test (the velocity test then runs standalone). Requires Motion-Field Validation." },
+      { id: 'velRejection', type: 'float', min: 0.0, max: 10.0, step: 0.1, default: 5.0, name: "Disocclusion Threshold (Velocity)", desc: "Pixel threshold of the velocity disocclusion test. History whose recorded surface motion no longer matches the current pixel is flagged, then confirmed by pursuing that surface into the current frame -- only a confirmed divergence rejects, so motion-vector noise alone cannot. 0 disables. Lower catches subtler ghosts behind accelerating occluders; too low speckles static scenes. The comparison is exactly de-jittered, so values down to ~0.5 are viable; 1.5 is conservative. Tune with debug modes 2 (green should appear only on true reveals) and 7. Known limitation: on fast-moving or rotating foregrounds, pixels in the object's edge dilation zone can trigger occasional random rejections (point-sampled motion of a fast layer); if that bothers you, raise Velocity Noise Allowance or lower Pursuit Confirmation Strength. Requires Motion-Field Validation." },
       { id: 'velGradientScale', type: 'float', min: 0.0, max: 4.0, step: 0.05, default: 1.0, name: "Velocity Noise Allowance", desc: "Scales the velocity-coherent noise allowance of the disocclusion alert (how much neighboring motion-vector variation is treated as noise rather than signal). Raise if noisy velocity content -- vegetation, particles, alpha-tested edges, or fast-foreground edge dilation zones -- causes speckled alerts in debug mode 2; lower for a stricter alert." },
       { id: 'crossTestStrength', type: 'float', min: 0.0, max: 1.0, step: 0.05, default: 0.35, name: "Pursuit Confirmation Strength", desc: "How strongly the current-frame pursuit must confirm a flagged velocity mismatch before history is actually rejected (scales the measured divergence against its tolerance). Higher = more velocity rejections; lower makes the pursuit stricter about confirming, which also suppresses the dilation-zone false positives on fast foregrounds. 0.35 is conservative; 0.6-1.0 is reasonable once verified against debug modes 2 and 7." },
       { id: 'clipDistanceRejectionEnabled', type: 'numBool', default: 1.0, name: "Smear Rejection", desc: "Drops history weight where the clip hull had to move the history a long way -- a ghosting indicator for content without motion vectors (animated textures, particles)." },
       { id: 'clipDistanceRejectionAmount', type: 'float', min: 0.0, max: 1.0, step: 0.001, default: 0.0, name: "Smear Rejection Tolerance", desc: "How far the clip distance must exceed the minimum error before history is fully rejected." },
-      { id: 'clipDistanceRejectionMinError', type: 'float', min: 0.001, max: 0.5, step: 0.001, default: 0.15, name: "Smear Rejection Min Error", desc: "Minimum clip distance before smear rejection begins to engage." },
-      { id: 'fireflyClamp', type: 'float', min: 1.0, max: 10.0, step: 0.1, default: 4.0, name: "Firefly Clamp", desc: "Clamps the variance bounds against extreme bright outliers, in standard deviations of the neighborhood. Lower = tighter (fewer fireflies, more clipping of legitimate highlights)." }
+      { id: 'clipDistanceRejectionMinError', type: 'float', min: 0.001, max: 0.5, step: 0.001, default: 0.15, name: "Smear Rejection Min Error", desc: "Minimum clip distance before smear rejection begins to engage." }
     ]
   },
   {
@@ -235,7 +237,7 @@ const settingsSchema = [
         type: 'select', 
         default: 0.0, 
         name: "Debug View Mode", 
-        desc: "Visualizes internal buffers and rejection masks (the final sharpen pass is bypassed in every mode except 0).\n\n1: Frame Motion -- reprojection motion per pixel.\n2: Disocclusion Breakdown -- red = depth rejection, green = velocity rejection, yellow = both, faint blue = velocity error flagged but pursuit did NOT confirm (suppressed alert).\n3: Center Velocity -- current-frame motion vector magnitude.\n4: Linearized Depth -- normalized 0-100 m.\n5: History Color -- resampled history before clipping.\n6: History-Side Velocity -- effective previous-frame velocity at the history landing.\n7: Pursuit Divergence -- red intensity = divergence magnitude, green = confirmed rejection.\n8: Depth Edge State -- red = dilation zone (background behind a crest), cyan = foreground crest, dark = continuous surface.\n9: Alignment-Drop Activity -- red intensity = the sub-pixel feedback drop actually applied, green tint = planar (eligible) pixels, blue tint = edges / dilation zones (exempt).",
+        desc: "Visualizes internal buffers and rejection masks (the final sharpen pass is bypassed in every mode except 0).\n\n1: Frame Motion -- reprojection motion per pixel.\n2: Disocclusion Breakdown -- red = depth rejection, green = velocity rejection, yellow = both, faint blue = velocity error flagged but pursuit did NOT confirm (suppressed alert).\n3: Center Velocity -- current-frame motion vector magnitude.\n4: Linearized Depth -- normalized 0-100 m.\n5: History Color -- resampled history before clipping.\n6: History-Side Velocity -- effective previous-frame velocity at the history landing.\n7: Pursuit Divergence -- red intensity = divergence magnitude, green = confirmed rejection.\n8: Layer State -- orange = revoked dilation candidate, red = kept dilation zone, cyan = crest, magenta = depth-flat but velocity-straddled.\n9: Dilation Gate -- red = revoked candidate, green = kept (full = flag branch, half = depth branch), blue = depth-rejected.\n10: Alignment Drop -- red intensity = the sub-pixel feedback drop actually applied, green tint = planar (eligible) pixels, blue tint = edges / dilation zones (exempt).\n12: Dejittered Residual -- jitter-cancel verification; must be near black on static scenes.",
         options: [
           { label: 'Off (Normal Rendering)', value: 0.0 },
           { label: '1 - Frame Motion', value: 1.0 },
@@ -245,12 +247,11 @@ const settingsSchema = [
           { label: '5 - History Color', value: 5.0 },
           { label: '6 - History-Side Velocity', value: 6.0 },
           { label: '7 - Pursuit Divergence', value: 7.0 },
-          { label: '8 - Depth Edge State', value: 8.0 },
-          { label: '9 - Alignment-Drop Activity', value: 9.0 },
-          { label: '10 - disocclusion 2', value: 10.0 },
-          { label: '11 - disocclusion 3', value: 11.0 },
-          { label: '12 - ujittered vel', value: 12.0 },
-          { label: '13 - ujittered vel', value: 13.0 }
+          { label: '8 - Layer State', value: 8.0 },
+          { label: '9 - Dilation Gate', value: 9.0 },
+          { label: '10 - Alignment Drop', value: 10.0 },
+          { label: '11 - Hull Clipper State', value: 11.0 },
+          { label: '12 - Dejittered Residual', value: 12.0 }
         ]
       }
     ]
@@ -263,10 +264,19 @@ settingsSchema.forEach(cat => {
 })
 
 const presets = {
-  Performance: { feedbackMax: 0.95, feedbackMin: 0.95, useSlepian3: 0, useKDopClipping: 0, colorSpaceOklab: 0 },
-  Balanced: { useKDopClipping: 0, colorSpaceOklab: 0}, 
+  Performance: { feedbackMax: 0.95, feedbackMin: 0.95, useKaiser6: 0, useKDopClipping: 0, colorSpaceOklab: 0, useMotionField: 0 },
+  Balanced: { useKDopClipping: 0, colorSpaceOklab: 0 }, 
   Clarity: { feedbackMax: 0.95, feedbackMin: 0.95, },
   Smooth: { }
+}
+
+// Per-item display override: the sharpness row follows the auto-sharpen toggle.
+function displayItem(item) {
+  if (item && item.id === 'sharpness') {
+    const auto = config.value.autoSharpen === 1 || config.value.autoSharpen === true
+    return auto ? sharpnessAuto : sharpnessManual
+  }
+  return item
 }
 
 function toLuaValue(val) {

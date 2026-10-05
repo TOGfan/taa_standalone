@@ -4,6 +4,7 @@
 uniform_sampler2D(taaResultTex, 0);
 
 cbuffer perDraw {
+    float taaAutoSharpen;
     float taaSharpness;
     float taaDebugMode;
 
@@ -27,14 +28,13 @@ cbuffer perDraw {
 // FsrRcasF, and the SRTM reversible tonemapper. EASU / LFGA / TEPD and all
 // 16-bit variants are omitted.
 //
-// Deviations from upstream (all OUTSIDE the algorithm bodies, which are
+// Integration notes (all OUTSIDE the algorithm bodies, which are
 // line-for-line):
 //   * ffx_a.h's 32-bit HLSL macro layer is reproduced inline below (the
 //     header itself is not part of this engine's shader tree).
 //   * 'varAF2(name)=initAF2(a,b)' (a CPU-compilation helper) is written as a
 //     plain constructor in FsrRcasCon.
-//   * FSR_RCAS_DENOISE is enabled (matches this mod's previous behavior of
-//     always applying the noise-limiting term).
+//   * FSR_RCAS_DENOISE is enabled (always apply the noise-limiting term).
 //   * The calling-shader callbacks (FsrRcasLoadF / FsrRcasInputF) implement
 //     this engine's point-sampled fetch and the HDR input transform: RCAS
 //     expects {0 to 1} input, the resolve output is linear HDR, so the input
@@ -94,16 +94,8 @@ cbuffer perDraw {
 #define FSR_RCAS_F 1
 #define FSR_RCAS_DENOISE 1
 
-// ============================================================================
-//                                                      CONSTANT SETUP
-// ============================================================================
 // This is set at the limit of providing unnatural results for sharpening.
 #define FSR_RCAS_LIMIT (0.25-(1.0/16.0))
-////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-//_____________________________________________________________/\_______________________________________________________________
-//==============================================================================================================================
-//                                                      CONSTANT SETUP
 //==============================================================================================================================
 // Call to setup required constant values (works on CPU or GPU).
 A_STATIC void FsrRcasCon(
@@ -117,11 +109,6 @@ AF1 sharpness){
  con[1]=AU1_AH2_AF2(hSharp);
  con[2]=0;
  con[3]=0;}
-////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-//_____________________________________________________________/\_______________________________________________________________
-//==============================================================================================================================
-//                                                   NON-PACKED 32-BIT VERSION
 //==============================================================================================================================
 #if defined(A_GPU)&&defined(FSR_RCAS_F)
  // Input callback prototypes that need to be implemented by calling shader
@@ -215,11 +202,6 @@ AF1 sharpness){
   pixB=(lobe*bB+lobe*dB+lobe*hB+lobe*fB+eB)*rcpL;
   return;} 
 #endif
-////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-//_____________________________________________________________/\_______________________________________________________________
 //==============================================================================================================================
 //
 //                                          FSR - [SRTM] SIMPLE REVERSIBLE TONE-MAPPER
@@ -262,7 +244,7 @@ void FsrRcasInputF(inout AF1 r, inout AF1 g, inout AF1 b)
     r = c.r; g = c.g; b = c.b;
 }
 // ============================================================================
-// AUTO-PARITY SHARPENING METRIC
+// ACUTANCE METRIC
 // ----------------------------------------------------------------------------
 // FSR SRTM + RCAS luma (x2), matching exactly how the resolve pass computed
 // the raw-scene acutance energy it shipped in taaResultTex.a.
@@ -275,7 +257,41 @@ AF1 SharpLuma(AF3 rgb)
 }
 
 // ============================================================================
-// MAIN PASS
+// AUTO-PARITY / MANUAL SHARPENING
+// ----------------------------------------------------------------------------
+// taaAutoSharpen selects the mode; taaSharpness is the mode's amount in
+// [0, 1] (0 disables either mode):
+//   * AUTO (default): taaSharpness is the PARITY TARGET fraction -- 1.0
+//     restores the raw frame's local sharpness.
+//
+//     The resolve pass ships the raw scene's local acutance energy (squared
+//     cross high-pass of RCAS-luma over SRTM'd taps) in alpha. The same
+//     energy is measured on the resolved image from RCAS's own five cross
+//     taps (identical loads and UV math as FsrRcasF below, so the compiler
+//     can merge them -- zero extra fetches).
+//
+//     RCAS is a negative-lobe unsharp mask with 1D band response
+//         H(w) = (1 - 2L(1 + cos w)) / (1 - 4L),   L = |lobe| in [0, LIMIT]
+//     The cross-Laplacian energy of natural image detail concentrates around
+//     w_ref = 3*pi/4 (0.375 cycles/pixel). Demanding energy parity at the
+//     reference band,
+//         E_resolved * H(w_ref)^2 = amount * E_raw
+//     gives the required band gain R = sqrt(amount * E_raw / E_resolved)
+//     (both energies floored at kSharpEnergyFloor), and inverting
+//     H(w_ref) = R yields the lobe:
+//         L = (R - 1) / (4R - 2(1 + cos w_ref))
+//     evaluated in sign-safe form: R <= 1 gives L = 0, and the denominator
+//     is floored positive so an energy inversion cannot flip the lobe to
+//     its maximum.
+//
+//     Aliasing is not re-introduced: R <= 1 gives L = 0 (never sharper than
+//     raw), the noise floor ignores sub-perceptual energy, and RCAS's
+//     contrast limiter (hitMin/hitMax) and noise suppression (nz) only ever
+//     REDUCE the lobe further. The system is self-regulating: freshly reset
+//     or disoccluded pixels have E_resolved ~= E_raw -> no boost; only
+//     genuinely accumulated (blurred) pixels get sharpened.
+//   * MANUAL: taaSharpness is a fixed RCAS strength (1 = the maximum lobe
+//     RCAS permits); the acutance measurement is skipped entirely.
 // ============================================================================
 
 // Perceptual noise floor for the acutance energies (SRTM-luma^2 units):
@@ -294,78 +310,64 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
         return float4(max(0.0, tex2Dlod(taaResultTex, float4(IN.uv0, 0.0, 0.0)).rgb), 1.0);
     }
 
-    // taaSharpness is now the PARITY TARGET fraction: 1.0 = restore the raw
-    // frame's local sharpness, 0 disables.
-    AF1 parity = AF1_(saturate(taaSharpness));
-    if (parity <= AF1_(0.001)) {
+    AF1 amount = AF1_(saturate(taaSharpness));
+    if (amount <= AF1_(0.001)) {
         return float4(max(0.0, tex2Dlod(taaResultTex, float4(IN.uv0, 0.0, 0.0)).rgb), 1.0);
     }
 
-    // ------------------------------------------------------------------
-    // Auto-parity sharpness: closed-form RCAS lobe from the measured
-    // acutance ratio between the raw scene and the resolved image.
-    //
-    // The resolve pass ships the raw scene's local acutance energy (squared
-    // cross high-pass of RCAS-luma over SRTM'd taps) in alpha. Measure the
-    // same energy on the resolved image from RCAS's own five cross taps
-    // (identical loads and UV math as FsrRcasF below, so the compiler can
-    // merge them -- zero extra fetches).
-    //
-    // RCAS is a negative-lobe unsharp mask with 1D band response
-    //     H(w) = (1 - 2L(1 + cos w)) / (1 - 4L),   L = |lobe| in [0, LIMIT]
-    // The cross-Laplacian energy of natural image detail concentrates around
-    // w_ref = 3*pi/4 (0.375 cycles/pixel). Demanding energy parity at the
-    // reference band,
-    //     E_resolved * H(w_ref)^2 = parity * E_raw
-    // gives the required band gain R = sqrt(parity * E_raw / E_resolved)
-    // (both energies floored at kSharpEnergyFloor), and inverting
-    // H(w_ref) = R yields the lobe:
-    //     L = (R - 1) / (4R - 2(1 + cos w_ref))
-    //
-    // Aliasing is not re-introduced: R <= 1 gives L = 0 (never sharper than
-    // raw), the noise floor ignores sub-perceptual energy, and RCAS's
-    // contrast limiter (hitMin/hitMax) and noise suppression (nz) only ever
-    // REDUCE the lobe further. The system is self-regulating: freshly reset
-    // or disoccluded pixels have E_resolved ~= E_raw -> no boost; only
-    // genuinely accumulated (blurred) pixels get sharpened.
-    // ------------------------------------------------------------------
     ASU2 ip = ASU2(IN.uv0 / oneOverTargetSize);
-
     AF4 tE = FsrRcasLoadF(ip);
-    AF4 tB = FsrRcasLoadF(ip + ASU2( 0,-1));
-    AF4 tD = FsrRcasLoadF(ip + ASU2(-1, 0));
-    AF4 tF = FsrRcasLoadF(ip + ASU2( 1, 0));
-    AF4 tH = FsrRcasLoadF(ip + ASU2( 0, 1));
 
-    AF1 lB = SharpLuma(tB.rgb);
-    AF1 lD = SharpLuma(tD.rgb);
-    AF1 lE = SharpLuma(tE.rgb);
-    AF1 lF = SharpLuma(tF.rgb);
-    AF1 lH = SharpLuma(tH.rgb);
+    AF1 strength;
+    if (taaAutoSharpen > 0.5)
+    {
+        AF4 tB = FsrRcasLoadF(ip + ASU2( 0,-1));
+        AF4 tD = FsrRcasLoadF(ip + ASU2(-1, 0));
+        AF4 tF = FsrRcasLoadF(ip + ASU2( 1, 0));
+        AF4 tH = FsrRcasLoadF(ip + ASU2( 0, 1));
 
-    // Resolved-image acutance energy (same metric the resolve ran on raw).
-    AF1 highPass      = lE - AF1_(0.25) * (lB + lD + lF + lH);
-    AF1 energyResolved = highPass * highPass;
+        AF1 lB = SharpLuma(tB.rgb);
+        AF1 lD = SharpLuma(tD.rgb);
+        AF1 lE = SharpLuma(tE.rgb);
+        AF1 lF = SharpLuma(tF.rgb);
+        AF1 lH = SharpLuma(tH.rgb);
 
-    // Raw-scene acutance energy, cross-averaged for stability. abs() decodes
-    // the metric from the sign-encoded alpha (negative = the resolve revoked
-    // that pixel's dilation; the magnitude is the metric).
-    AF1 energyRaw = AF1_(0.2) * (abs(tE.a) + abs(tB.a) + abs(tD.a) + abs(tF.a) + abs(tH.a));
+        // Resolved-image acutance energy (same metric the resolve ran on raw).
+        AF1 highPass       = lE - AF1_(0.25) * (lB + lD + lF + lH);
+        AF1 energyResolved = highPass * highPass;
 
-    AF1 bandGain = sqrt((parity * energyRaw + kSharpEnergyFloor) /
-                        (energyResolved + kSharpEnergyFloor));
+        // Raw-scene acutance energy, cross-averaged for stability. abs()
+        // decodes the metric from the sign-encoded alpha (negative = the
+        // resolve revoked that pixel's dilation; the magnitude is the
+        // metric).
+        AF1 energyRaw = AF1_(0.2) * (abs(tE.a) + abs(tB.a) + abs(tD.a) + abs(tF.a) + abs(tH.a));
 
-    AF1 lobe = (bandGain - AF1_(1.0)) / (AF1_(4.0) * bandGain - kSharpRefFreqTerm);
-    lobe = clamp(lobe, AF1_(0.0), AF1_(FSR_RCAS_LIMIT));
+        AF1 bandGain = sqrt((amount * energyRaw + kSharpEnergyFloor) /
+                            (energyResolved + kSharpEnergyFloor));
 
-    // Map onto FsrRcasCon's strength domain {0..1}: con.x = exp2(-stops) =
-    // strength, so the RCAS-internal limiter scales the derived lobe down
-    // from exactly the parity-derived value (never up).
-    AF1 strength = lobe * (AF1_(1.0) / AF1_(FSR_RCAS_LIMIT));
-    if (strength <= AF1_(0.001)) {
-        return float4(max(0.0, tex2Dlod(taaResultTex, float4(IN.uv0, 0.0, 0.0)).rgb), 1.0);
+        // Sign-safe inversion of H(w_ref) = bandGain: the numerator floors
+        // at 0 (never sharpen past parity) and the denominator is floored
+        // positive, so an energy inversion -- the resolved image carrying
+        // MORE acutance than the raw (FXAA-added edge energy on rejected
+        // pixels, noise) -- yields lobe = 0 instead of the sign-flipped
+        // RCAS maximum. The denominator floor never engages in the valid
+        // bandGain > 1 regime, so the derivation there is exact.
+        AF1 lobe = max(bandGain - AF1_(1.0), AF1_(0.0)) /
+                   max(AF1_(4.0) * bandGain - kSharpRefFreqTerm, AF1_(1e-4));
+        strength = clamp(lobe, AF1_(0.0), AF1_(FSR_RCAS_LIMIT)) * (AF1_(1.0) / AF1_(FSR_RCAS_LIMIT));
+    }
+    else
+    {
+        // MANUAL: the slider IS the RCAS strength.
+        strength = amount;
     }
 
+    if (strength <= AF1_(0.001)) {
+        return float4(max(tE.rgb, AF3_(0.0)), 1.0);
+    }
+
+    // con.x = exp2(-stops) = strength: the RCAS-internal limiter scales the
+    // lobe down from the requested value (never up).
     AF1 stops = -log2(max(strength, AF1_(1.0 / 1024.0)));
 
     AU4 con;

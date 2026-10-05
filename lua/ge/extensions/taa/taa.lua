@@ -1,6 +1,6 @@
 local M = {}
 
-local MOD_VERSION = "1.12"
+local MOD_VERSION = "1.13"
 local settingsPath = "settings/taa_standalone.json"
 local active = true
 local pfx = nil
@@ -31,6 +31,10 @@ local lastCanvasW, lastCanvasH = 0, 0
 -- mid-rebuild): persisted immediately, applied on the next ensureChain(), and
 -- surfaced by requestUIState().
 local pendingSettings = nil
+
+-- Set when a settings-file version change reset the settings to defaults;
+-- start() persists the full defaults back to the file once the chain is live.
+local settingsResetPending = false
 
 local hookedCam = nil
 local hookStamp, seenStamp = 0, 0
@@ -240,20 +244,19 @@ local function loadState()
         if savedData.active ~= nil then active = savedData.active end
 
         if savedData.version ~= MOD_VERSION then
+            -- Settings saved by an older version may reference constants or
+            -- semantics that no longer exist: reset to the current defaults
+            -- instead of migrating. The enabled/disabled state is kept.
+            -- The settings key is dropped from the file here (so the next
+            -- ensureChain() loads pure defaults); start() persists the full
+            -- defaults once the chain is live. A chain already running
+            -- mid-session is reset through pfx.resetSettings().
             clearShaderCache()
-            -- Legacy migration (pre-1.11 files): the alignment drop default
-            -- moved 0.25 -> 0.5 once it was actually reachable. Only migrate
-            -- untouched defaults (0.25 from 1.10, 0.9 from the inert era);
-            -- keep user tuning.
-            if type(savedData.settings) == "table" then
-                local v = tonumber(savedData.settings.alignmentFeedbackDrop)
-                if v and (math.abs(v - 0.25) < 1e-4 or math.abs(v - 0.9) < 1e-4) then
-                    savedData.settings.alignmentFeedbackDrop = 0.5
-                end
-            end
-            savedData.version = MOD_VERSION
-            savedData.active = active
-            jsonWriteFile(settingsPath, savedData, true)
+            pendingSettings = nil
+            settingsResetPending = true
+            if pfx and pfx.resetSettings then pfx.resetSettings() end
+            jsonWriteFile(settingsPath, { version = MOD_VERSION, active = active }, true)
+            log("I", "TAA", "Settings reset to defaults (file version " .. tostring(savedData.version) .. " -> " .. MOD_VERSION .. ")")
         end
     else
         clearShaderCache()
@@ -304,6 +307,13 @@ local function start()
     suppressGameAA()
     active = true
     hookCamera()
+
+    -- After a version-change reset the settings file has no settings key;
+    -- persist the live (default) settings so the file is complete again.
+    if settingsResetPending then
+        settingsResetPending = false
+        saveState()
+    end
     return true
 end
 

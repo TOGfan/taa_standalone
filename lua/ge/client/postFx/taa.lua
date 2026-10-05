@@ -53,13 +53,9 @@ end
 -- BASIS DIRECTION CONTRACT (must match the shaders):
 --   This engine applies the camera jitter OPPOSITE to basis()'s rotation
 --   convention: basis(-angles) models the ACTUAL rendered frame, basis(+angles)
---   models the mirrored frame. Verified empirically: the original build
---   (current basis +angles / previous basis -angles) produced an exact
---   reprojection -- the -angles previous basis was the TRUE previous frame,
---   and the snap hid the current basis' mirroring for sampling. Both bases
---   are therefore built with NEGATED angles so the shaders receive the true
---   per-frame maps (the shaders compute inverses themselves and are
---   convention-agnostic otherwise).
+--   models the mirrored frame. Both bases are therefore built with NEGATED
+--   angles so the shaders receive the true per-frame maps (the shaders compute
+--   inverses themselves and are convention-agnostic otherwise).
 --
 -- prev2Yaw/prev2Pitch are likewise passed NEGATED: RotationFlowUV uses the
 --   same (mirrored) convention as basis(), so -angles yields the true t-2
@@ -91,7 +87,6 @@ function M.setFrameState(tanX, tanY, yaw, pitch, prevYaw, prevPitch, prev2Yaw, p
         }
     end
 
-    -- FIX: both bases NEGATED = the TRUE frames in this engine.
     local cur = basis(-(yaw or 0.0), -(pitch or 0.0))
     local prv = basis(-(prevYaw or 0.0), -(prevPitch or 0.0))
 
@@ -140,7 +135,7 @@ function M.build()
         -- function as FXAA.
         sb:setField("samplerStates", 0, "SamplerClampLinear")   -- 0: sceneTex
         sb:setField("samplerStates", 1, "SamplerClampPoint")    -- 1: depthTex
-        sb:setField("samplerStates", 2, "SamplerClampLinear")   -- 2: historyTex (fused Slepian tap needs it)
+        sb:setField("samplerStates", 2, "SamplerClampLinear")   -- 2: historyTex (fused Kaiser tap needs it)
         sb:setField("samplerStates", 3, "SamplerClampPoint")    -- 3: velocityTex
         sb:setField("samplerStates", 4, "SamplerClampPoint")    -- 4: historyMotionTex (stored field, exact texel fetches)
     end)
@@ -155,7 +150,7 @@ function M.build()
     getOrCreateStateBlock("TAA_Motion_StateBlock", function(sb)
         sb:setField("samplerStates", 0, "SamplerClampPoint")    -- 0: depthTex
         sb:setField("samplerStates", 1, "SamplerClampPoint")    -- 1: velocityTex
-        sb:setField("samplerStates", 2, "SamplerClampPoint")    -- 2: taaResultTex (revocation bit in alpha sign)
+        sb:setField("samplerStates", 2, "SamplerClampPoint")    -- 2: resolveOutputTex
     end)
 
     getOrCreateShader("TAA_Resolve_ShaderData", "shaders/common/postFx/taa/taa.fx.hlsl")
@@ -180,20 +175,21 @@ function M.build()
     -- Always bound: last frame's layer-resolved motion+depth field. The
     -- writer's inputs (depth, velocity, #TAA_Result) all exist
     -- unconditionally from frame 1, so it always writes this target and the
-    -- chain can never deadlock.
+    -- chain can never deadlock. With useMotionField disabled the resolve
+    -- stops reading it (the writer pass itself keeps running -- see the
+    -- motion-writer note below).
     taaPreFx:setField("texture", 4, "#TAA_HistMotion")
     taaPreFx:setField("target", 0, "#TAA_Result")
     taaPreFx:setField("targetFormat", 0, "GFXFormatR32G32B32A32F")
     taaPreFx:setField("targetClear", 0, "PFXTargetClear_OnDraw")
 
     -- ------------------------------------------------------------------
-    -- Final pass (auto-parity sharpening): #TAA_Result -> $backBuffer. MUST
-    -- be a CHILD of the resolve pass: children execute immediately after
-    -- their parent, inside the parent's pass, i.e. strictly after
-    -- #TAA_Result is written and before anything else touches $backBuffer.
-    -- Field set matches the last known-good version exactly: no own
-    -- renderTime / renderBin / priority / targetScale -- a child inherits
-    -- the parent's scheduling.
+    -- Final pass (auto-parity / manual sharpening): #TAA_Result ->
+    -- $backBuffer. MUST be a CHILD of the resolve pass: children execute
+    -- immediately after their parent, inside the parent's pass, i.e.
+    -- strictly after #TAA_Result is written and before anything else touches
+    -- $backBuffer. No own renderTime / renderBin / priority / targetScale:
+    -- a child inherits the parent's scheduling.
     -- ------------------------------------------------------------------
     local taaFinalFx = createObject("PostEffect")
     taaFinalFx:setField("shader", 0, "TAA_Final_ShaderData"); taaFinalFx:setField("stateBlock", 0, "TAA_Copy_StateBlock")
@@ -216,6 +212,15 @@ function M.build()
     -- (effective velocity/depth + flag) to #TAA_HistMotion. The resolve's
     -- revocation decision travels through the sign of #TAA_Result.a, which
     -- this pass decodes and persists. Must run AFTER the resolve (a child).
+    --
+    -- This pass is NEVER touched after creation -- no enable()/disable(), no
+    -- isEnabled writes, no own scheduling fields. Any lifecycle manipulation
+    -- of it re-registers the effect outside the resolve's pass chain on the
+    -- Vulkan backend and its named-target bindings then fail ("missing
+    -- vulkan resource" spam). useMotionField therefore gates the resolve's
+    -- stored-field ANALYSIS only; this pass always runs (a single cheap
+    -- fullscreen write, and its output is simply ignored when the resolve
+    -- does not read the field).
     -- ------------------------------------------------------------------
     local taaStoreMotionFx = createObject("PostEffect")
     taaStoreMotionFx:setField("shader", 0, "TAA_Motion_ShaderData"); taaStoreMotionFx:setField("stateBlock", 0, "TAA_Motion_StateBlock")
@@ -231,7 +236,12 @@ function M.build()
     M.setFrameState(1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
 end
 
-M.settings = {
+-- Defaults: the single source of truth for every setting. M.settings is a
+-- working copy that applySettings/user input mutate. When the settings
+-- file's version changes, ge/extensions/taa.lua calls M.resetSettings() to
+-- rebuild this copy -- merging would keep stale keys from settings that were
+-- renamed or removed in newer versions.
+M.defaultSettings = {
     useJitter                     = true,
     useR2Jitter                   = true,
     jitterScale                   = 1.0,
@@ -239,9 +249,6 @@ M.settings = {
     feedbackMax                   = 0.97,
     lumaDriftStrength             = 0.0,
     lumaDriftChromaTol            = 0.1,
-    shadowMitigation              = 0.0,
-    shadowDarknessThreshold       = 0.25,
-    shadowBlendStrength           = 0.95,
     varianceGamma                 = 1.50,
     softClip                      = 0.0,
     chromaVarianceMod             = 1.0,
@@ -257,35 +264,52 @@ M.settings = {
     velRejection                  = 5.0,
     velGradientScale              = 1.0,
     crossTestStrength             = 0.35,
-    -- Auto-parity sharpening target: 1.0 restores the raw frame's local
-    -- sharpness (per-pixel lobe derived in closed form from the measured
-    -- acutance ratio), 0 disables. The old manual RCAS strength semantics
-    -- are gone; 0.5 roughly matches the previous default look.
+    autoSharpen                   = 1.0,
+    -- Auto mode: parity target fraction (1.0 = restore the raw frame's local
+    -- sharpness). Manual mode (autoSharpen = 0): fixed RCAS strength.
     sharpness                     = 1.0,
     debugMode                     = 0.0,
     useDepthDilation              = 1.0,
+    -- Gates the resolve's stored-field analysis (dilation validation, the
+    -- depth/velocity disocclusion tests, landing/pursuit). 0 = the resolve
+    -- ignores the stored field and disocclusion relies on color clipping
+    -- only. The writer pass itself always runs (it cannot be toggled without
+    -- re-registering it outside the resolve's pass chain).
+    useMotionField                = 1.0,
     lumaVariance                  = 0.0,
-    useKDopClipping               = 1.0,
+    useHullClipping               = 1.0,
     kdopVarianceClipping          = 0.0,
-    useCovarianceClipping         = 0.0,
     colorSpaceOklab               = 1.0,
     jitterAwareVariance           = 1.0,
     velocityAlignedVariance       = 0.0,
     alignmentFeedbackDrop         = 0.25,
     motionBlendDropSpeed          = 1.0,
-    useSlepian3                   = 1.0,
+    useKaiser6                    = 1.0,
     historyOvershoot              = 1.0,
     clipOvershoot                 = 0.0,
     fireflyClamp                  = 4.0,
-    shadowTemporalMult            = 10.0,
-    shadowSpatialMult             = 5.0,
     clipDistanceRejectionEnabled  = 1.0,
     clipDistanceRejectionAmount   = 0.0,
     clipDistanceRejectionMinError = 0.15,
     motionBlendStart              = 1.0,
-    shadowVarianceBase            = 0.2,
     fallbackFXAA                  = 1.0
 }
+
+local function freshSettingsCopy()
+    local copy = {}
+    for key, value in pairs(M.defaultSettings) do copy[key] = value end
+    return copy
+end
+
+M.settings = freshSettingsCopy()
+
+-- Rebuild the working copy from the defaults and push it to the shaders.
+-- A tableMerge cannot be used here: it would keep stale keys from whatever
+-- the copy previously held.
+function M.resetSettings()
+    M.settings = freshSettingsCopy()
+    M.applySettings()
+end
 
 function M.applySettings(inputs)
     if inputs and type(inputs) == "table" then tableMerge(M.settings, inputs) end
@@ -297,7 +321,7 @@ function M.applySettings(inputs)
 
     -- Keep the shader's feedback clamp well-defined: with lo > hi, HLSL
     -- clamp() silently collapses to hi, quietly disabling the motion /
-    -- alignment / shadow feedback reductions.
+    -- alignment feedback reductions.
     if s.feedbackMin and s.feedbackMax and s.feedbackMin > s.feedbackMax then
         s.feedbackMin = s.feedbackMax
     end
@@ -305,9 +329,6 @@ function M.applySettings(inputs)
     if pre then
         pre:setShaderConst("$taaFeedbackMin",             s.feedbackMin)
         pre:setShaderConst("$taaFeedbackMax",             s.feedbackMax)
-        pre:setShaderConst("$taaShadowMitigation",        s.shadowMitigation)
-        pre:setShaderConst("$taaShadowDarknessThreshold", s.shadowDarknessThreshold)
-        pre:setShaderConst("$taaShadowBlendStrength",     s.shadowBlendStrength)
         pre:setShaderConst("$taaVarianceGamma",           s.varianceGamma)
         pre:setShaderConst("$taaSoftClip",                s.softClip)
         pre:setShaderConst("$taaChromaVarianceMod",       s.chromaVarianceMod)
@@ -320,47 +341,49 @@ function M.applySettings(inputs)
         pre:setShaderConst("$taaCrossTestStrength",       s.crossTestStrength)
         pre:setShaderConst("$taaDebugMode",               s.debugMode)
         pre:setShaderConst("$taaUseDepthDilation",        s.useDepthDilation)
+        pre:setShaderConst("$taaUseMotionField",          s.useMotionField)
         pre:setShaderConst("$taaLumaVariance",            s.lumaVariance)
-        pre:setShaderConst("$taaUseKDopClipping",         s.useKDopClipping)
-        pre:setShaderConst("$taaKDopVariance",            s.kdopVarianceClipping)
-        pre:setShaderConst("$taaUseCovarianceClipping",   s.useCovarianceClipping)
+        pre:setShaderConst("$taaUseHullClipping",         s.useHullClipping)
         pre:setShaderConst("$taaColorSpaceOklab",         s.colorSpaceOklab)
         pre:setShaderConst("$taaJitterAwareVariance",     s.jitterAwareVariance)
         pre:setShaderConst("$taaVelocityAlignedVariance", s.velocityAlignedVariance)
         pre:setShaderConst("$taaAlignmentFeedbackDrop",   s.alignmentFeedbackDrop)
         pre:setShaderConst("$taaMotionBlendDropSpeed",    s.motionBlendDropSpeed)
-        pre:setShaderConst("$taaUseSlepian3",             s.useSlepian3)
+        pre:setShaderConst("$taaUseKaiser6",              s.useKaiser6)
         pre:setShaderConst("$taaHistoryOvershoot",        s.historyOvershoot)
         pre:setShaderConst("$taaClipOvershoot",           s.clipOvershoot)
         pre:setShaderConst("$taaLumaDriftStrength",       s.lumaDriftStrength)
         pre:setShaderConst("$taaLumaDriftChromaTol",      s.lumaDriftChromaTol)
         pre:setShaderConst("$taaFireflyClamp",            s.fireflyClamp)
-        pre:setShaderConst("$taaShadowTemporalMult",      s.shadowTemporalMult)
-        pre:setShaderConst("$taaShadowSpatialMult",       s.shadowSpatialMult)
         pre:setShaderConst("$taaClipDistanceRejectionEnabled",  s.clipDistanceRejectionEnabled)
         pre:setShaderConst("$taaClipDistanceRejectionAmount",   s.clipDistanceRejectionAmount)
         pre:setShaderConst("$taaClipDistanceRejectionMinError", s.clipDistanceRejectionMinError)
         pre:setShaderConst("$taaMotionBlendStart",        s.motionBlendStart)
-        pre:setShaderConst("$taaShadowVarianceBase",      s.shadowVarianceBase)
         pre:setShaderConst("$taaFallbackFXAA",            s.fallbackFXAA)
+        -- Keep the history source consistent with the debug state: the ge
+        -- warmup only re-runs setupHistory at mission start / resolution
+        -- changes, but debug toggles arrive here.
+        pre:setField("texture", 2, (tonumber(s.debugMode) or 0.0) > 0.5 and "$backBuffer" or "#TAA_History")
     end
 
     -- The motion-field writer must classify with the SAME parameters as the
     -- resolve, or the stored field disagrees with the resolve's own
-    -- classification.
+    -- classification. Setting its constants is the ONLY interaction with
+    -- this pass -- its lifecycle is never touched (see build()).
     if mot then
         mot:setShaderConst("$taaUseDepthDilation", s.useDepthDilation)
-        mot:setShaderConst("$taaDepthRejection",   s.depthRejection)
     end
 
     if fin then
+        fin:setShaderConst("$taaAutoSharpen", (tonumber(s.autoSharpen) or 1.0))
         fin:setShaderConst("$taaSharpness", s.sharpness)
         fin:setShaderConst("$taaDebugMode", s.debugMode)
     end
 end
 
 function M.setEnabled(enabled)
-    -- Parent only: children toggle with their parent.
+    -- Parent only: children toggle with their parent. The motion writer is a
+    -- child and is never individually toggled (see build()).
     local pre = scenetree.TAA_PreFx
     if pre then
         if enabled then pre:enable() else pre:disable() end
@@ -387,10 +410,26 @@ function M.setupHistory(state)
     local pre = scenetree.TAA_PreFx
     if pre then
         local isHistory = (state == "history")
-        pre:setField("texture", 2, isHistory and "#TAA_History" or "$backBuffer")
+        -- Debug views write diagnostic colors into #TAA_Result, and the
+        -- history-copy child stores that into #TAA_History unconditionally:
+        -- while a debug mode is active, the clip's history input would be
+        -- garbage that also feeds the debug pattern back into itself (red
+        -- pixels write red-ish history, whose rays stay red). While
+        -- debugging, read the RAW CURRENT FRAME as the history instead:
+        -- the clip rays stay real (converged-regime directions), nothing
+        -- accumulates, and normal operation resumes one frame after debug
+        -- is switched off (the poisoned #TAA_History is fully rejected on
+        -- that first frame).
+        local debugActive = (tonumber(M.settings.debugMode) or 0.0) > 0.5
+        local source
+        if not isHistory then
+            source = "$backBuffer"                          -- warmup reset
+        else
+            source = debugActive and "$backBuffer" or "#TAA_History"
+        end
+        pre:setField("texture", 2, source)
         -- texture 4 (#TAA_HistMotion) is permanently bound: the stored
-        -- motion field is always last frame's data, including warmup frames
-        -- (stale data there is safely rejected by the disocclusion tests).
+        -- motion field is always last frame's data.
     end
 end
 
