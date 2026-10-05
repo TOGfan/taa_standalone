@@ -177,13 +177,29 @@ LayerSurface ClassifyLayerSurface(
     {
         // Phase toward the silhouette: the content position hangs at/past
         // the limb; the velocity is the object's field at the exact phase --
-        // the same extrapolation anchored at the center, with the
-        // second-closest tap. Gate failures fall back to the own center raw
-        // sample. The depth stays the own center.
+        // the same extrapolation anchored at the center. Gate failures fall
+        // back to the own center raw sample. The depth stays the own center.
+        //
+        // PARTNER SELECTION: the pair partner must be a tap OTHER than the
+        // center. When the center is the scan's closest tap (the typical
+        // crest) the second-closest is that partner. When some neighbor is
+        // deeper still, the demotion chain leaves the second-closest AT the
+        // center itself -- a degenerate (center, center) pair whose zero
+        // span always trips the dSqPx gate and silently disables the
+        // extrapolation on exactly the branch that exists to use it. In
+        // that case the closest tap (the deepest foreground neighbor) is
+        // the partner: temporally stable, admitted through the identical
+        // gates, and resolving depth ties in scan order -- the same
+        // stability class as the original second-closest pick.
+        bool   closestIsCenter = (s.closestOffsetPx.x == 0.0) && (s.closestOffsetPx.y == 0.0);
+        float2 partnerOffsetPx = closestIsCenter ? secondOffsetPx    : s.closestOffsetPx;
+        float  partnerDepth    = closestIsCenter ? secondDepth       : s.closestDepth;
+        float2 partnerVelocity = closestIsCenter ? secondVelocityUV  : closestVelocityUV;
+
         s.effectiveDepth = depthRaw[0];
         s.effectiveVelocityUV = ResolveForegroundFieldVelocityUV(
             float2(0.0, 0.0), depthRaw[0], velocityUV[0],
-            secondOffsetPx, secondDepth, secondVelocityUV,
+            partnerOffsetPx, partnerDepth, partnerVelocity,
             false, 0.0,
             fracPx,
             shallowSlope, edge.depthQuantStep,

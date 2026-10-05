@@ -2,7 +2,7 @@
 // TAA history clipping: color statistics, the exact-hull clipper, the
 // mean/variance box fallback, and the feedback/drift consumers
 // ----------------------------------------------------------------------------
-// EXACTNESS CERTIFICATE (the hull clipper): three certified solve paths.
+// EXACTNESS CERTIFICATE (the hull clipper): four certified properties.
 // (1) Collinear / flat tap sets -- every 1D color neighborhood, i.e. every
 // edge -- are solved by dual axis walks (the perpendicular dual coordinate
 // is degenerate for a truly collinear set, so the 1D dual IS the dual; the
@@ -15,6 +15,33 @@
 // of certified upper bounds on the exit height (dual points, supporting
 // planes, the horizontal plane zMax), so the clip can never over-clip: the
 // failure mode is safe looseness, never flicker.
+// (4) PHASE-TRANSPORT PADDING (the hull's jitter accounting): the history
+// is an EWMA of PAST-PHASE samples of the signal; the 9 taps are
+// CURRENT-phase point samples. The convexity argument above bounds
+// averages of THE TAPS -- it says nothing about averages of other phases'
+// samples, and for sub-texel content (values no single phase's tap set
+// spans: thin features, sparkle, per-texel noise) those differ. Clipping
+// to the single-phase hull every frame constrains the converged
+// accumulator to the INTERSECTION of the per-phase hulls, while the
+// anti-aliased value needs the UNION's room -- that gap is the hull's
+// flicker. The hull is therefore padded by the measured phase-transport
+// SEGMENT [-w, +w]: w = expectedJitterShift (the same first-order gradient
+// model, magnitude rule and motion fade the box path's sigma inflation
+// uses -- one policy, both paths). The padded hull is hull(taps)
+// Minkowski-summed with the segment, whose support function is ADDITIVE:
+// every certified dual bound F(a,b) lifts by exactly
+// |w_z - a*w_u - b*w_v|, every supporting plane by |dot(w,N)|/N.z, and
+// zMax by |w_z|. The min of lifted bounds is a certified upper bound on
+// the PADDED exit height: never-over-clip survives w.r.t. the jitter
+// model (whose error is second order in the local curvature -- the same
+// footing as every practical variance clipper). The lifts are identically
+// zero when the padding is off, the content flat, or motion has faded it,
+// and they never touch a history that already lands inside (only the exit
+// height rises, and tHit >= 1 still early-returns). With an active
+// non-ray-parallel segment, exactness labels are demoted to "certified":
+// the padded optimum may sit at a different dual point than the one
+// certified above. A ray-parallel segment (wSeg.xy == 0) lifts F by the
+// constant |w_z| and moves no minimizer -- labels stay exact.
 //
 // LOAD-BEARING INVARIANT: the anchor (stats.mean) must lie inside the hull
 // of the taps -- it is a positive-weighted average of exactly those taps.
@@ -194,6 +221,13 @@ ColorNeighborhoodStats ComputeColorNeighborhoodStats(
 // For a tap set collinear in (u,v), F is invariant along the perpendicular
 // dual axis, so ONE w-walk solves the problem exactly: the clipper's fast
 // path for edges and flat regions.
+//
+// PHASE-PADDED OBJECTIVE: with the transport segment active the true
+// objective is F_pad = F + |W| (W = w_z - a*w_u - b*w_v; see the header,
+// item 4), whose extra kink at W = 0 is NOT a walk breakpoint -- the walks
+// still minimize F. That is looseness only: the lift is added to each
+// walk's value at ITS OWN final dual point by the caller, and every lifted
+// value is still a certified upper bound on the padded exit.
 // ============================================================================
 static const float kHullTieBreakEps    = kHullSimplexCertEps * 0.03125; // index-linear z perturbation: hull-inflating, < certEps/4 total
 static const float kHullCollinearExact = 1.0e-6;     // float-noise-level collinearity: only below this is the 1D solve labeled exact
@@ -201,6 +235,15 @@ static const float kHullCollinearLoose = 1.0 / 64.0; // .. below this the 1D bou
 static const float kHullDualStepCap   = 1e20;       // runaway guard for near-flat slopes
 
 float cross2(float2 a, float2 b) { return a.x * b.y - a.y * b.x; }
+
+// Segment lift of a dual bound: for the phase-transport segment [-w, +w]
+// (w in the ray frame), F_pad(a,b) = F(a,b) + |W| with
+// W = w.z - a*w.x - b*w.y -- the segment's support function is additive and
+// index-independent (max_i (f_i + |W|) = F + |W| exactly).
+float HullSegmentLift(float2 mn, float3 wSeg)
+{
+    return abs(wSeg.z - mn.x * wSeg.x - mn.y * wSeg.y);
+}
 
 float HullDualAxisWalk(
     inout float2 mn,            // dual position (x = w-axis, y = w-perp-axis); advanced in place
@@ -292,7 +335,7 @@ float HullDualAxisWalk(
 }
 
 // ============================================================================
-// EXACT-HULL SIMPLEX CLIPPER (2D-reduced, ray-aligned frame)
+// EXACT-HULL SIMPLEX CLIPPER (2D-reduced, ray-aligned frame, phase-padded)
 // ----------------------------------------------------------------------------
 // STRUCTURE: rotate to a frame with +Z = the ray; the exit is the upper
 // envelope's height at the 2D origin. Near-collinear / flat sets are
@@ -312,9 +355,17 @@ float HullDualAxisWalk(
 // All taps are tracked BY VALUE (selects over unrolled static indices) --
 // no dynamic indexing anywhere.
 //
+// PHASE TRANSPORT: the simplex and the walks run on the UNPADDED tap set
+// (the anchor-invariant and the enclosure arguments belong to it); every
+// emitted bound is then lifted by the transport segment at the dual point
+// / plane normal that produced it. The lifts are zero whenever the jitter
+// padding is off, flat, or motion-faded -- bit-identical to the unpadded
+// clipper.
+//
 // Diagnostics (hullDiag): x = 1 exact (simplex certificate, or the
-// collinear 1D solve at float-noise collinearity), 2 certified bound (dual
-// descent / supporting-only plane), 3 defensive fallback (every path ends
+// collinear 1D solve -- requires the segment inactive or ray-parallel),
+// 2 certified bound (dual descent / supporting-only plane / any active
+// non-ray-parallel segment), 3 defensive fallback (every path ends
 // certified, so 3 should be unreachable -- treat it as a bug alarm);
 // y = iterations used.
 // ============================================================================
@@ -322,6 +373,7 @@ float3 ClipHistoryToConvexHull_Simplex(
     float3 historyColorSpace,
     float3 neighborhoodColorSpace[9],
     float3 anchorPoint,
+    float3 jitterShift,           // stats.expectedJitterShift (working color space)
     float  clipOvershoot,
     float  softClipAmount,
     float  motionFactor,
@@ -345,6 +397,17 @@ float3 ClipHistoryToConvexHull_Simplex(
     float b = ez.x * ez.y * a;
     float3 ex = float3(1.0 + sign * ez.x * ez.x * a, sign * b, -sign * ez.x);
     float3 ey = float3(b, sign + ez.y * ez.y * a, -ez.y);
+
+    // --- Phase-transport segment, projected into the ray frame -----------
+    // w = the measured expected jitter shift, faded by motion EXACTLY like
+    // the box path's sigma inflation (one policy, both paths). Zero when
+    // the padding is off / content flat / motion-faded: every lift below is
+    // then a no-op and the clipper is bit-identical to the unpadded one.
+    // The segment is symmetric ([-w, +w]): past phases sit on both sides of
+    // the current one, and the history is their average.
+    float  padFade = (taaJitterFlickerFade > 0.5) ? (1.0 - motionFactor) : 1.0;
+    float3 wColor  = jitterShift * (taaJitterFlickerPadding * padFade);
+    float3 wSeg    = float3(dot(wColor, ex), dot(wColor, ey), dot(wColor, ez));
 
     // --- Project the anchor-centered taps (u, v, z); track the max-z tap
     // (A), the max-radius direction (w) and the z range. z carries the
@@ -402,7 +465,7 @@ float3 ClipHistoryToConvexHull_Simplex(
     float devRel = devMax / max(spreadArea, 1e-30);   // <= 1 by construction
 
     float supportScale = 1.0 + clipOvershoot;
-    float zExit = zMax;                                // horizontal plane: always a valid upper bound
+    float zExit = zMax + abs(wSeg.z);                 // horizontal plane (+ segment lift): always a valid upper bound
     bool  exact  = false;
     float itersUsed = 0.0;
     float2 mnD = float2(0.0, 0.0);                     // shared dual descent position
@@ -420,7 +483,7 @@ float3 ClipHistoryToConvexHull_Simplex(
         // cancellation pattern.
         bool  ex1; float st1;
         float h1 = HullDualAxisWalk(mnD, true, 8, q, sArr, tArr, ex1, st1);
-        zExit     = min(h1, zMax);
+        zExit     = min(h1 + HullSegmentLift(mnD, wSeg), zExit);   // lift at h1's own dual point
         itersUsed = st1;
         exact     = ex1 && (devRel <= kHullCollinearExact);
     }
@@ -492,16 +555,27 @@ float3 ClipHistoryToConvexHull_Simplex(
                 if (maxSlack <= certEps * N.z)
                 {
                     float height = V0.z + (N.x * V0.x + N.y * V0.y) / N.z;
+                    // Segment lift of this plane: the padded hull's support
+                    // plane with the same normal sits |dot(w,N)|/N.z higher
+                    // (support functions add), so height + lift is a
+                    // certified upper bound on the PADDED exit height. With a
+                    // ray-parallel segment (lift = |wSeg.z| for every plane
+                    // and every dual point alike) the ordering of all bounds
+                    // is unchanged, so exactness survives exactly.
+                    float lift = abs(dot(wSeg, N)) / N.z;
 
                     // Enclosing + supporting = EXACT; supporting alone is still
-                    // a valid upper bound (take the min with the fallback).
+                    // a valid upper bound. Both take the min with the other
+                    // lifted bounds -- the lifted bounds are mutually
+                    // unordered, and the min of certified upper bounds is a
+                    // certified upper bound.
                     float tA = cross2(V0.xy, V1.xy);
                     float tB = cross2(V1.xy, V2.xy);
                     float tC = cross2(V2.xy, V0.xy);
                     bool encloses = (tA >= -epsArea && tB >= -epsArea && tC >= -epsArea) ||
                                     (tA <=  epsArea && tB <=  epsArea && tC <=  epsArea);
-                    if (encloses) { zExit = height;             exact = true; }
-                    else          { zExit = min(zExit, height); }
+                    if (encloses) { exact = true; }
+                    zExit = min(zExit, height + lift);
                     break;
                 }
 
@@ -536,26 +610,44 @@ float3 ClipHistoryToConvexHull_Simplex(
     // perpendicular axis (resolving near-duplicated projections with a
     // z-gap), the 2D path descends from the horizontal bound. Each value
     // is a certified upper bound (any dual point is), so the min is too.
-    // This covers the simplex's failure modes: thin color needles along
-    // the ray (near-vertical planes) and degenerate pivots.
+    // Each walk's lift is captured at ITS OWN final dual point -- mnD
+    // advances between calls. This covers the simplex's failure modes:
+    // thin color needles along the ray (near-vertical planes) and
+    // degenerate pivots.
     if (!exact)
     {
         bool  exF; float stF;
         if (devRel <= kHullCollinearLoose)
         {
-            float hp  = HullDualAxisWalk(mnD, false, 4, q, sArr, tArr, exF, stF);
-            float hw2 = HullDualAxisWalk(mnD, true,  2, q, sArr, tArr, exF, stF);
-            zExit = min(zExit, min(hp, hw2));
+            float hp   = HullDualAxisWalk(mnD, false, 4, q, sArr, tArr, exF, stF);
+            float hpP  = hp + HullSegmentLift(mnD, wSeg);
+            float hw2  = HullDualAxisWalk(mnD, true,  2, q, sArr, tArr, exF, stF);
+            float hw2P = hw2 + HullSegmentLift(mnD, wSeg);
+            zExit = min(zExit, min(hpP, hw2P));
         }
         else
         {
             float hw  = HullDualAxisWalk(mnD, true,  4, q, sArr, tArr, exF, stF);
+            float hwP = hw + HullSegmentLift(mnD, wSeg);
             float hp  = HullDualAxisWalk(mnD, false, 4, q, sArr, tArr, exF, stF);
-            float hw2 = HullDualAxisWalk(mnD, true,  2, q, sArr, tArr, exF, stF);
-            zExit = min(zExit, min(min(hw, hp), hw2));
+            float hpP = hp + HullSegmentLift(mnD, wSeg);
+            float hw2  = HullDualAxisWalk(mnD, true,  2, q, sArr, tArr, exF, stF);
+            float hw2P = hw2 + HullSegmentLift(mnD, wSeg);
+            zExit = min(zExit, min(min(hwP, hpP), hw2P));
         }
         itersUsed += stF;
     }
+
+    // ---- segment honesty: with an active NON-ray-parallel segment the
+    // padded optimum can sit at a different dual point than the one the
+    // machinery certified above, so equality with the PADDED exit is no
+    // longer provable -- cap the label at "certified bound". A ray-parallel
+    // segment lifts F by the constant |wSeg.z|, moves no minimizer, and
+    // lifts every plane by the same constant: exact labels survive exactly.
+    // (Bit-exact zero test is intentional: only a truly ray-parallel
+    // projection keeps the label.)
+    if (!(wSeg.x == 0.0 && wSeg.y == 0.0))
+        exact = false;
 
     hullDiag = exact ? float2(1.0, itersUsed) : float2(2.0, itersUsed);
 
@@ -577,11 +669,17 @@ float3 ClipHistoryToConvexHull_Simplex(
 // ============================================================================
 // HISTORY CLIPPING ENTRY
 // ============================================================================
-// Hull clipping: the exact clipper above. Fallback: mean/variance box
-// intersected with the (firefly-clamped) sample AABB, with soft-clip.
+// Hull clipping: the exact clipper above, phase-padded by the measured
+// expected jitter shift (the same model and motion fade as the box path's
+// sigma inflation -- taaJitterFlickerPadding drives BOTH paths; at padding
+// 0 the hull clipper is bit-identical to the strict single-phase version).
+// Fallback: mean/variance box intersected with the (firefly-clamped) sample
+// AABB, with soft-clip.
 // hullDiag: x = 0 clipper disabled, 1 exact (simplex certificate or the
-// collinear 1D solve), 2 certified bound (supporting-only plane and/or
-// dual descent), 3 defensive fallback (unreachable); y = iterations used.
+// collinear 1D solve -- requires the segment inactive or ray-parallel),
+// 2 certified bound (supporting-only plane and/or dual descent and/or an
+// active non-ray-parallel segment), 3 defensive fallback (unreachable);
+// y = iterations used.
 float3 ClipHistoryToNeighborhood(
     float3 historyColorSpace, ColorNeighborhoodStats stats,
     float motionNormalized, float varianceGamma,
@@ -594,6 +692,7 @@ float3 ClipHistoryToNeighborhood(
     {
         return ClipHistoryToConvexHull_Simplex(
             historyColorSpace, neighborhoodColorSpace, stats.mean,
+            stats.expectedJitterShift,
             taaClipOvershoot, taaSoftClip, motionFactor, hullDiag);
     }
 

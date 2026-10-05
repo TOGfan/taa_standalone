@@ -24,6 +24,13 @@
 //   the geometric same-surface rule and the rigid parallax magnitude
 //   ceiling -- both measured -- return the fallback (the anchor tap's raw
 //   velocity) on any failure.
+//   EVALUATION ENDPOINT: v(B) is evaluated from the pair endpoint NEAREST B.
+//   Under the similarity prior both endpoints give the identical v(B) (two
+//   correspondences determine the field exactly), so this is a no-op inside
+//   the model; under real field curvature the extrapolation error grows
+//   with the lever arm |B - f_e|, so the nearer endpoint is never worse and
+//   usually tighter. The dilation call benefits most: its anchor (the crest)
+//   can sit ~2 texels from B while the partner is nearer.
 //
 // MEASURED PAIR RULES:
 //   * ForegroundPairSameSurface: two foreground taps are ONE surface iff
@@ -375,11 +382,27 @@ float2 ResolveForegroundFieldVelocityUV(
     // q = w / d as a complex quotient: w * conj(d) / |d|^2.
     float2 q = ComplexMul(wPx, float2(dPx.x, -dPx.y)) / dSqPx;
 
-    float2 evalOffsetPx = evalPx - anchorOffsetPx;
-    pairGradPx = length(wPx) / sqrt(dSqPx);
-    dispPx     = length(ComplexMul(q, evalOffsetPx));
+    // Evaluate from the pair endpoint NEAREST the evaluation point. Under the
+    // similarity prior both endpoints give the identical v(B) (two
+    // correspondences determine the field exactly), so this is a no-op inside
+    // the model's world -- but under real field curvature the extrapolation
+    // error grows with the lever arm |B - f_e|, so the nearer endpoint is
+    // never worse and usually tighter. The dilation call benefits most: its
+    // anchor (the crest) can sit ~2 texels from B while the partner is
+    // nearer.
+    bool   fromSecond   = dot(evalPx - secondOffsetPx, evalPx - secondOffsetPx)
+                        < dot(evalPx - anchorOffsetPx, evalPx - anchorOffsetPx);
+    float2 baseOffsetPx = fromSecond ? secondOffsetPx    : anchorOffsetPx;
+    float2 baseVelPx    = (fromSecond ? secondVelocityUV : anchorVelocityUV) * sizePixels;
 
-    float2 vPx = anchorVelocityUV * sizePixels + ComplexMul(q, evalOffsetPx);
+    pairGradPx = length(wPx) / sqrt(dSqPx);
+    // Tolerance displacement stays measured from the ANCHOR tap: consumers
+    // size tolerances against the fallback (the anchor's raw velocity), and
+    // |v(B) - v_anchor| = |q| * |B - f_anchor| EXACTLY, independent of which
+    // endpoint the evaluation is anchored at.
+    dispPx = length(ComplexMul(q, evalPx - anchorOffsetPx));
+
+    float2 vPx = baseVelPx + ComplexMul(q, evalPx - baseOffsetPx);
     return vPx * (1.0 / sizePixels);
 }
 
