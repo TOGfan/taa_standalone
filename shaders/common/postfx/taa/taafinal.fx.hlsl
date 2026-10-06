@@ -284,17 +284,13 @@ AF1 SharpLuma(AF3 rgb)
     return c.b * AF1_(0.5) + (c.r * AF1_(0.5) + c.g);        // RCAS luma (x2)
 }
 
-// The raw-scene acutance energy from a resolve-output alpha (0 when the
-// payload is not clip state -- debug, foreign, non-finite). 12 bits at
-// [19:8]: the quantization step (2.4e-4) sits at kSharpEnergyFloor's own
-// scale, and pack-time saturation only ever lowers the derived boost.
-AF1 DecodeAcutanceEnergy(AF1 a)
-{
-    AU1 u = AU1_AF1(a);
-    if (((u >> 27) & 0xFu) == 0x6u)                     // clip-state tag
-        return AF1_((float)((u >> 8) & 0xFFFu)) * AF1_(1.0 / 4095.0);
-    return AF1_(0.0);
-}
+// DecodeAcutanceEnergy now lives in taaShared.h.hlsl (the resolve needs it
+// too, for the transport EWMA). It returns the ENERGY directly: the packed
+// field is sqrt-compressed (linear [0,1] <-> energy [0,9] -- the old linear
+// packing saturated at E = 1, i.e. every full-contrast LDR edge and all HDR
+// content) and pre-stabilized by the resolve (EWMA against the previous
+// frame's decoded value at the landing, so the boost cannot flicker with
+// the jitter phase).
 
 // ============================================================================
 // AUTO-PARITY / MANUAL SHARPENING
@@ -396,8 +392,8 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
         AF1 energyResolved = highPass * highPass;
 
         // Raw-scene acutance energy, cross-averaged for stability, decoded
-        // from the packed clip-state alpha (bits [19:4]; the revocation
-        // sign and the state sigma are simply ignored here). A foreign tag
+        // from the packed clip-state alpha (bits [19:8], sqrt-compressed and
+        // pre-stabilized by the resolve's transport EWMA). A foreign tag
         // (debug payload, cleared buffer) decodes as zero: no boost.
         AF1 energyRaw = AF1_(0.2) * (DecodeAcutanceEnergy(tE.a) + DecodeAcutanceEnergy(tB.a)
                                     + DecodeAcutanceEnergy(tD.a) + DecodeAcutanceEnergy(tF.a)

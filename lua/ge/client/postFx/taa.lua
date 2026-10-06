@@ -363,10 +363,9 @@ M.defaultSettings = {
     feedbackMax                   = 0.97,
     lumaDriftStrength             = 0.0,
     lumaDriftChromaTol            = 0.1,
-    -- chi: the gate's coverage radius (3-dof). With the gate scale now
-    -- per-texel and bias-subtracted, values below ~2.2 under-cover LEGIT
-    -- sub-texel content for no ghost benefit (the ghost sits 3-10x outside
-    -- the radius regardless). 2.2 = 86% coverage.
+    -- chi: the gate's coverage radius (3-dof, PER-CHANNEL normalized -- the
+    -- coverages below are actually true now). Below ~2.2 legit sub-texel
+    -- content is under-covered. 2.2 = 82%, 2.8 = 95%.
     varianceGamma                 = 2.8,
     softClip                      = 0.0,
     chromaVarianceMod             = 1.0,
@@ -383,9 +382,11 @@ M.defaultSettings = {
     velGradientScale              = 1.0,
     crossTestStrength             = 0.35,
     autoSharpen                   = 1.0,
-    -- Auto mode: parity target fraction (1.0 = restore the raw frame's local
-    -- sharpness). Manual mode (autoSharpen = 0): fixed RCAS strength.
-    sharpness                     = 1.0,
+    -- Auto mode: the parity target fraction. 0.85 default: the raw frame's
+    -- acutance includes above-Nyquist foldover energy at hard edges, so
+    -- strict parity (1.0) over-sharpens them; ~0.85 discounts it. Note this
+    -- is an ENERGY fraction (0.5 ~= 71% amplitude restoration).
+    sharpness                     = 0.85,
     debugMode                     = 0.0,
     useDepthDilation              = 1.0,
     -- Gates the resolve's stored-field analysis (dilation validation, the
@@ -395,6 +396,12 @@ M.defaultSettings = {
     -- re-registering it outside the resolve's pass chain).
     useMotionField                = 1.0,
     lumaVariance                  = 0.0,
+    -- C3 (see taaClip.h.hlsl): the gate's mu-share scoping. 1.0 =
+    -- residual-scoped -- the statistically exact mu variance; edge ghosts
+    -- clip at ~0.2x local contrast instead of ~0.5x. 0.0 = the conservative
+    -- full-E payment. Back off toward 0 (or raise the coverage radius) if
+    -- debug mode 11 shows static-content shrinkage (blue) on fine detail.
+    clipScopedMu                  = 1.0,
     useHullClipping               = 1.0,
     kdopVarianceClipping          = 0.0,
     colorSpaceOklab               = 1.0,
@@ -448,6 +455,12 @@ function M.applySettings(inputs)
         pre:setShaderConst("$taaFeedbackMin",             s.feedbackMin)
         pre:setShaderConst("$taaFeedbackMax",             s.feedbackMax)
         pre:setShaderConst("$taaVarianceGamma",           s.varianceGamma)
+        pre:setShaderConst("$taaClipScopedMu",            s.clipScopedMu)
+        -- The camera's forward displacement this frame (units of 1/rawDepth);
+        -- 0 = the shader measures T_y locally. The host could provide this
+        -- from the camera hook (res.pos delta dotted with the previous
+        -- forward axis) once the depth convention is confirmed.
+        pre:setShaderConst("$taaDepthParallaxStep",       0.0)
         pre:setShaderConst("$taaVarianceGamma",           s.varianceGamma)
         -- The Studentization EXACTLY tracks the slider: the fit consumes
         -- the EFFECTIVE radius (chi * (1 + clipOvershoot)) -- the same

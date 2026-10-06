@@ -104,6 +104,34 @@ float PackDebugAlpha(bool revoked, float code, float a, float b, float sigma)
     return asfloat(revoked ? (u | 0x80000000u) : u);
 }
 
+// ============================================================================
+// ACUTANCE TRANSPORT DECODE (the clip-state alpha's [19:8] field)
+// ----------------------------------------------------------------------------
+// The resolve packs the raw-scene acutance target SQRT-COMPRESSED (packed
+// linear [0,1] <-> energy [0,9]; the old linear packing saturated at E = 1
+// -- every full-contrast LDR edge and all HDR content) and TEMPORALLY
+// STABILIZED (an EWMA at kSharpEwmaRate against the previous frame's
+// decoded value at the landing; the raw measurement swings ~2x across the
+// jitter phase cycle on edges and would flicker the sharpener's boost).
+// DecodeAcutanceEnergy returns the ENERGY; a foreign tag (debug payload,
+// cleared buffer, NaN) decodes as zero: no boost, never a spurious one.
+// ============================================================================
+float DecodeAcutanceLinear(float alphaValue)
+{
+    uint u = asuint(alphaValue);
+    if (((u >> 27) & 0xFu) == 0x6u)                     // clip-state tag
+        return (float)((u >> 8) & 0xFFFu) * (1.0 / 4095.0);
+    return 0.0;
+}
+
+float DecodeAcutanceEnergy(float alphaValue)
+{
+    float lin = DecodeAcutanceLinear(alphaValue);
+    return 9.0 * lin * lin;                             // energy domain
+}
+
+
+
 void UnpackDebugAlpha(float alpha, out uint code, out float a, out float b)
 {
     uint u = asuint(alpha);

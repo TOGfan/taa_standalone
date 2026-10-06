@@ -16,31 +16,21 @@
 // layer flag (w). Read by the resolve for dilation validation and the
 // disocclusion tests.
 //
-// HISTORY CLIPPING: the Mahalanobis statistic gate (taaClip.h.hlsl), with
-// the exact estimation-uncertainty accounting and the consumer-split
-// innovation:
-//     raw  i = x(S + u) - h  -> the variance path (the record E, the gate
-//          scale: the accumulator carries the full phase spread; u is the
-//          sample's snap offset, u = -pixel.fracPx)
-//     corr i_corr = i - beta*u  -> the mean-structure path (the
-//          anti-alignment; the accumulator field is PHASE-FREE, so the
-//          phase bit is the sample's alone -- landings between pixels
-//          enter as the resample bit the record absorbs, first-class)
-//     gate_var = cStat(t) * S(nu(t)) * E   (live; the transient + the
-//          host-fit Student inflation, slider-coupled)
-//     cold     = invNeff * sigma_c^2       (the change-point replacement)
-//     seed     = tr(Cov_taps)              (the new regime's MEASURED
-//          spread -- never the change-point's own squared residual, which
-//          re-armed the gate to the ghost's scale: the faint sky ghost)
-// plus the anti-alignment reset, corroborated at chi^2_3(0.80) of the
-// spatial trace. Mixtures are content: the stats run on the FULL tap set,
-// always.
+// HISTORY CLIPPING: the Mahalanobis statistic gate (taaClip.h.hlsl) -- now
+// PER-CHANNEL normalized (the record's TOTAL split by the live spatial
+// covariance's diagonal; the previous isotropic form paid the full total to
+// every channel: 3x the true per-channel variance under isotropy, chi = 2.8
+// actually gating at ~4.85 sigma), with the PHASE-CORRECTED test vector
+// d_corr = h - mu + beta*(centroid - u), the exact transient/Student
+// accounting, and the consumer-split innovation.
 //
 // OUTPUT: RGB = the resolved color -- ALWAYS, also while a debug mode is
 // active. A = the packed CLIP STATE: [31] the revocation sign, [30:27] tag
-// 0110, [26:20] the state sigma code (0 = cold), [19:8] the 12-bit acutance
-// energy, [7:1] the record's age, [0] the fiction flag. While a debug mode
-// is active, A carries the packed debug payload (tag 0111) with the sigma
+// 0110, [26:20] the state sigma code (0 = cold), [19:8] the acutance target
+// (12 bits, SQRT-COMPRESSED -- energy range [0,9] -- and TEMPORALLY
+// STABILIZED against the previous frame's value at the landing),
+// [7:1] the record's age, [0] the fiction flag. While a debug mode is
+// active, A carries the packed debug payload (tag 0111) with the sigma
 // embedded in its low 7 bits.
 //
 // PIPELINE (mainP): (1) resolve the jittered render position; (2) gather
@@ -48,18 +38,17 @@
 // (4) reproject into history; (5) gather the color neighborhood + FXAA
 // corners + acutance; (6) validate the history landing position; (7) exact
 // jitter plumbing; (8) own-history dilation validation; (9) history landing
-// analysis; (10) disocclusion tests; (11) color stats (full tap set), the
-// temporal clip-state read/reset/advance (sigma + age + fiction), the
-// anti-alignment test, the statistic gate; (12) feedback and the temporal
-// blend; (13) output.
+// analysis; (10) disocclusion tests; (11) color stats (full tap set) with
+// the centroid/LS-residual estimators, the temporal clip-state
+// read/reset/advance, the acutance EWMA, the anti-alignment (corrected
+// vector, standardized guards), the statistic gate; (12) feedback and the
+// temporal blend; (13) output.
 //
 // DEBUG MODES (taaDebugMode): rendered by taaFinal from the alpha payload.
 //   0 off | 1 frame motion | 2 disocclusion breakdown | 3 center velocity |
 //   4 linearized depth | 5 history color | 6 landing effective velocity |
 //   7 pursuit divergence | 8 layer state | 9 dilation-gate breakdown |
-//   10 alignment-drop activity | 11 clip gate state (G = record carried,
-//   half-G = reset this frame, dim-R = no record, B = applied shrink) |
-//   12 dejittered residual.
+//   10 alignment-drop activity | 11 clip gate state | 12 dejittered residual.
 //
 // FILE ARCHITECTURE (flat includes, this file is the only include issuer):
 //   taaShared / taaConstants / taaColor / taaFrame / taaVelocity /
@@ -127,6 +116,10 @@ cbuffer perDraw
     // exact at nu = 4 (age 0) and nu = 12.33 (converged); see taaClip.
     // Unset constants read 0: S = 1 (the pre-Student gate, graceful).
     float  taaStudentA;                     float  taaStudentB;
+    // The gate's mu-share scoping blend (see taaClip.h.hlsl): 0 = the
+    // conservative full-E payment, 1 = residual-scoped (the exact mu
+    // variance). Set from client/postFx/taa.lua (clipScopedMu).
+    float  taaClipScopedMu;
 
     float2 oneOverTargetSize;
     POSTFX_UNIFORMS
@@ -274,6 +267,9 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
 
     // ------------------------------------------------------------------
     // 6) Validate the history sample position (filter support must fit).
+    //    Border pixels pack the FRESH acutance value: the stabilized EWMA
+    //    reads the previous alpha at the landing (step 11), which is not
+    //    meaningful at an out-of-support landing anyway.
     // ------------------------------------------------------------------
     float  historySupportTexels = (taaUseKaiser6 > 0.5) ? 3.0 : 2.0;
     float2 historyMinUV = historySupportTexels * vp.texelSize;
@@ -285,7 +281,8 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
         bool  earlyRevoked = currentLayer.isDilationZone;
         float earlyAlpha  = debugActive
             ? PackDebugAlpha(earlyRevoked, dbgCode, saturate(dbgA), saturate(dbgB), 0.0)
-            : PackClipStateAlpha(earlyRevoked, 0.0, 0.0, rawSharpnessEnergy, false);
+            : PackClipStateAlpha(earlyRevoked, 0.0, 0.0,
+                                 saturate(sqrt(rawSharpnessEnergy)) * (1.0 / 3.0), false);
 
         if (fxaaEnabled)
         {
@@ -297,9 +294,7 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
 
     // ------------------------------------------------------------------
     // 7) Exact jitter plumbing. jitterOffsetCurUV is the per-pixel jitter
-    //    offset s_t (the velocity tests' cancel term). The PHASE
-    //    REGRESSION does NOT use it -- it uses the sample's snap offset,
-    //    pixel.fracPx (step 11); the accumulator field is phase-free.
+    //    offset s_t (the velocity tests' cancel term).
     // ------------------------------------------------------------------
     float2 jitterOffsetCurUV   = currentJitteredUV - IN.uv0;
     float2 jitterOffsetPrevUV  = ReprojectThroughCamera(IN.uv0, previousCamera, IN.uv0, taaTanHalfFovX, taaTanHalfFovY) - IN.uv0;
@@ -411,10 +406,7 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
     }
 
     // ------------------------------------------------------------------
-    // 10) Disocclusion tests (require the stored motion field). With the
-    //     motion field disabled both are skipped and disocclusion relies
-    //     on the color side alone (the statistic gate + the change-point
-    //     guards in step 11).
+    // 10) Disocclusion tests (require the stored motion field).
     // ------------------------------------------------------------------
     float depthDisocclusionScore = 0.0;
     if (depthTestActive)
@@ -499,15 +491,12 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
 
     // ------------------------------------------------------------------
     // 11) Color stats (full tap set), the temporal clip state (sigma +
-    //     age + fiction), the anti-alignment, the statistic gate.
+    //     age + fiction), the acutance EWMA, the anti-alignment, the
+    //     statistic gate.
     // ------------------------------------------------------------------
-    // The stats run on the FULL tap set, always: an anti-aliased texel IS
-    // a coverage mixture, and the mixture is the sub-texel signal the
-    // record is supposed to measure. The phase bit's regressor is the
-    // SAMPLE's snap offset (pixel.fracPx, negated inside the stats): the
-    // accumulator field is phase-free, so the corrected innovation is
-    // null-clean for any landing, and the landing's own fraction enters
-    // as the resample bit the record absorbs (see the taaClip header).
+    // The stats run on the FULL tap set, always. The phase bit's regressor
+    // is the sample's snap offset; the GATE's test vector additionally
+    // carries the centroid correction (see taaClip).
     ColorNeighborhoodStats colorStats = ComputeColorNeighborhoodStats(
         neighborhoodColorSpace, repro.motionDirUnit, repro.motionNormalized,
         pixel.fracPx);
@@ -517,10 +506,10 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
         ? SampleHistoryColor_Kaiser6_21Tap(repro.sampleUV, vp, historyMinUV, historyMaxUV)
         : SampleHistoryColor_Kaiser4_9Tap(repro.sampleUV, vp, historyMinUV, historyMaxUV);
 
-    // NaN guard: a non-finite history value would sail THROUGH the gate and
-    // permanently poison the accumulation. Collapse to the neighborhood
-    // mean; the record side is covered by the innovSq reset below.
-    if (!(dot(historyColorSpace, historyColorSpace) >= 0.0))
+    // NaN/Inf guard: the strict form catches NaN (NaN < x is false) AND both
+    // infinities (the old `>= 0` test passed +Inf, and Inf*tGate=0 = NaN
+    // poisoned the blend for a frame). Collapse to the neighborhood mean.
+    if (!(dot(historyColorSpace, historyColorSpace) < kLargeValue))
         historyColorSpace = colorStats.mean;
 
     // Gamut recompression: required with resampling-overshoot margin, and
@@ -535,26 +524,38 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
         dbgCode = 5.0;
     }
 
-    // ---- temporal clip state: read, reset, advance -----------------------
+    // ---- temporal clip state + acutance transport -------------------------
     // The previous stable output's packed alpha, read AT THE LANDING through
-    // the DEDICATED POINT-SAMPLED binding (slot 5). The state is sigma
-    // (E[i^2]), the record's AGE (the Student dof and the accumulator
-    // transient) and the fiction flag.
+    // the DEDICATED POINT-SAMPLED binding (slot 5). ONE fetch feeds BOTH the
+    // clip-state decode and the acutance EWMA (below) -- note the fetch is
+    // now unconditional: the acutance stabilization runs with the clip
+    // memory off too (the packed energy is written regardless).
     bool  temporalStateEnabled = (taaUseHullClipping > 0.5);
     float sigmaPrevSq = -1.0;
     float agePrev     = 0.0;
     bool  fictionPrev = false;
+
+    float2 stateUV       = SnapUVToTexel(repro.sampleUV, vp).snappedUV;
+    float  prevStateAlpha = tex2Dlod(historyStateTex, float4(stateUV, 0.0, 0.0)).a;
     if (temporalStateEnabled)
+        DecodeClipState(prevStateAlpha, sigmaPrevSq, agePrev, fictionPrev);
+
+    // The acutance target, TEMPORALLY STABILIZED: the fresh measurement is
+    // taken at the CURRENT jitter phase and swings ~2x across the phase
+    // cycle on edges; packing it raw made the sharpener's boost itself
+    // flicker. EWMA against the previous frame's decoded value AT THE
+    // LANDING (the same advection semantics as the record). Foreign/debug
+    // tags decode 0, so the target ramps in over ~4 frames after debug or
+    // on reveals -- no sharpening pops.
+    float acutanceStabLin = saturate(sqrt(rawSharpnessEnergy)) * (1.0 / 3.0);
     {
-        float2 stateUV = SnapUVToTexel(repro.sampleUV, vp).snappedUV;
-        DecodeClipState(tex2Dlod(historyStateTex, float4(stateUV, 0.0, 0.0)).a,
-                        sigmaPrevSq, agePrev, fictionPrev);
+        float ePrev = DecodeAcutanceLinear(prevStateAlpha);
+        acutanceStabLin = lerp(ePrev, acutanceStabLin, kSharpEwmaRate);
     }
 
     // This frame's own fiction state: a TRAVELING dilation band (dilation
-    // zone with real motion), DIRECTION-BLIND. Static dilation -- a thin
-    // fence at rest -- is NOT fiction. Both sides of a traveling band are
-    // the DILATION's to own; the clip never distinguishes them.
+    // zone with real motion), DIRECTION-BLIND. Static dilation is NOT
+    // fiction.
     bool dilationFictionNow = currentLayer.isDilationZone
                             && (repro.motionMagnitudePx > 0.5);
 
@@ -566,19 +567,14 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
     }
 
     // The innovation against the stored accumulator, PRE-clip, and its
-    // PHASE-CORRECTED form. The RAW second moment feeds the record (the
-    // accumulator carries the full phase oscillation -- the sub-texel and
-    // resampler-footprint room); the CORRECTED form (the phase bit
-    // subtracted: beta * u, u = -fracPx) feeds the mean-structure test
-    // only.
+    // PHASE-CORRECTED form (the mean-structure test input).
     float3 innov       = currentColorSpace - historyColorSpace;
     float  innovSq     = dot(innov, innov);
     float3 innovCorr   = innov - colorStats.phaseShift;
     float  innovCorrSq = dot(innovCorr, innovCorr);
 
-    // The spatial prior: the taps' TOTAL variance tr(Cov) -- the
-    // anti-alignment's corroboration reference, the re-seed, and the
-    // change-point tests' scale (NEVER the record: the record is exactly
+    // The spatial prior: the taps' TOTAL variance tr(Cov) -- the re-seed and
+    // the change-point tests' scale (NEVER the record: the record is exactly
     // what a ghost arms).
     float spatialSigmaSq = dot(colorStats.sigma, colorStats.sigma);
     float spatialScaleSq = max(spatialSigmaSq, kClipSigmaRecordFloorSq);
@@ -586,24 +582,29 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
     bool  innovFinite    = (innovSq < kLargeValue);
 
     // (a) THE ANTI-ALIGNMENT RESET (the ghost signature; see taaClip): the
-    //     mean lies BETWEEN the current sample and the history; the
-    //     PHASE-CLEAN corrected innovation corroborates against the
-    //     neighborhood's trace at chi^2_3(0.80); the history is
-    //     meaningfully outside; and DILATION ZONES are exempt -- the band
-    //     is the silhouette's feather, both sides; the clip's domain
-    //     begins beyond it. A vacated texel still carrying object color
-    //     (the ghost past the feather) fires this and is reset in one
-    //     frame.
+    //     mean lies BETWEEN the current sample and the history, the
+    //     PHASE-CLEAN corrected innovation corroborates, the history is
+    //     meaningfully outside, and DILATION ZONES are exempt. The test
+    //     vector is the PHASE-CORRECTED d (the centroid correction -- the
+    //     un-corrected d carried the kernel-truncation wobble, perturbing
+    //     the direction test), and the guards are STANDARDIZED per channel
+    //     by the aniso-capped spatial sigma: the old trCov-normalized forms
+    //     were luma-scaled on luma-dominant content, so a pure-chroma ghost
+    //     had to clear a LUMA-scaled corroboration AND distance bar. The
+    //     standardized forms are identical under isotropy.
     // (b) THE SHOCK: innovation > kClipSpikeRatio times BOTH the record
     //     and the neighborhood's squared AABB range.
     // (c) GEOMETRY AS EVIDENCE, NOT COMMAND: a geometric reject resets only
     //     when the color side corroborates (chi^2_3 at 95%).
-    float3 dAlign        = historyColorSpace - colorStats.mean;
+    float3 dAlign        = historyColorSpace - colorStats.mean + colorStats.gatePhaseShift;
     float  dAlignSq      = dot(dAlign, dAlign);
     bool   antiAligned   = dot(innovCorr, dAlign)
                            < -kAlignCos * sqrt(innovCorrSq * dAlignSq);
-    bool   farEnough     = dAlignSq > kAlignDist * kAlignDist * spatialScaleSq;
-    bool   corroborated  = innovCorrSq > kAlignSpatial * spatialScaleSq;
+    float3 guardSigma    = AnisoClampSigma(colorStats.sigma);
+    float3 zAlign        = dAlign / guardSigma;
+    float3 zInnov        = innovCorr / guardSigma;
+    bool   farEnough     = dot(zAlign, zAlign) > kAlignDistChiSq;
+    bool   corroborated  = dot(zInnov, zInnov) > kAlignSpatialChiSq;
     bool   antiAlignReset = hadRecord && !currentLayer.isDilationZone
                          && antiAligned && farEnough && corroborated;
 
@@ -618,18 +619,9 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
     bool  carryRecord = hadRecord && !resetRecord;
 
     // FULL-RATE, WINSORIZED ingest of the RAW second moment -- no motion
-    // fade. THE SEED IS THE SPATIAL PRIOR: a change-point's first squared
-    // residual is a draw from the OLD error, not the new regime's spread --
-    // seeding E with it armed the gate to the change-point's own magnitude
-    // and left the post-reset remnant riding unclipped at blend speed (the
-    // faint, clip-shaped ghost). The spatial prior is the new regime's
-    // MEASURED spread, and the Student factor (nu = 4 at age 0) prices its
-    // own uncertainty. The AGE resets with the seed (the dof and the
-    // accumulator transient restart).
-    //
-    // DILATION-FICTION FREEZE (traveling bands): the innovation is
-    // borrowed-content fiction -- never ingested, the record and its age
-    // frozen, the flag written.
+    // fade. THE SEED IS THE SPATIAL PRIOR (the new regime's measured
+    // spread). DILATION-FICTION FREEZE (traveling bands): never ingested,
+    // the record and its age frozen, the flag written.
     bool fictionFreeze = carryRecord && dilationFictionNow;
 
     float winsorCap   = kClipWinsorC * kClipWinsorC * max(sigmaPrevSq, kClipSigmaRecordFloorSq);
@@ -655,26 +647,23 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
         ageNext     = 0.0;                     // the seed IS the reset
     }
 
-    // The flag travels with every traveling-band output (the reader rule
-    // exempts band readers, so this marks the wake, nothing else).
+    // The flag travels with every traveling-band output.
     bool fictionAdvected = dilationFictionNow;
 
     // The accumulator's blend weight at clip time (motion only). The
     // clip-rejection and alignment drops raise the TRUE accumulator alpha,
-    // biasing Var(h) low -- the tight, anti-ghost direction (the mu share
-    // does not depend on it).
+    // biasing Var(h) low -- the tight, anti-ghost direction.
     float statAlpha = 1.0 - ComputeMotionFeedback(repro);
 
-    // ---- the statistic gate ------------------------------------------------
+    // ---- the statistic gate -----------------------------------------------
+    // Per-channel normalized, phase-corrected test vector, transient +
+    // Student accounting, conservative-or-scoped mu share (taaClip).
     ClipGateResult clipGate = ClipHistoryToStatisticGate(
         historyColorSpace, colorStats, gateSigmaSq, ageNext, statAlpha, repro.motionNormalized);
     float3 clippedHistorySpace = clipGate.clippedColorSpace;
 
     // Mode 11 (clip gate state): A = 1.0 carried / 0.35 reset this frame
-    // (anti-alignment, shock, corroborated geometry, NaN) / 0.15 no record;
-    // B = applied shrink. The ghost-past-the-feather kill reads as a
-    // one-frame 0.35 flash just beyond the band's trailing edge, then
-    // quiet; the post-reset gate re-warms from the spatial scale.
+    // / 0.15 no record; B = applied shrink.
     if (taaDebugMode > 10.5 && taaDebugMode < 11.5)
     {
         dbgCode = 11.0;
@@ -713,7 +702,8 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
     // ------------------------------------------------------------------
     // 13) Final blend & output: RGB is ALWAYS the real resolved color.
     //     Alpha = the packed CLIP STATE (sign / tag 0110 / 7-bit state
-    //     sigma / 12-bit acutance / 7-bit record age / fiction flag).
+    //     sigma / sqrt-compressed stabilized acutance / 7-bit record age /
+    //     fiction flag).
     // ------------------------------------------------------------------
     float3 blendedColorSpace = lerp(clippedHistorySpace, currentFrameColorSpace, currentBlendWeight);
     // Clamp scalar luminance only; do NOT clamp signed chrominance channels.
@@ -721,7 +711,7 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
     float3 outputRGB = max(FromSpace(blendedColorSpace), 0.0);
     float outAlpha = debugActive
         ? PackDebugAlpha(dilationRevoked, dbgCode, saturate(dbgA), saturate(dbgB), sqrt(sigmaStatSq))
-        : PackClipStateAlpha(dilationRevoked, sqrt(sigmaStatSq), ageNext, rawSharpnessEnergy, fictionAdvected);
+        : PackClipStateAlpha(dilationRevoked, sqrt(sigmaStatSq), ageNext, acutanceStabLin, fictionAdvected);
     return float4(outputRGB, outAlpha);
 }
 

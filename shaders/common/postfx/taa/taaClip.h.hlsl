@@ -1,235 +1,147 @@
 // ============================================================================
 // TAA history clipping: color statistics, the temporal clip-state transport
-// (sigma + age + fiction), the Mahalanobis statistic gate, and the
-// feedback consumers
+// (sigma + age + fiction), the Mahalanobis statistic gate, and the feedback
+// consumers
 // ----------------------------------------------------------------------------
-// THE CLIP (design, stated honestly): the accumulator is the ESTIMATOR,
-// h_{t+1} = (1-a) h_t + a x_t, and the clip is a robust innovation gate on
-// the STATISTIC -- not a plausibility test of a fresh sample. The gate is a
-// coverage statement about the only two random objects in the system:
-//
+// THE CLIP (design): the accumulator is the ESTIMATOR, h_{t+1} = (1-a)h_t +
+// a x_t, and the clip is a robust innovation gate on the STATISTIC -- a
+// coverage statement about the only two random objects:
 //     h   the accumulator:   Var(h)  = a/(2-a) Var(x)      (iid limit)
-//     i_t = x_t - h_{t-1}:  E[i^2]  = 2/(2-a) Var(x)
+//     i_t = x_t - h_{t-1}:   E[i^2]  = 2/(2-a) Var(x)
 //         =>  Var(h) = (a/2) E[i^2]                        -- EXACT
 //     mu  the phase-mean estimate (the jitter-aware tap mean):
-//         Var(mu) = invNeff Var(x),  invNeff = SumW2/SumW^2
-//         -- measured live from the ACTUAL weight kernel (0.18 standard
-//            weights, up to ~0.27 at a corner-phase kernel).
+//         Var(mu) = invNeff Var(x), invNeff = SumW2/SumW^2 (measured live)
 //
-//     gate_var = cStat(t) * S(nu(t)) * E[i^2]   (live; see below)
-//     gate_var = invNeff * sigma_c^2            (cold: the change-point
-//                                                replacement, tight)
+// THE PER-CHANNEL NORMALIZATION (fixed in this revision -- read first): the
+// record transports the TOTAL E[|i|^2] (summed over the working-space
+// channels); the Mahalanobis test needs the PER-CHANNEL variance
+// cStat * E[i_k^2]. The previous form paid the full total to every channel:
+// 3x the true per-channel variance under isotropy (chi = 2.8 actually gated
+// at chi*sqrt(3) ~ 4.85 sigma) and unboundedly loose on the quiet channels
+// of luma-dominant content. The gate now splits the total by the live
+// spatial covariance's diagonal:
+//     share_k = sigma_k^2 / tr(Cov),   gateVar_k = (...) * E * share_k
+// exact per channel under the design's own stationarity model
+// (E[i_k^2] = 2/(2-a) Var(x_k); sigma_k^2 estimates Var(x_k)). share is
+// computed from the ANISO-CAPPED sigma (AnisoClampSigma): temporally-white,
+// spatially-correlated noise on a quiet channel would otherwise be
+// under-covered by its share (chroma shimmer); the cap bounds per-channel
+// tightening at kAnisoSigmaCap^-2 of the loudest channel.
 //
-// THE INNOVATION, SPLIT BY CONSUMER (landings between pixels are
-// first-class): after translating out the (dejittered) content
-// displacement, the innovation compares a POINT SAMPLE of the raw field,
-// at sub-texel offset u = -fracPx from the stable point, with a KAISER
-// RECONSTRUCTION of the accumulator field at the landing fraction phi_h.
-// The accumulator field is PHASE-FREE (each stored texel is the
-// jitter-centered mean at its position), and the innovation splits into
-// exactly three bits:
-//   * PHASE beta*u: the point sample's phase (the accumulator has none).
-//     Jitter-correlated; energy = the sub-texel room. CONSUMER: subtracted
-//     for every mean-structure test (the anti-alignment); KEPT in the raw
-//     second moment (the record -- the accumulator carries the full phase
-//     oscillation, so the variance path must measure it).
-//   * RESAMPLE -R(phi_h): the Kaiser's error reconstructing the AA field
-//     at the landing fraction. Zero at texel centers; second order on
-//     coverage ramps (the stored history near an edge IS the ramp -- a
-//     between-pixels landing resamples the RAMP, not the two layers);
-//     first order only for sub-texel edges, bounded by the kernel's
-//     across-edge leakage (~10-20% of the gap). CONSUMER: the record, as
-//     the resampler's footprint variance.
-//   * DISCREPANCY: everything persistent (content change, staleness,
-//     wrong-layer reads, velocity error). CONSUMER: the anti-alignment's
-//     actual subject.
-// The corrected innovation (the anti-alignment's input) is
-//     i_corr = i - beta*u
-// with beta the local gradient (central differences -- the ramp model; the
-// step mismatch at hard edges peaks at ~gap/4 on 50/50 straddles, is
-// zero-mean over the sequence, and is covered by the record).
+// THE CORRECTED TEST VECTOR: the gate (and the anti-alignment) test
+//     d_corr = h - mu + beta * (centroid - u)
+// with u = the snap residual and centroid = the ACTUAL weighted centroid of
+// the tap kernel. The taps sample the stable field SHIFTED by -u, so for a
+// linear field mu = f(S + centroid - u): mu's residual phase displacement is
+// beta*(centroid - u), and it is ADDED to d to cancel it. The jitter-aware
+// kernel's TRUNCATED centroid tracks only ~0.81 of the phase at corner
+// phases, so the un-corrected d carried a ~(1-kappa)*beta*u wobble. Exact
+// for linear fields, any kernel, any weight mode (non-jitter-aware:
+// centroid ~ 0 -> the full -beta*u correction -- that mode's "center
+// wanders with the phase" shimmer mechanism disappears with it). The gate's
+// OUTPUT is anchored at the history:
+//     clipped = h - (1 - tGate) * d_corr
+// tGate = 1 is a bit-exact passthrough; tGate = 0 lands on the phase-free
+// AA estimate (mu - gatePhaseShift) instead of the phase-carrying mu.
 //
-// MIXTURES ARE CONTENT (the anti-aliased texel): an AA texel's current
-// sample is itself a coverage mixture of foreground and background -- the
-// mixture IS the sub-texel signal. The statistics therefore run on the
-// FULL tap set, always: mixtures enter through (i) the jitter-centered
-// mean (the phase-correct target: the mixture at the CURRENT phase, so
-// the shrinkage never fights the jitter), (ii) the record (the mixture's
-// phase spread: the sub-texel room the gate must cover), (iii) the phase
-// bit above. No depth-plane masking of the color stats anywhere: masking
-// would treat a texel's own mixture as an outlier and de-antialias it.
+// THE INNOVATION, SPLIT BY CONSUMER (unchanged): i = PHASE (beta*u: kept in
+// the raw second moment -- the record; subtracted for every mean-structure
+// test: i_corr) + RESAMPLE (the Kaiser's reconstruction error: the record's
+// footprint variance) + DISCREPANCY (the anti-alignment's subject).
+// MIXTURES ARE CONTENT: the stats run on the FULL tap set, always.
+// DILATION SANCTITY: every dilation zone is exempt from the anti-alignment;
+// the fiction machinery owns traveling bands.
 //
-// DILATION SANCTITY: the clip treats every dilation zone identically --
-// exempt from the anti-alignment reset, full-mixture stats, the fiction
-// machinery as designed. The band is the silhouette's AA feather; the
-// clip's domain begins beyond it. Where bands exist at all is the
-// own-history validation's decision, never the color side's.
+// THE SAMPLING LAW (Studentization -- now on the correctly normalized
+// statistic): mdd/3 = [chi^2_3/3]/[chi^2_nu/nu] ~ F(3, nu) under the null;
+// the exact threshold at coverage p is 3*F_{3,nu}(p). nu(t) Satterthwaite
+// with the seed's declared prior dof (nu0 = 4), fit by the host as
+// S(nu) = 1 + taaStudentA/nu + taaStudentB/nu^2, exact at nu = 4 and
+// 12.33 (mid-range error ~1.4% at chi = 2.8, up to ~6% at chi >= 3.5 -- an
+// immaterial comfort-gate regime). The COLD path is deliberately NOT
+// Studentized: it is the change-point replacement, not a coverage statement.
 //
-// THE SAMPLING LAW OF THE GATE (Studentization -- the exact threshold):
-// the gate standardizes d by the record's ESTIMATE of E, not by E itself.
-// Under the null (isotropic Gaussian; the estimate independent of d -- the
-// conservative side, the accumulator's coupling only tightens the true
-// law):
-//     mdd / 3 = [chi^2_3 / 3] / [chi^2_nu / nu]  ~  F(3, nu)
-// The exact threshold at coverage p is 3 F_{3,nu}(p), NOT chi^2_3(p). The
-// record's EWMA carries nu(t) effective dof (Satterthwaite):
-//     nu = 1 / [D/nu0 + (rho/(2-rho)) (1-D)],   D = (1-rho)^{2t}
-// (nu0 = 4: the seed's declared prior dof -- see THE SEED below) --
-// nu = 4 at the seed, 12.33 at convergence for rho = 0.15. Implemented as
-//     S(nu) = 1 + taaStudentA/nu + taaStudentB/nu^2
-// fit BY THE HOST (studentFitAB, client/postFx/taa.lua) to the exact
-// F(3,nu) quantiles at the trajectory's two extremes -- nu = 4 (age 0)
-// and nu = 12.33 (converged) -- so the inflation is exact at birth and at
-// convergence and within ~1% across the lived range, AT EVERY SLIDER
-// VALUE: the required inflation is a function of the requested coverage
-// (the exact first-order term is (chi^2 - 1)/(2 nu); the full S(4) is
-// 1.18 at chi = 1.5 and 2.52 at chi = 2.8 -- a fixed constant cannot
-// serve both). The fit consumes the EFFECTIVE radius
-// chi * (1 + clipOvershoot) -- the same threshold the gate tests -- and
-// the host's STUDENT_RHO / STUDENT_NU0 must match kClipSigmaEmaRate /
-// kClipStudentPriorDof. Unset constants read 0: S = 1, the pre-Student
-// gate (graceful). The COLD path is deliberately NOT Studentized: it is
-// not a coverage statement but the change-point replacement.
+// THE ACCUMULATOR'S TRANSIENT (exact, per channel): Var(h_t) =
+// decayH*Var(h_0) + (1-decayH)*(a/2)*E_k with Var(h_0) = Var(mu_prev) =
+// muVar, relaxing at (1-a)^{2t}. The gate variance is
+//     gateVar_k = muVar_k*(1 + decayH) + (a/2)*E_k*(1 - decayH)
+// (2*muVar at t = 0: exactly Var(mu_prev - mu_cur)).
 //
-// THE ACCUMULATOR'S TRANSIENT (the exact center statistic): Var(h) =
-// (a/2)E is the STEADY state. After a reset h IS a fresh mu-estimate
-// (variance muShare E, muShare = invNeff (1 - a/2)), relaxing at (1-a)^2
-// per frame -- at feedback 0.97 a genuine ~10-frame transient:
-//     cStat(t) = [a/2 + (muShare - a/2)(1-a)^{2t}] + muShare
-// At t = 0 this is 2 muShare -- exactly Var(mu_prev - mu_cur), two
-// independent 9-tap means.
+// THE MU SHARE, conservative or residual-scoped (taaClipScopedMu, blended):
+//   * conservative (0): muVar_k = invNeff*(1-a/2)*E_k -- mu modelled as an
+//     invNeff-attenuated draw of the full x distribution. Exact for
+//     noise-dominated content; over-pays the phase energy on edges (the
+//     safe direction: a noiseless edge ran ~3x true, chi_eff ~ 5, ghosts
+//     below ~0.5x local contrast riding).
+//   * residual-scoped (1): muVar_k = invNeff * residSq_k, the weighted-LS
+//     residual variance around the local linear model (noise + curvature,
+//     dof-corrected for the 3 parameters the plane fit absorbs). Equals the
+//     conservative value on noise; collapses toward the floor on clean
+//     ramps and the gate recovers its nominal chi (ghost threshold ~0.2x
+//     local contrast). SELF-COVERING on straddles: the central-difference
+//     phase gradient underestimates the true slope there, so residSq
+//     inflates by the missing-slope energy -- exactly the scale of the
+//     phase correction's own error. Floors: (kScopedResidFrac*sigma)^2.
+//   scoped = 0 reduces EXACTLY to the previous cStat*E*share form.
 //
-// THE SEED (and the faint-ghost shelter it closes): a change-point's
-// first sample is the best estimate of the new regime's OFFSET -- and the
-// WORST available estimate of its VARIANCE: a single squared residual is
-// one draw, drawn from the OLD error, not the new spread. Seeding E :=
-// innovSq (the pre-fix form) armed the gate to the change-point's own
-// magnitude: post-reset the remnant sat deep inside a gap-wide gate,
-// tGate saturated to 1, and the only decay left was the blend's -- the
-// faint, clip-shaped ghost. Worse, a ghost AT the gate boundary feeds its
-// own residual back into E (innov^2 ~= r^2 while the boundary is
-// chi*sqrt(cStat)*r ~= 0.98 r at the default chi): a self-sustaining
-// neutral fixed point. The seed is now the SPATIAL prior tr(Cov_taps) --
-// the new regime's MEASURED spread (9 taps, this frame) -- and the
-// Student factor prices that seed's own uncertainty (nu = 4 at age 0: a
-// coarse prior is exactly what low dof means). On a reveal the gate
-// collapses to content scale on the first post-reset frame; the reset
-// frame's hard clip feeds the clip-distance rejection (the endorsed
-// refresh channel), and the accumulator re-averages from the honest
-// scale.
+// THE SEED: the spatial prior tr(Cov_taps) -- the new regime's MEASURED
+// spread, never the change-point's own squared residual (which re-armed the
+// gate to the ghost's scale). Over-seeds edges ~5x for ~7 frames: benign
+// (the reset itself already pulled h onto mu; the seed only governs
+// post-reset coverage).
 //
-// THE GHOST SIGNATURE (the anti-alignment reset -- no state, all
-// channels): for the three points every texel already has -- the current
-// sample x, the accumulator h, the neighborhood mean mu -- a ghost is
-// unambiguous GEOMETRY: mu sits BETWEEN x and h:
-//     d = h - mu;   i_corr = x - h - beta*u;
-//     ghost  <=>  dot(i_corr, d) < -kAlignCos |i_corr| |d|
-// Under the null i_corr ~ 0 (the phase bit cancelled exactly) and d ~ the
-// phase spread -- no fire, for any landing phase or fraction. A ghost --
-// LUMA OR CHROMA, armed record or not -- points anti-aligned. Guards:
-//   * SPATIAL corroboration: innovCorr^2 > kAlignSpatial * tr(Cov_taps),
-//     kAlignSpatial = chi^2_3(0.80)/3 = 1.55: the phase-clean corrected
-//     innovation must exceed the 80% bound of the neighborhood's own
-//     trace. (The pre-fix 3.0 ~= chi^2_3(0.97) existed to survive the
-//     mis-signed phase regressor, which left a DOUBLED phase oscillation
-//     in i_corr; with the corrected phase bit the null is single-
-//     amplitude and the 80% bound holds -- the faint-ghost kill floor
-//     drops from ~1.7 to ~1.2 sigma.)
-//   * DISTANCE: |d|^2 > kAlignDist^2 * tr(Cov) -- blocks sub-texel fires
-//     (their accumulator sits near the mean) and the test's own one-frame
-//     lag (a kill rebuilds it over a full frame; 0.5 sits between).
-//   * DILATION EXEMPTION: every dilation zone, both sides, direction-
-//     blind (see DILATION SANCTITY).
-// On fire: RESET -> the COLD gate this frame -> h pulled onto mu -> the
-// ghost replaced by current content; the record re-seeds from the
-// spatial prior and re-warms in ~7 frames.
+// THE GHOST SIGNATURE (anti-alignment; the test lives in the resolve, the
+// constants here): mu between x and h, i_corr anti-aligned with d_corr.
+// Guards (standardized per channel by the aniso-capped sigma -- the old
+// trCov forms were luma-scaled and blocked pure-chroma ghosts):
+//   * corroboration: Sum(i_corr_k^2/sigma_k^2) > chi^2_3(0.80) = 4.64
+//   * distance:      Sum(d_corr_k^2/sigma_k^2)  > 0.75
+//     (both identical to the old forms under isotropy)
+//   * dilation exemption. Null fires: rare on edges (the distance guard),
+//     cheap on flat noise (cold ~= live there).
 //
-// WHERE SIGMA COMES FROM (the information wall): the phase variance is
-// unmeasurable in a single frame at blind phases (an all-background 3x3
-// says nothing about the gap); it is sampled by the INNOVATION SEQUENCE,
-// measured PRE-CLIP against the stored accumulator, transported
-// bit-exactly through the output alpha, read back through a DEDICATED
-// POINT-SAMPLED history binding, advected with the content, reset on
-// disocclusion, re-warmed in ~7 frames. The record is the only carrier
-// of blind-phase room -- which is why the WINSOR CAP stays
-// record-referenced (C^2 E_prev, the Student-t predictive bound): the
-// cap must not throttle a straddling texel's blind-phase re-learning (at
-// revealing phases the edge is in the 3x3 and the ingest is uncapped; at
-// blind phases E_prev carries the room).
+// THE WINSOR CAP stays record-referenced (C^2 E_prev, the Student-t
+// predictive bound): engages at chi^2_3 > 27 (~6e-6 under Gaussian) --
+// negligible bias, outlier protection only.
 //
 // CHANGE-POINTS, in order of authority (all route to the cold gate, the
-// spatial seed, and age 0):
-//   (1) THE ANTI-ALIGNMENT RESET (above).
-//   (2) THE SHOCK: innovation > kClipSpikeRatio times BOTH the record
-//       and the neighborhood's squared AABB range (the range tracks the
-//       population's tail, so heavy-tailed legit content never shocks).
-//   (3) THE FICTION SENTINEL: a record written by a traveling dilation
-//       band is foreign content; every non-band reader kills it.
-//   (4) GEOMETRY AS EVIDENCE, NOT COMMAND: a geometric reject resets only
-//       when the color side corroborates (chi^2_3 at 95%).
+// spatial seed, age 0): (1) the anti-alignment reset; (2) THE SHOCK --
+// innovation > kClipSpikeRatio (4x) times BOTH the record and the
+// neighborhood's squared AABB range (a heuristic conjunction, conservative
+// through the range term -- not a derived quantile); (3) the fiction
+// sentinel; (4) geometry as evidence, not command (corroborated at
+// chi^2_3(0.95)/3 = 2.6).
 //
-// NO STATIC/MOTION DIVISION: no motion fade, no ingest floor, no absolute
-// pixel threshold in the gate. The record ingests the TOTAL innovation at
-// full rate, winsorized; motion enters through what it does to the
-// innovation. The blend's responsive channels are the clip-distance
-// rejection (event-relative, independent floor) and the alignment drop
-// (phase-relative); the motion drop is inert in the pinned configuration
-// by design.
-//
-// THE FAINT-GHOST FLOOR, stated honestly: with geometric disocclusion
-// off, the color side kills anything persistently anti-aligned above
-// ~1.2 sigma_layer; below that the evidence of a single frame cannot
-// distinguish a ghost from content noise, and the reset frame's
-// clip-distance refresh plus re-averaging handles the remnant. That
-// floor is the information limit of single-frame color evidence -- the
-// geometric tests are the other half.
+// TRANSPORT LAYOUT (the output alpha, non-debug): [31] revocation sign (the
+// motion-field writer reads ONLY this); [30:27] tag 0110; [26:20] the state
+// sigma (7-bit log2, TOTAL across channels, code 0 = cold); [19:8] the
+// acutance target, 12 bits SQRT-COMPRESSED (packed linear [0,1] <->
+// energy [0,9]; the old linear packing saturated at E = 1 -- every
+// full-contrast LDR edge and all HDR content) and TEMPORALLY STABILIZED
+// (EWMA at rate kSharpEwmaRate against the previous frame's decoded value
+// at the landing -- the raw measurement swings ~2x across the jitter phase
+// cycle on edges and would flicker the sharpener's boost); [7:1] the
+// record's age; [0] the fiction flag. WHILE DEBUG IS ON the debug payload
+// (tag 0111) carries the sigma in its low 7 bits. Read back bit-exactly
+// through the DEDICATED POINT-SAMPLED history binding.
 //
 // SAFETY LAYERS: (1) the accumulator share floored at kStatAlphaFloor;
-// (2) the record floored at kClipSigmaRecordFloorSq; (3) the E winsor cap
-// (record-referenced -- see WHERE SIGMA COMES FROM); (4) the Student and
-// transient inflations (the exact estimation-uncertainty accounting,
-// slider-coupled); (5) soft clip. The emitted value always lies ON THE
-// SEGMENT [mu, history]; it may exceed the tap AABB BY DESIGN (the
-// sub-texel room).
-//
-// HONEST LIMITS: chi = taaVarianceGamma is the NOMINAL coverage radius
-// of a 3-dof Gaussian (1.0 -> 20%, 1.5 -> 48%, 2.0 -> 74%, 2.2 -> 82%,
-// 2.5 -> 90%, 2.7959 -> 95%, 3.0 -> 97%, 3.5 -> 99.3%); the Student
-// inflation is what makes the nominal TRUE, and it TRACKS THE SLIDER.
-// The F law assumes the isotropic Gaussian and estimate-independence
-// (the conservative side). Var(mu) via invNeff assumes tap independence.
-// THE MOTION FRINGE: under motion faster than the accumulator can track
-// (the pinned-feedback regime), the anti-alignment re-fires on
-// flat-near-edge texels as the one-frame lag rebuilds -- those texels
-// degenerate to the SPATIAL estimator for the motion's duration.
-// kAlignDist sizes the fringe; unpinning feedbackMin restores the
-// blend-side response.
-//
-// TRANSPORT LAYOUT (the output alpha, non-debug): [31] revocation sign
-// (the motion-field writer reads ONLY this); [30:27] tag 0110; [26:20]
-// the state sigma, 7-bit log2 scale s = (1/255) 2^(code/8 - 8), code 0 =
-// the explicit cold marker; [19:8] the acutance energy, 12 bits (the
-// quantization step 2.4e-4 sits at the sharpener's own noise floor
-// kSharpEnergyFloor = 1e-4, and pack-time saturation only lowers boost --
-// the safe direction); [7:1] the RECORD'S AGE -- frames since the seed,
-// 7 bits linear, saturating at 127 (the Student dof and the accumulator
-// transient; re-warms from 0 after debug -- the conservative, maximum-
-// inflation direction); [0] the FICTION FLAG (traveling-band writer).
-// WHILE DEBUG IS ON the debug payload (tag 0111) carries the sigma in
-// its low 7 bits; the age and the fiction flag re-warm after debug.
-// Read back bit-exactly through the DEDICATED POINT-SAMPLED history
-// binding (a linear sampler is NOT exact even at a snapped texel center:
-// the center (k+0.5)/N is not float-representable for non-power-of-two
-// sizes).
+// (2) the record floored at kClipSigmaRecordFloorSq; (3) the winsor cap;
+// (4) the Student + transient inflations (the whole live gateVar is
+// inflated by S(nu), including the mu term -- a deliberate simplification
+// in the safe direction); (5) the soft clip; (6) the aniso cap and the
+// scoped-residual floor. The emitted value lies on the segment
+// [phase-free AA estimate, history]; it may exceed the tap AABB BY DESIGN.
 //
 // FRAGMENT HEADER: compiled only inside taa.fx.hlsl. Requires host context:
-// cbuffer perDraw (clipping + feedback constants, taaStudentA/B). Requires
-// fragments included before: taaShared.h.hlsl (kClipSigmaRef,
-// ClipPackSigmaCode, ClipUnpackSigmaCode), taaConstants.h.hlsl,
+// cbuffer perDraw (clipping + feedback constants, taaStudentA/B,
+// taaClipScopedMu). Requires fragments included before: taaShared.h.hlsl
+// (kClipSigmaRef, ClipPackSigmaCode, ClipUnpackSigmaCode), taaConstants,
 // taaFrame.h.hlsl (HistoryReprojection).
 // ============================================================================
 #ifndef TAA_CLIP_H_HLSL
 #define TAA_CLIP_H_HLSL
+
 // ============================================================================
 // SMALL CLIPPING MATH HELPERS
 // ============================================================================
@@ -245,12 +157,10 @@ float SoftClipUnitScale(float overshootUnits, float softClipAmount, float motion
 // ============================================================================
 // COLOR NEIGHBORHOOD STATISTICS
 // ============================================================================
-// The FULL tap set, always (see MIXTURES ARE CONTENT): the AABB (spike test
-// + the luma-drift chroma gate), the mean (gate center, NaN fallback),
-// sigma (cold gate, smear rejection, spatial scales), invNeff (the mean's
-// estimator share, measured live from the actual weight kernel) and
-// phaseShift (the phase-correlated part of the innovation, from the EXACT
-// sample snap offset).
+// The FULL tap set, always: the AABB (spike test + the luma-drift chroma
+// gate), the mean (gate center, NaN fallback), sigma (cold gate, smear
+// rejection, spatial shape), invNeff (the mean's estimator share), the
+// phase corrections and the LS residual (the scoped mu share).
 struct ColorNeighborhoodStats
 {
     float3 aabbMin;
@@ -258,7 +168,11 @@ struct ColorNeighborhoodStats
     float3 mean;
     float3 sigma;
     float  invNeff;         // SumW2 / SumW^2: Var(mu) = invNeff * Var(x)
-    float3 phaseShift;      // beta * u: the phase-correlated part (u = -fracPx)
+    float3 phaseShift;      // beta * u: the INNOVATION's phase bit (u = -fracPx sense)
+    float3 gatePhaseShift;  // beta * (centroid - u): mu's residual phase displacement
+                            // (the GATE/anti-alignment test-vector correction)
+    float3 residSq;         // per-channel weighted-LS residual variance around the
+                            // local linear model, dof-corrected (noise + curvature)
 };
 
 ColorNeighborhoodStats ComputeColorNeighborhoodStats(
@@ -277,8 +191,18 @@ ColorNeighborhoodStats ComputeColorNeighborhoodStats(
     float  totalWeightSq = 0.0;
     float  motionFactor  = saturate(motionNormalized);
 
+    // Weighted-offset accumulators: the kernel's ACTUAL centroid, the
+    // per-axis offset variances (LS slopes) and the offset cross-moments.
+    float2 weightedOffsetSum = float2(0.0, 0.0);
+    float  weightedOffXSqSum = 0.0;
+    float  weightedOffYSqSum = 0.0;
+    float3 weightedCovXSum   = float3(0.0, 0.0, 0.0);   // Sum w * offx * c
+    float3 weightedCovYSum   = float3(0.0, 0.0, 0.0);   // Sum w * offy * c
+
     bool jitterCenteredWeights = (taaJitterAwareVariance > 0.5);
     float2 weightCenterPx = jitterCenteredWeights ? jitterPx : float2(0.0, 0.0);
+
+    float w9[9];
 
     [unroll]
     for (int i = 0; i < 9; ++i)
@@ -300,10 +224,17 @@ ColorNeighborhoodStats ComputeColorNeighborhoodStats(
             w *= lerp(1.0, saturate(dot(tapOffsetPx, motionDirUnit) * kInvLength[i] * 0.5 + 0.5), motionFactor);
         }
 
-        weightedSum   += tapColorSpace * w;
-        weightedSumSq += tapColorSpace * tapColorSpace * w;
-        totalWeight   += w;
-        totalWeightSq += w * w;
+        w9[i] = w;
+
+        weightedSum       += tapColorSpace * w;
+        weightedSumSq     += tapColorSpace * tapColorSpace * w;
+        totalWeight       += w;
+        totalWeightSq     += w * w;
+        weightedOffsetSum += tapOffsetPx * w;
+        weightedOffXSqSum += tapOffsetPx.x * tapOffsetPx.x * w;
+        weightedOffYSqSum += tapOffsetPx.y * tapOffsetPx.y * w;
+        weightedCovXSum   += tapOffsetPx.x * tapColorSpace * w;
+        weightedCovYSum   += tapOffsetPx.y * tapColorSpace * w;
     }
 
     float invTotalWeight = 1.0 / max(totalWeight, kEpsilon);
@@ -311,19 +242,58 @@ ColorNeighborhoodStats ComputeColorNeighborhoodStats(
     stats.sigma   = sqrt(max(weightedSumSq * invTotalWeight - stats.mean * stats.mean, 0.0));
     stats.invNeff = saturate(totalWeightSq * invTotalWeight * invTotalWeight);
 
-    // THE PHASE BIT (the corrected sign + structure): the sample sits at
-    // S + u with u = -jitterPx (jitterPx is pixel.fracPx, the snap residual
-    // -- the sample's offset from the stable point, negated). The
-    // accumulator field is PHASE-FREE (each stored texel is the
-    // jitter-centered mean at its position), so the phase-correlated part
-    // of the innovation is exactly beta * u = -beta * jitterPx. Subtracting
-    // phaseShift from the innovation cancels it for every mean-structure
-    // test; the RAW second moment (the variance path) keeps its energy
-    // (the sub-texel room). The landing's fraction enters elsewhere, as
-    // the resample bit R(phi_h) the record absorbs.
-    float3 gradX = 0.5 * (neighborhoodColorSpace[4] - neighborhoodColorSpace[3]);
-    float3 gradY = 0.5 * (neighborhoodColorSpace[2] - neighborhoodColorSpace[1]);
-    stats.phaseShift = -(gradX * jitterPx.x + gradY * jitterPx.y);
+    // ---- kernel geometry: the ACTUAL weighted centroid ----------------------
+    // NB: named kernelCentroidPx, NOT 'centroid' -- 'centroid' is a reserved
+    // GLSL interpolation qualifier and the engine's HLSL->GLSL front end
+    // lexes it as a keyword even inside .hlsl files (that was the compile
+    // failure). weightCenterPx above is the INTENDED kernel center; this is
+    // the actual one (grid truncation included -- it tracks only ~0.81x the
+    // phase at corner phases).
+    float2 kernelCentroidPx = weightedOffsetSum * invTotalWeight;
+    float  vXX = max(weightedOffXSqSum * invTotalWeight - kernelCentroidPx.x * kernelCentroidPx.x, 1e-6);
+    float  vYY = max(weightedOffYSqSum * invTotalWeight - kernelCentroidPx.y * kernelCentroidPx.y, 1e-6);
+
+    // ---- gradient estimator (1): central differences ------------------------
+    // The established phase-bit regressor. The taps sample the stable field
+    // SHIFTED by -u, so for a linear field:
+    //   x  = f(S - u),  mu = f(S + kernelCentroidPx - u)
+    //     -> i = x - h ~= -beta*u                             (phaseShift cancels it)
+    //     -> d = h - mu ~= -beta*(kernelCentroidPx - u)   (gatePhaseShift cancels it)
+    // Auto-adapts to both weight modes (non-jitter-aware: centroid ~ 0 -> the
+    // full -beta*u); exact for linear fields; its own error on straddles is
+    // covered by residSq below.
+    float3 gradCDx = 0.5 * (neighborhoodColorSpace[4] - neighborhoodColorSpace[3]);
+    float3 gradCDy = 0.5 * (neighborhoodColorSpace[2] - neighborhoodColorSpace[1]);
+    stats.phaseShift     = -(gradCDx * jitterPx.x + gradCDy * jitterPx.y);
+    stats.gatePhaseShift = gradCDx * (kernelCentroidPx.x - jitterPx.x)
+                         + gradCDy * (kernelCentroidPx.y - jitterPx.y);
+
+    // ---- gradient estimator (2): weighted-LS slopes (decoupled normal
+    // equations; the small offset cross-covariance is neglected, which
+    // UNDER-explains -> OVER-estimates the residual -> the safe direction).
+    // NOT used for the phase corrections.
+    float3 covX  = weightedCovXSum * invTotalWeight - kernelCentroidPx.x * stats.mean;
+    float3 covY  = weightedCovYSum * invTotalWeight - kernelCentroidPx.y * stats.mean;
+    float3 lsGX = covX / vXX;
+    float3 lsGY = covY / vYY;
+
+    // ---- the LS residual: noise + curvature, dof-corrected -----------------
+    // Second pass over the (in-register) taps. The mean squared residual of a
+    // 3-parameter plane fit under-estimates the per-tap residual variance by
+    // the dof the fit absorbed; N_eff = 1/invNeff corrects, clamped at 3x
+    // (corner-phase kernels have N_eff ~ 3.7 -- their invNeff is
+    // correspondingly larger, which partially self-corrects).
+    float3 ssr = float3(0.0, 0.0, 0.0);
+    [unroll]
+    for (int j = 0; j < 9; ++j)
+    {
+        float2 dOff = kOffsets3x3[j] - kernelCentroidPx;
+        float3 fit  = stats.mean + lsGX * dOff.x + lsGY * dOff.y;
+        float3 r    = neighborhoodColorSpace[j] - fit;
+        ssr += w9[j] * (r * r);
+    }
+    float dofCorr = 1.0 / max(1.0 - 3.0 * stats.invNeff, 1.0 / 3.0);
+    stats.residSq = max(ssr * invTotalWeight * dofCorr, 0.0);
 
     // Firefly clamp: pulls the AABB (used by the luma-drift chroma gate and
     // the spike test) into the mean +/- k*sigma band.
@@ -335,9 +305,8 @@ ColorNeighborhoodStats ComputeColorNeighborhoodStats(
         stats.aabbMax = clamp(stats.aabbMax, fireflyMin, fireflyMax);
     }
 
-    // POPOVICIU: any distribution supported on [min, max] has variance <=
-    // (max - min)^2 / 4, so the (possibly firefly-clamped) range bounds the
-    // tap sigma. A no-op by construction on unclamped neighborhoods.
+    // POPOVICIU: variance <= (max - min)^2 / 4 for anything supported on
+    // [min, max]. A no-op by construction on unclamped neighborhoods.
     stats.sigma = min(stats.sigma, 0.5 * (stats.aabbMax - stats.aabbMin));
 
     float spatialContrast = max(stats.aabbMax.x - stats.aabbMin.x, kMinSpatialContrast);
@@ -365,34 +334,61 @@ ColorNeighborhoodStats ComputeColorNeighborhoodStats(
 // CLIP CONSTANTS (the sigma encoding lives in taaShared -- two transports)
 // ============================================================================
 static const float kClipSigmaEmaRate         = 0.15;          // rho: the record's EMA rate (~7-frame re-warm)
-static const float kClipSigmaRecordFloorSq   = (1.0 / 255.0) * (1.0 / 255.0);  // the record's minimum carried VARIANCE (sigma >= kClipSigmaRef). NOT the transport's resolution -- the deliberate floor the change-point tests and the winsor cap normalize against.
-static const float kStatAlphaFloor           = 0.10;          // accumulator-share floor (blind-phase coverage); the mu share does not depend on it
-static const float kClipSpikeRatio           = 4.0;           // innovation shock: >4x the record AND the AABB range = change-point (t(11) @ ~99.8% ~= 3.9, derived not tuned)
-static const float kClipWinsorC              = 3.0;           // E's winsorization cap, in sigma_hat of the PREVIOUS record (Student-t predictive outlier bound; record-referenced so a straddling texel's blind-phase room survives -- see WHERE SIGMA COMES FROM)
+static const float kClipSigmaRecordFloorSq   = (1.0 / 255.0) * (1.0 / 255.0);  // the record's minimum carried VARIANCE (TOTAL across channels). NOT the transport's resolution -- the deliberate floor the change-point tests and the winsor cap normalize against.
+static const float kStatAlphaFloor           = 0.10;          // accumulator-share floor (blind-phase coverage)
+static const float kClipSpikeRatio           = 4.0;           // innovation shock: >4x the record AND the AABB range = change-point. A heuristic conjunction (the range term tracks the population's tail, so heavy-tailed legit content never shocks) -- conservative, not a derived quantile.
+static const float kClipWinsorC              = 3.0;           // E's winsorization cap, in sigma_hat of the PREVIOUS record (Student-t predictive outlier bound; record-referenced so a straddling texel's blind-phase room survives)
 static const float kClipCorroborateRatio     = 2.6;           // geometric-reject corroboration, in units of the carried E[i^2]: chi^2_3(0.95)/3
-static const float kAlignCos                 = 0.5;           // anti-alignment strength: dot(i_corr,d) < -0.5|i||d| (the slack absorbs ghost+phase cross terms)
-static const float kAlignDist                = 0.5;           // |d| must exceed this fraction of the spatial trace: blocks sub-texel fires and the test's own one-frame lag
-static const float kAlignSpatial             = 1.55;          // innovCorr^2 vs tr(Cov): chi^2_3(0.80)/3 -- the 80% bound of the neighborhood's trace. (The pre-fix 3.0 ~= chi^2_3(0.97) existed to survive the mis-signed phase regressor, which left a DOUBLED phase oscillation in i_corr; with the corrected phase bit the null is single-amplitude and the 80% bound holds -- the faint-ghost floor drops from ~1.7 to ~1.2 sigma.)
-static const float kClipRejectionFeedbackFloor = 0.5;         // the clip-distance rejection's INDEPENDENT floor: a full-rejection event injects a half-weight current sample. Deliberately NOT taaFeedbackMin -- with a pinned feedback pair a floor tied to feedbackMin made the rejection a silent no-op.
+static const float kAlignCos                 = 0.5;           // anti-alignment cone: dot(i_corr,d) < -0.5|i||d| (the slack absorbs ghost+phase cross terms)
+// Standardized anti-alignment guards (chi^2_3 units, per channel by the
+// aniso-capped spatial sigma; applied by the resolve). Both are the exact
+// isotropic equivalents of the old tr(Cov) forms:
+static const float kAlignDistChiSq           = 0.75;          // was |d|^2 > 0.25*tr(Cov)
+static const float kAlignSpatialChiSq        = 4.642;         // chi^2_3(0.80); was i_corr^2 > 1.55*tr(Cov)
+static const float kClipRejectionFeedbackFloor = 0.5;         // the clip-distance rejection's INDEPENDENT floor: a full-rejection event injects a half-weight current sample. Deliberately NOT taaFeedbackMin.
+// Per-channel shape cap: the gate share / guard normalization floors each
+// channel's sigma at this fraction of the loudest channel. Bounds the
+// tightening on quiet channels (spatially-correlated temporal noise
+// insurance) at kAnisoSigmaCap^-2 in variance.
+static const float kAnisoSigmaCap            = 0.10;
+// Scoped-mu residual floor, as a fraction of the (aniso-capped) channel
+// sigma: leakage insurance for the LS residual estimate.
+static const float kScopedResidFrac          = 0.10;
+// Acutance transport: the EWMA rate of the stabilized target (the resolve
+// blends the fresh measurement with the previous decoded value at the
+// landing). ~4-frame stabilization.
+static const float kSharpEwmaRate            = 0.25;
 // Studentization: nu(t) = 1 / [D/nu0 + sigmaW2 (1-D)], D = (1-rho)^{2t},
 // sigmaW2 = rho/(2-rho) = 0.0811, 2*log2(1-rho) = -0.46893 (rho = 0.15).
-// S(nu) = 1 + taaStudentA/nu + taaStudentB/nu^2 is HOST-FIT (studentFitAB
-// in client/postFx/taa.lua) to the exact F(3,nu) quantiles at the lived
-// range's extremes, consuming the EFFECTIVE radius chi*(1+clipOvershoot).
-// The host's STUDENT_RHO / STUDENT_NU0 must match the two constants below.
-static const float kClipStudentPriorDof      = 4.0;           // the SEED's declared prior dof: the spatial seed is a 9-tap spread, ~4 honest dof after correlation -- a coarse prior is exactly what low dof means, and S(4) prices it
+// S(nu) = 1 + taaStudentA/nu + taaStudentB/nu^2 is HOST-FIT to the exact
+// F(3,nu) quantiles at nu = 4 and 12.33, consuming the EFFECTIVE radius
+// chi*(1+clipOvershoot). The host's STUDENT_RHO / STUDENT_NU0 must match
+// the two constants below.
+static const float kClipStudentPriorDof      = 4.0;           // the SEED's declared prior dof (a 9-tap spread ~ 4 honest dof after correlation)
 static const float kClipStudentVarFrac       = 0.0810811;     // rho/(2-rho)
 static const float kClipStudentDecay         = -0.4689303;    // 2*log2(1-rho)
-static const float kClipMaxAge               = 127.0;         // the age transport's saturation (both decays are ~0 there)
+static const float kClipMaxAge               = 127.0;         // the age transport's saturation
+
+// The per-channel spatial sigma, capped against extreme anisotropy: every
+// channel is floored at kAnisoSigmaCap of the loudest. Consumers: the
+// gate's per-channel share and the standardized anti-alignment guards.
+float3 AnisoClampSigma(float3 sigma)
+{
+    float sMax   = max(sigma.x, max(sigma.y, sigma.z));
+    float sFloor = max(sMax * kAnisoSigmaCap, kMinSigma);
+    return max(sigma, float3(sFloor, sFloor, sFloor));
+}
 
 // ============================================================================
 // CLIP-STATE TRANSPORT (the output alpha; layout in the file header)
 // ============================================================================
-float PackClipStateAlpha(bool revoked, float sigma, float age, float acutance, bool fictionAdvected)
+// acutanceLinear: the SQRT-COMPRESSED, TEMPORALLY STABILIZED acutance target
+// in [0,1] (energy in [0,9]). The resolve computes it; this only packs it.
+float PackClipStateAlpha(bool revoked, float sigma, float age, float acutanceLinear, bool fictionAdvected)
 {
     uint u = 0x30000000u                                      // tag 0110
            | ((uint(ClipPackSigmaCode(sigma) + 0.5) & 0x7Fu)    << 20)
-           | ((uint(saturate(acutance) * 4095.0 + 0.5) & 0xFFFu) << 8)
+           | ((uint(saturate(acutanceLinear) * 4095.0 + 0.5) & 0xFFFu) << 8)
            | ((uint(clamp(age, 0.0, kClipMaxAge)) & 0x7Fu)       << 1)
            |  (fictionAdvected ? 0x1u : 0x0u);
     return asfloat(revoked ? (u | 0x80000000u) : u);
@@ -444,7 +440,7 @@ struct ClipGateResult
 ClipGateResult ClipHistoryToStatisticGate(
     float3 historyColorSpace,
     ColorNeighborhoodStats stats,
-    float  sigmaStatSq,        // the temporal record (E[i^2]); < 0 = cold -> tap-based gate
+    float  sigmaStatSq,        // the temporal record (TOTAL E[|i|^2]); < 0 = cold -> tap-based gate
     float  recordAge,          // frames since the record's seed (transported)
     float  statAlpha,          // the accumulator's motion-based blend weight (a)
     float  motionNormalized)   // soft-clip restore only -- the gate itself has no motion term
@@ -452,50 +448,59 @@ ClipGateResult ClipHistoryToStatisticGate(
     ClipGateResult r;
     bool recordLive = (sigmaStatSq >= 0.0);
 
-    // THE EXACT CENTER STATISTIC: muShare = invNeff (1 - a/2) (age-
-    // independent); hShare(t) = a/2 + (muShare - a/2)(1-a)^{2t} (the
-    // accumulator IS a fresh mu-estimate at t = 0, relaxing to the steady
-    // (a/2)E); cStat(t) = hShare + muShare (2 muShare at t = 0: exactly
-    // Var(mu_prev - mu_cur)).
     float alphaStat = max(statAlpha, kStatAlphaFloor);
-    float muShare   = stats.invNeff * (1.0 - alphaStat * 0.5);
-    float decayH    = exp2(recordAge * 2.0 * log2(max(1.0 - alphaStat, 0.5)));
-    float hShare    = alphaStat * 0.5 + (muShare - alphaStat * 0.5) * decayH;
-    float cStat     = hShare + muShare;
 
-    // THE STUDENT FACTOR: the record's effective dof (Satterthwaite) and
-    // the host-fit exact-threshold inflation S(nu) = 1 + A/nu + B/nu^2
-    // (slider-coupled; unset constants read 0 -> S = 1, graceful).
+    // ---- per-channel shape: the record is a TOTAL; split it by the live
+    // spatial covariance's diagonal (see the header). Aniso-capped.
+    float3 sigA     = AnisoClampSigma(stats.sigma);
+    float  traceSig = max(dot(sigA, sigA), kEpsilon);
+    float3 share    = (sigA * sigA) / traceSig;
+    float3 ePer     = share * max(sigmaStatSq, kClipSigmaRecordFloorSq);
+
+    // ---- the accumulator transient (exact, per channel):
+    // Var(h_t) = decayH*Var(h_0) + (1-decayH)*(a/2)*E_k, Var(h_0) = muVar.
+    float decayH = exp2(recordAge * 2.0 * log2(max(1.0 - alphaStat, 0.5)));
+
+    // ---- THE STUDENT FACTOR: the record's effective dof (Satterthwaite) and
+    // the host-fit exact-threshold inflation. Unset constants read 0 -> S=1.
     float decayPrior = exp2(recordAge * kClipStudentDecay);   // (1-rho)^{2t}
     float nu         = 1.0 / (decayPrior / kClipStudentPriorDof
                             + kClipStudentVarFrac * (1.0 - decayPrior));
     float invNu      = 1.0 / nu;
     float studentS   = 1.0 + taaStudentA * invNu + taaStudentB * invNu * invNu;
 
-    // chromaScale multiplies the TOTAL gate (the live term applies the 3-D
-    // energy per channel: up to sqrt(3) headroom on luma-dominant content,
-    // which a moderate mod < 1 consumes before biting the measured chroma
-    // variance).
+    // ---- the mu share: conservative or residual-scoped (see the header).
+    float3 muVarFull    = stats.invNeff * (1.0 - alphaStat * 0.5) * ePer;
+    float3 residFloor   = sigA * kScopedResidFrac;
+    float3 muVarScoped  = stats.invNeff * max(stats.residSq, residFloor * residFloor);
+    float3 muVar        = lerp(muVarFull, muVarScoped, saturate(taaClipScopedMu));
+
+    // chromaScale multiplies the TOTAL gate variance per channel (up to
+    // sqrt(3) radius headroom on luma-dominant content for a moderate mod).
     float3 chromaScale = max(float3(1.0, taaChromaVarianceMod, taaChromaVarianceMod), 0.0);
 
-    // LIVE: cStat * S(nu) * E. COLD: the mean's own estimator uncertainty,
-    // per channel, on the full tap set -- the change-point replacement,
-    // deliberately tight (NOT Studentized: not a coverage statement).
+    // LIVE: [muVar*(1+decayH) + (a/2)*E_k*(1-decayH)] * S(nu) -- the Student
+    // factor is applied to the whole live variance (a deliberate
+    // simplification in the safe direction; only the record-derived parts
+    // strictly carry nu's uncertainty). COLD: the mean's own estimator
+    // uncertainty, per channel -- the change-point replacement, deliberately
+    // tight (NOT Studentized).
     float3 gateVar = recordLive
-        ? (cStat * studentS * max(sigmaStatSq, kClipSigmaRecordFloorSq)).xxx
+        ? (muVar * (1.0 + decayH) + (alphaStat * 0.5) * ePer * (1.0 - decayH)) * studentS
         : (stats.invNeff * stats.sigma * stats.sigma);
 
     float3 invGateVar = 1.0 / max(gateVar * (chromaScale * chromaScale),
                                   (kMinSigma * kMinSigma).xxx);
 
     // chi = the NOMINAL coverage radius (taaVarianceGamma; chi_3(0.95) =
-    // 2.7959), with taaClipOvershoot as multiplicative radius slack. The
-    // Student inflation above is what makes the nominal TRUE.
+    // 2.7959 -- now actually true per channel), with taaClipOvershoot as
+    // multiplicative radius slack. The Student inflation makes the nominal
+    // TRUE.
     float chi = max(taaVarianceGamma, kEpsilon) * (1.0 + max(taaClipOvershoot, 0.0));
 
-    // The gate on the ray from the phase-mean estimate: one dot, one sqrt.
-    float3 d   = historyColorSpace - stats.mean;
-    float  mdd = dot(d * d, invGateVar);
+    // The PHASE-CORRECTED test vector: d_corr = h - mu + beta*(centroid - u).
+    float3 dCorr = historyColorSpace - stats.mean + stats.gatePhaseShift;
+    float  mdd   = dot(dCorr * dCorr, invGateVar);
     float  tGate = (mdd > 1e-20) ? min(chi / sqrt(mdd), 1.0) : 1.0;
 
     if (tGate < 1.0 && taaSoftClip > 0.0)
@@ -506,10 +511,12 @@ ClipGateResult ClipHistoryToStatisticGate(
     }
     r.tGate = tGate;
 
-    // Shrink toward the phase-mean estimate. Deliberately NOT clamped to
-    // the tap AABB: exceeding it is exactly the sub-texel room the record
-    // purchased.
-    r.clippedColorSpace = stats.mean + d * tGate;
+    // Shrink along the CORRECTED displacement, anchored at the history:
+    // tGate = 1 is a bit-exact passthrough (an un-fired gate never touches
+    // the accumulator); tGate = 0 lands on the phase-free AA estimate
+    // (mean - gatePhaseShift). Deliberately NOT clamped to the tap AABB:
+    // exceeding it is exactly the sub-texel room the record purchased.
+    r.clippedColorSpace = historyColorSpace - (1.0 - tGate) * dCorr;
     return r;
 }
 
@@ -518,10 +525,7 @@ ClipGateResult ClipHistoryToStatisticGate(
 // ============================================================================
 // Normalized by the SPATIAL sigma (the neighborhood's own spread), NOT the
 // gate's variance: normalizing by the record would disarm smear rejection
-// precisely on ghosts. The blend's event-relative responsive channel: it
-// fires when the clip fires, whatever the cause. Requires nothing of the
-// feedback pair: the drop lands on an independent floor and acts at any
-// feedbackMin/Max, including the pinned configuration.
+// precisely on ghosts. The blend's event-relative responsive channel.
 float ComputeClipDistanceRejection(float3 clippedHistorySpace, float3 historyColorSpace, ColorNeighborhoodStats stats)
 {
     float3 clipDistance = abs(clippedHistorySpace - historyColorSpace) / stats.sigma;
@@ -555,9 +559,8 @@ float ComputeMotionFeedback(HistoryReprojection repro)
     return clamp(lerp(taaFeedbackMax, taaFeedbackMin, motionDrop), taaFeedbackMin, taaFeedbackMax);
 }
 
-// History feedback. The rejection can only LOWER feedback (never raise it
-// back toward the floor when the alignment drop already went below); the
-// alignment drop is applied AFTER the clamp and ONLY on planar surfaces.
+// History feedback. The rejection can only LOWER feedback; the alignment
+// drop is applied AFTER the clamp and ONLY on planar surfaces.
 float ComputeHistoryFeedback(HistoryReprojection repro, float clipDistanceRejection, bool planarSurface)
 {
     float feedback = ComputeMotionFeedback(repro);
