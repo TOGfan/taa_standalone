@@ -6,7 +6,8 @@
 //      is the only place a debug color ever exists -- the history-copy child
 //      stores the untouched RGB, so the accumulation simply continues while
 //      debugging.
-//   2) Sharpening: auto-parity (acutance-driven) or manual RCAS.
+//   2) Sharpening: auto-parity (acutance transported in the packed
+//      clip-state alpha) or manual RCAS.
 // ============================================================================
 #include "shaders/common/postFx/postFx.h.hlsl"
 #include "shaders/common/hlsl.h"
@@ -71,8 +72,8 @@ cbuffer perDraw {
 // FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.IN NO EVENT SHALL THE
 // AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
-// THE SOFTWARE.
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
 // ============================================================================
 
 // ---- ffx_a.h: minimal 32-bit HLSL subset ----------------------------------
@@ -260,17 +261,39 @@ void FsrRcasInputF(inout AF1 r, inout AF1 g, inout AF1 b)
     FsrSrtmF(c);
     r = c.r; g = c.g; b = c.b;
 }
+
 // ============================================================================
 // ACUTANCE METRIC
 // ----------------------------------------------------------------------------
 // FSR SRTM + RCAS luma (x2), matching exactly how the resolve pass computed
-// the raw-scene acutance energy it shipped in taaResultTex.a.
+// the raw-scene acutance energy. TRANSPORT: it rides inside the packed
+// clip-state alpha, 12 bits at [19:8] (full layout: [31] revocation sign,
+// [30:27] tag 0110, [26:20] the temporal clip-state sigma code, [19:8] the
+// acutance energy, [7:0] the drift bias -- [7] sign, [6:1] quarter-octave
+// magnitude -- with [0] the fiction flag; the bias and flag are simply
+// ignored here). The stored energy is saturate'd at pack time, which only
+// ever LOWERS the derived boost (the safe direction), and the 12-bit
+// quantization step (2.4e-4) sits at kSharpEnergyFloor's own scale. A
+// foreign tag (the debug payload 0111, a cleared buffer, a NaN) decodes as
+// zero energy = no boost, never a spurious one.
 // ============================================================================
 AF1 SharpLuma(AF3 rgb)
 {
     AF3 c = max(rgb, AF3_(0.0));
     c *= AF3_(ARcpF1(AMax3F1(c.r, c.g, c.b) + AF1_(1.0))); // FsrSrtmF
     return c.b * AF1_(0.5) + (c.r * AF1_(0.5) + c.g);        // RCAS luma (x2)
+}
+
+// The raw-scene acutance energy from a resolve-output alpha (0 when the
+// payload is not clip state -- debug, foreign, non-finite). 12 bits at
+// [19:8]: the quantization step (2.4e-4) sits at kSharpEnergyFloor's own
+// scale, and pack-time saturation only ever lowers the derived boost.
+AF1 DecodeAcutanceEnergy(AF1 a)
+{
+    AU1 u = AU1_AF1(a);
+    if (((u >> 27) & 0xFu) == 0x6u)                     // clip-state tag
+        return AF1_((float)((u >> 8) & 0xFFFu)) * AF1_(1.0 / 4095.0);
+    return AF1_(0.0);
 }
 
 // ============================================================================
@@ -282,10 +305,11 @@ AF1 SharpLuma(AF3 rgb)
 //     restores the raw frame's local sharpness.
 //
 //     The resolve pass ships the raw scene's local acutance energy (squared
-//     cross high-pass of RCAS-luma over SRTM'd taps) in alpha. The same
-//     energy is measured on the resolved image from RCAS's own five cross
-//     taps (identical loads and UV math as FsrRcasF below, so the compiler
-//     can merge them -- zero extra fetches).
+//     cross high-pass of RCAS-luma over SRTM'd taps), packed into the
+//     clip-state alpha's 16-bit field. The same energy is measured on the
+//     resolved image from RCAS's own five cross taps (identical loads and UV
+//     math as FsrRcasF below, so the compiler can merge them -- zero extra
+//     fetches).
 //
 //     RCAS is a negative-lobe unsharp mask with 1D band response
 //         H(w) = (1 - 2L(1 + cos w)) / (1 - 4L),   L = |lobe| in [0, LIMIT]
@@ -371,11 +395,13 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
         AF1 highPass       = lE - AF1_(0.25) * (lB + lD + lF + lH);
         AF1 energyResolved = highPass * highPass;
 
-        // Raw-scene acutance energy, cross-averaged for stability. abs()
-        // decodes the metric from the sign-encoded alpha (negative = the
-        // resolve revoked that pixel's dilation; the magnitude is the
-        // metric).
-        AF1 energyRaw = AF1_(0.2) * (abs(tE.a) + abs(tB.a) + abs(tD.a) + abs(tF.a) + abs(tH.a));
+        // Raw-scene acutance energy, cross-averaged for stability, decoded
+        // from the packed clip-state alpha (bits [19:4]; the revocation
+        // sign and the state sigma are simply ignored here). A foreign tag
+        // (debug payload, cleared buffer) decodes as zero: no boost.
+        AF1 energyRaw = AF1_(0.2) * (DecodeAcutanceEnergy(tE.a) + DecodeAcutanceEnergy(tB.a)
+                                    + DecodeAcutanceEnergy(tD.a) + DecodeAcutanceEnergy(tF.a)
+                                    + DecodeAcutanceEnergy(tH.a));
 
         AF1 bandGain = sqrt((amount * energyRaw + kSharpEnergyFloor) /
                             (energyResolved + kSharpEnergyFloor));

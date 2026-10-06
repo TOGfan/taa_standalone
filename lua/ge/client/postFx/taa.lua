@@ -128,7 +128,7 @@ function M.build()
     -- never leave a stale object behind.
     M.destroy()
 
-    getOrCreateStateBlock("TAA_StateBlock", function(sb)
+        getOrCreateStateBlock("TAA_StateBlock", function(sb)
         -- Linear for sceneTex: every main-path fetch sits on an exact texel
         -- center (bilinear returns the exact texel there), while the FXAA
         -- fallback samples at sub-texel positions and needs real filtering to
@@ -138,6 +138,15 @@ function M.build()
         sb:setField("samplerStates", 2, "SamplerClampLinear")   -- 2: historyTex (fused Kaiser tap needs it)
         sb:setField("samplerStates", 3, "SamplerClampPoint")    -- 3: velocityTex
         sb:setField("samplerStates", 4, "SamplerClampPoint")    -- 4: historyMotionTex (stored field, exact texel fetches)
+        -- Slot 5: #TAA_History bound a SECOND time, through a POINT sampler:
+        -- the bit-packed clip state in its alpha must never see bilinear
+        -- weights. A linear sampler is not bit-exact even at a snapped texel
+        -- center (the center (k+0.5)/N is not float-representable for
+        -- non-power-of-two sizes; the residual weight corrupts the packed
+        -- low bits, the bias field first). Slot 2 stays linear for the
+        -- fused Kaiser color taps -- one texture, two filterings, two
+        -- bindings.
+        sb:setField("samplerStates", 5, "SamplerClampPoint")    -- 5: historyStateTex
     end)
 
     getOrCreateStateBlock("TAA_Copy_StateBlock", function(sb)
@@ -182,6 +191,10 @@ function M.build()
     -- stops reading it (the writer pass itself keeps running -- see the
     -- motion-writer note below).
     taaPreFx:setField("texture", 4, "#TAA_HistMotion")
+    -- The clip-state read: #TAA_History bound a second time, point-sampled
+    -- (slot 2 is the linear Kaiser color binding; the packed alpha needs a
+    -- filter-free fetch).
+    taaPreFx:setField("texture", 5, "#TAA_History")
     taaPreFx:setField("target", 0, "#TAA_Result")
     taaPreFx:setField("targetFormat", 0, "GFXFormatR32G32B32A32F")
     taaPreFx:setField("targetClear", 0, "PFXTargetClear_OnDraw")
@@ -243,6 +256,100 @@ function M.build()
     M.setFrameState(1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
 end
 
+
+-- ============================================================================
+-- STUDENTIZATION FIT (exact; consumed by the resolve's statistic gate)
+-- ----------------------------------------------------------------------------
+-- The gate's sampling law is F(3, nu), nu = the record's effective dof
+-- (Satterthwaite; taaClip.h.hlsl): nu = 4 at age 0, 12.33 converged. The
+-- variance inflation restoring the NOMINAL chi-coverage is
+--     S(nu) = 3 * F^-1_{3,nu}(p) / chi^2,   p = CDF_chi2_3(chi^2),
+-- a function of the slider: S(4) is 1.18 at chi = 1.5 and 2.52 at 2.8 --
+-- a fixed constant cannot serve both. The host fits
+--     S(nu) = 1 + A/nu + B/nu^2
+-- exactly at the trajectory's two extremes: exact at birth and at
+-- convergence, <= ~1% across the lived range, at every slider value.
+--
+-- MUST MATCH taaClip.h.hlsl: kClipSigmaEmaRate (rho) and
+-- kClipStudentPriorDof (nu0). nuInf = (2 - rho) / rho.
+-- ============================================================================
+local STUDENT_RHO   = 0.15                              -- kClipSigmaEmaRate
+local STUDENT_NU0   = 4.0                               -- kClipStudentPriorDof
+local STUDENT_NUINF = (2.0 - STUDENT_RHO) / STUDENT_RHO -- 12.333
+
+local function erfApprox(x)  -- Abramowitz & Stegun 7.1.26 (|eps| <= 1.5e-7)
+    local sign = 1.0
+    if x < 0.0 then sign = -1.0; x = -x end
+    local t = 1.0 / (1.0 + 0.3275911 * x)
+    local poly = 0.254829592 + t * (-0.284496736
+                + t * ( 1.421413741 + t * (-1.453152027 + t * 1.061405429)))
+    return sign * (1.0 - poly * t * math.exp(-x * x))
+end
+
+local function chiSq3Cdf(x)
+    if x <= 0.0 then return 0.0 end
+    return erfApprox(math.sqrt(x * 0.5))
+         - math.sqrt(2.0 * x / math.pi) * math.exp(-x * 0.5)
+end
+
+local function beta15Cdf(u, b)
+    -- P(Beta(1.5, b) <= u): Simpson on t = s^2 (kills the sqrt
+    -- singularity; n is a power of two so the [0,1] step is exact).
+    if u <= 0.0 then return 0.0 end
+    if u >= 1.0 then return 1.0 end
+    local n = 512
+    local function integral(hi)
+        local h = hi / n
+        local sum = 0.0
+        for i = 0, n do
+            local s = i * h
+            local w = (i == 0 or i == n) and 1.0 or (((i % 2) == 1) and 4.0 or 2.0)
+            sum = sum + w * 2.0 * s * s * (1.0 - s * s) ^ (b - 1.0)
+        end
+        return sum * h / 3.0
+    end
+    return integral(math.sqrt(u)) / integral(1.0)
+end
+
+local function f3nuQuantile(p, nu)
+    -- q with P(F(3, nu) <= q) = p, via P(F <= q) = I_u(1.5, nu/2),
+    -- u = 3q / (3q + nu).
+    local b = nu * 0.5
+    local lo, hi = 0.0, 1.0
+    for _ = 1, 48 do
+        local mid = 0.5 * (lo + hi)
+        if beta15Cdf(mid, b) < p then lo = mid else hi = mid end
+    end
+    local u = 0.5 * (lo + hi)
+    return nu * u / (3.0 * (1.0 - u))
+end
+
+local studentFitCacheChi, studentFitCacheA, studentFitCacheB
+
+local function studentFitAB(chi)
+    chi = tonumber(chi) or 2.8
+    if chi < 0.25 then chi = 0.25 end
+    if studentFitCacheChi == chi then return studentFitCacheA, studentFitCacheB end
+
+    local c2 = chi * chi
+    local p = math.min(math.max(chiSq3Cdf(c2), 1e-6), 1.0 - 1e-6)
+
+    local s0 = 3.0 * f3nuQuantile(p, STUDENT_NU0) / c2    -- age 0
+    local s1 = 3.0 * f3nuQuantile(p, STUDENT_NUINF) / c2  -- converged
+
+    -- Solve 1 + A/nu + B/nu^2 = S at both anchors (2x2 in 1/nu).
+    local i0, i1 = 1.0 / STUDENT_NU0, 1.0 / STUDENT_NUINF
+    local r0, r1 = s0 - 1.0, s1 - 1.0
+    local det = i0 * i1 * (i1 - i0)
+    local A = (r0 * i1 * i1 - r1 * i0 * i0) / det
+    local B = (i0 * r1 - i1 * r0) / det
+
+    studentFitCacheChi, studentFitCacheA, studentFitCacheB = chi, A, B
+    return A, B
+end
+
+
+
 -- Defaults: the single source of truth for every setting. M.settings is a
 -- working copy that applySettings/user input mutate. When the settings
 -- file's version changes, ge/extensions/taa.lua calls M.resetSettings() to
@@ -256,7 +363,11 @@ M.defaultSettings = {
     feedbackMax                   = 0.97,
     lumaDriftStrength             = 0.0,
     lumaDriftChromaTol            = 0.1,
-    varianceGamma                 = 1.50,
+    -- chi: the gate's coverage radius (3-dof). With the gate scale now
+    -- per-texel and bias-subtracted, values below ~2.2 under-cover LEGIT
+    -- sub-texel content for no ghost benefit (the ghost sits 3-10x outside
+    -- the radius regardless). 2.2 = 86% coverage.
+    varianceGamma                 = 2.8,
     softClip                      = 0.0,
     chromaVarianceMod             = 1.0,
     jitterFlickerPadding          = 0.0,
@@ -337,6 +448,15 @@ function M.applySettings(inputs)
         pre:setShaderConst("$taaFeedbackMin",             s.feedbackMin)
         pre:setShaderConst("$taaFeedbackMax",             s.feedbackMax)
         pre:setShaderConst("$taaVarianceGamma",           s.varianceGamma)
+        pre:setShaderConst("$taaVarianceGamma",           s.varianceGamma)
+        -- The Studentization EXACTLY tracks the slider: the fit consumes
+        -- the EFFECTIVE radius (chi * (1 + clipOvershoot)) -- the same
+        -- threshold the gate tests.
+        local chiEff = (tonumber(s.varianceGamma) or 2.8)
+                     * (1.0 + math.max(tonumber(s.clipOvershoot) or 0.0, 0.0))
+        local studentA, studentB = studentFitAB(chiEff)
+        pre:setShaderConst("$taaStudentA",               studentA)
+        pre:setShaderConst("$taaStudentB",               studentB)
         pre:setShaderConst("$taaSoftClip",                s.softClip)
         pre:setShaderConst("$taaChromaVarianceMod",       s.chromaVarianceMod)
         pre:setShaderConst("$taaJitterFlickerPadding",    s.jitterFlickerPadding)

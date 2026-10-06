@@ -28,6 +28,11 @@
 // foreground edge / flat) is THE classifier -- shared verbatim by the current
 // frame, the history landing and the motion-field writer's flag channel, so
 // every landing site resolves with identical layer semantics.
+//
+// CLIP-STATE SIGMA HELPERS: the 7-bit log2 encoding of the temporal clip
+// record's sigma lives HERE (not taaClip) because TWO transports carry it:
+// the clip-state alpha (taaClip) and the debug payload (below). One encoding,
+// two packings; DecodeClipSigmaSq accepts both tags.
 // ============================================================================
 #ifndef TAA_SHARED_H_HLSL
 #define TAA_SHARED_H_HLSL
@@ -62,16 +67,40 @@ float2 Bilerp2x2(float2 c00, float2 c10, float2 c01, float2 c11, float2 fraction
 // rides the alpha instead: the magnitude's only consumers are taaFinal's
 // auto-sharpener (bypassed in debug) and the writer's revocation SIGN (kept
 // genuine). Bit layout: 31 = revocation sign; 30..27 = 0111 (finite,
-// non-subnormal, never NaN/Inf); 26..23 = state code; 22..13 = payload A
-// [0,1]; 12..0 = payload B [0,1]. Exact through an RGBA32F target with
-// point sampling (no filtering on the store path).
+// non-subnormal, never NaN/Inf); 26..23 = view code; 22..13 = payload A
+// [0,1] (10 bits); 12..7 = payload B [0,1] (6 bits); 6..0 = the temporal
+// clip-state sigma code (7 bits, the same encoding as the clip-state
+// alpha's field -- see taaClip.h.hlsl).
+//
+// Carrying the clip state INSIDE the debug payload is what makes the state
+// OBSERVABLE: without it, every debug frame overwrites the alpha with a
+// foreign tag, the next frame's record reads cold, and debug mode 11 shows
+// permanently red -- the view destroying the state it displays. With it the
+// record chain runs uninterrupted through debugging. Payload B's coarser
+// 6 bits are display-only in every view (a boolean or a coarse channel);
+// the 0.125-quantized bit fields decode exactly through round(b*63)/63.
+// Exact through an RGBA32F target with point sampling (no filtering on the
+// store path).
 // ============================================================================
-float PackDebugAlpha(bool revoked, float code, float a, float b)
+static const float kClipSigmaRef = 1.0 / 255.0;   // the clip-state sigma's unit
+
+float ClipPackSigmaCode(float s)
+{
+    return clamp((log2(max(s, 1e-6) / kClipSigmaRef) + 8.0) * 8.0, 0.0, 127.0);
+}
+
+float ClipUnpackSigmaCode(uint code)
+{
+    return kClipSigmaRef * exp2(code * 0.125 - 8.0);
+}
+
+float PackDebugAlpha(bool revoked, float code, float a, float b, float sigma)
 {
     uint u = 0x38000000u
-           | ((uint(code + 0.5) & 0xFu)   << 23)
+           | ((uint(code + 0.5) & 0xFu)        << 23)
            | ((uint(a * 1023.0 + 0.5) & 0x3FFu) << 13)
-           |  (uint(b * 8191.0 + 0.5) & 0x1FFFu);
+           | ((uint(b * 63.0 + 0.5)   & 0x3Fu)  << 7)
+           |  (uint(ClipPackSigmaCode(sigma) + 0.5) & 0x7Fu);
     return asfloat(revoked ? (u | 0x80000000u) : u);
 }
 
@@ -80,7 +109,7 @@ void UnpackDebugAlpha(float alpha, out uint code, out float a, out float b)
     uint u = asuint(alpha);
     code = (u >> 23) & 0xFu;
     a    = (float)((u >> 13) & 0x3FFu) * (1.0 / 1023.0);
-    b    = (float)(u & 0x1FFFu) * (1.0 / 8191.0);
+    b    = (float)((u >> 7) & 0x3Fu) * (1.0 / 63.0);
 }
 
 // ============================================================================

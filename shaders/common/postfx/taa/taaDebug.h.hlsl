@@ -4,9 +4,11 @@
 // The resolve NEVER writes debug colors: its RGB is always the real blended
 // color (the history-copy child stores it into #TAA_History unconditionally)
 // and the view state rides #TAA_Result.a instead, packed by PackDebugAlpha
-// (taaShared.h.hlsl). This file turns that payload back into the on-screen
-// view, so debug colors exist ONLY in $backBuffer and the temporal
-// accumulation continues undisturbed while debugging.
+// (taaShared.h.hlsl -- which also embeds the temporal clip-state sigma in
+// the payload's low 7 bits, so the record chain survives debugging). This
+// file turns that payload back into the on-screen view, so debug colors
+// exist ONLY in $backBuffer and the temporal accumulation continues
+// undisturbed while debugging.
 //
 // SEMANTIC NOTES vs. the old early-return views:
 //   * View bases use the RESOLVED output (the blend), not the raw current
@@ -17,7 +19,9 @@
 //     Kaiser-resampled sample at the landing position. Showing the stored
 //     buffer is what you want when auditing the accumulation itself.
 //   * Flag payloads pack small integer bit fields into payload A as f/8
-//     (10-bit quantization sits far below the rounding threshold).
+//     (10-bit quantization sits far below the rounding threshold). Payload
+//     B is 6 bits -- display-only in every view; the 0.125-quantized bit
+//     fields decode exactly through it.
 //
 // FRAGMENT HEADER: compiled only inside taaFinal.fx.hlsl. Requires fragments
 // included before: taaShared.h.hlsl (UnpackDebugAlpha).
@@ -97,16 +101,23 @@ float3 RenderDebugView(uint code, float a, float b, bool revoked,
         return resultRGB * 0.2 + float3(a, planar ? 0.25 : 0.0, planar ? 0.0 : 0.25);
     }
 
-    // 11: hull clipper state. A decodes to the code: 1 = exact (simplex
-    // certificate or the collinear 1D solve), 2 = certified dual bound,
-    // 3 = defensive (should never fire). B = iterations used (pre-scaled).
+    // 11: clip gate state. A: the record's SURVIVING VARIANCE FRACTION when
+    // carried (1.0 = clean record, full room; dimming toward 0.55 = the
+    // bias is latching, the gate is entering bias-removal mode -- the
+    // ghost-kill state), 0.35 = record RESET this frame (identity reset,
+    // shock, corroborated geometry, or the NaN guard), 0.15 = no record at
+    // all. B = how far the gate shrank the history toward the neighborhood
+    // mean, post-soft-clip (0 = untouched). The reveal repair reads as
+    // either a one-frame reset flash at the departing edge or the green
+    // dimming over ~4 frames with B bright while the gate dismantles the
+    // remnant; a persistent dim-green + bright-B region means a ghost the
+    // latch is still dismantling (watch it clear in 2-3 frames).
     case 11: {
         float3 c = resultRGB * 0.1;
-        float x = a * 4.0;
-        if (x > 2.5)      c.r = 1.0;    // unconverged: safe fallback bound
-        else if (x > 1.5) c.g = 0.5;    // supporting-only bound
-        else if (x > 0.5) c.g = 1.0;    // exact certificate fired
-        c.b = b;
+        if (a > 0.45)      c.g = saturate((a - 0.55) * 2.2);  // carried: brightness = surviving variance fraction
+        else if (a > 0.25) c.g = 0.5;                         // reset this frame (A = 0.35)
+        else               c.r = 0.5;                         // no record (A = 0.15)
+        c.b = b;                         // applied shrink fraction
         return c;
     }
 
