@@ -568,7 +568,18 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
     float3 zInnov        = innovCorr / guardSigma;
     bool   farEnough     = dot(zAlign, zAlign) > kAlignDistChiSq;
     bool   corroborated  = dot(zInnov, zInnov) > kAlignSpatialChiSq;
-    bool   antiAlignReset = hadRecord && !currentLayer.isDilationZone
+    // SINGLE-LAYER SANCTITY (supersedes the dilation-only exemption): the
+    // anti-alignment's premise -- the neighborhood mean tracking one
+    // surface -- requires single-layer statistics. On dilation zones AND
+    // foreground-edge (crest) texels the 3x3 spans an ownership boundary:
+    // the mixture mean lies between the layers BY CONSTRUCTION, which is
+    // the ghost geometry the test reads. The sweep transient at a moving
+    // crest fires it solidly (|z_d|^2 ~ 1-3, |z_i|^2 ~ 10+), producing a
+    // reset wave riding every moving silhouette. currentSingleLayer is the
+    // same post-revocation predicate the alignment drop and the velocity
+    // rejection already use for the same reason; a revoked dilation
+    // candidate re-arms the test (it acts flat).
+    bool   antiAlignReset = hadRecord && currentSingleLayer
                          && antiAligned && farEnough && corroborated;
 
     float rangeSq = dot(colorStats.aabbMax - colorStats.aabbMin,
