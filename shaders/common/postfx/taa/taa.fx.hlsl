@@ -588,7 +588,7 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
         && (innovSq > kClipSpikeRatio * max(sigmaPrevSq, rangeSq));
 
     bool  resetRecord = hadRecord
-        && (spike || antiAlignReset || !innovFinite
+        && (spike || !innovFinite
             || (disoccluded && innovSq > kClipCorroborateRatio * sigmaPrevSq));
     bool  carryRecord = hadRecord && !resetRecord;
 

@@ -130,7 +130,12 @@
 // (4) the Student + transient inflations (the whole live gateVar is
 // inflated by S(nu), including the mu term -- a deliberate simplification
 // in the safe direction); (5) the soft clip; (6) the aniso cap and the
-// scoped-residual floor. The emitted value lies on the segment
+// scoped-residual floor; (7) the arming cap: the record's standing gate
+// authority is clamped at kArmingCap spatial priors (the stationary model
+// predicts E[i^2] = 2/(2-a)Var(x) ~= Var_spatial; sustained excess is
+// model violation). A coverage envelope, NOT a change-point: a slowly
+// varying bias that stays under the cap rides faint BY DESIGN. The
+// emitted value lies on the segment
 // [phase-free AA estimate, history]; it may exceed the tap AABB BY DESIGN.
 //
 // FRAGMENT HEADER: compiled only inside taa.fx.hlsl. Requires host context:
@@ -394,6 +399,18 @@ static const float kClipStudentPriorDof      = 4.0;           // the SEED's decl
 static const float kClipStudentVarFrac       = 0.0810811;     // rho/(2-rho)
 static const float kClipStudentDecay         = -0.4689303;    // 2*log2(1-rho)
 static const float kClipMaxAge               = 127.0;         // the age transport's saturation
+// The arming brake: the record's standing authority over the gate, in units
+// of the spatial prior (the trace of the aniso-capped tap covariance). The
+// stationary model predicts E[i^2] = 2/(2-a)Var(x) ~= Var_spatial, so the
+// cap is the model-consistency envelope: sustained E beyond kArmingCap
+// spatial priors is model violation (persistent landing bias, a stale
+// regime the ownership layer did not prevent) and the gate holds the
+// spatial envelope instead. 5.0 matches the seed's documented "over-seeds
+// edges ~5x: benign" regime; sparkle sits at R ~ 1-1.5 (the sparkling
+// texel is in its own taps, so the spatial prior scales with it). Binds
+// the CONSUMER only -- the transport and the change-point tests keep the
+// honest record. Tune via debug mode 11 (A = the cap engagement).
+static const float kArmingCap                = 5.0;           // the record's gate-authority cap, in spatial priors
 
 // The per-channel spatial sigma, capped against extreme anisotropy: every
 // channel is floored at kAnisoSigmaCap of the loudest. Consumers: the
@@ -481,7 +498,18 @@ ClipGateResult ClipHistoryToStatisticGate(
     float3 sigA     = AnisoClampSigma(stats.sigma);
     float  traceSig = max(dot(sigA, sigA), kEpsilon);
     float3 share    = (sigA * sigA) / traceSig;
-    float3 ePer     = share * max(sigmaStatSq, kClipSigmaRecordFloorSq);
+    // ---- the arming brake ------------------------------------------------
+    // The stationary model predicts E[i^2] = 2/(2-a)Var(x) ~= Var_spatial,
+    // so the record is granted at most kArmingCap spatial priors of
+    // standing authority over the gate. Sustained E beyond the cap is
+    // model violation (persistent landing bias, a stale regime the
+    // ownership layer did not prevent) and the gate holds the spatial
+    // envelope instead -- continuously, with no detection geometry to
+    // false-positive on. The cap binds the CONSUMER only: the transport
+    // and the change-point tests keep the honest record.
+    float  spatialPriorSq = max(traceSig, kClipSigmaRecordFloorSq);
+    float  recordSq       = min(sigmaStatSq, kArmingCap * spatialPriorSq);
+    float3 ePer           = share * max(recordSq, kClipSigmaRecordFloorSq);
 
     // ---- the accumulator transient (exact, per channel):
     // Var(h_t) = decayH*Var(h_0) + (1-decayH)*(a/2)*E_k, Var(h_0) = muVar.
