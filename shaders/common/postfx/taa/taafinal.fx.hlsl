@@ -437,8 +437,16 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
     AF1 pixR, pixG, pixB;
     FsrRcasF(pixR, pixG, pixB, AU2(ip), con);
 
-    // Undo the SRTM applied inside FsrRcasInputF: back to linear HDR.
+    // Flat-tap NaN guard: an exactly-flat neighborhood makes the verbatim
+    // RCAS noise term evaluate 0 * rcp(0); DX min/max cleanses the NaN, the
+    // GLSL translation path may not (the vendor variance the fetch guards
+    // document). RCAS is identity on flat input for any lobe, so the
+    // strict-compare fallback to the center tap is exact.
     AF3 pix = AF3(pixR, pixG, pixB);
+    if (!(dot(pix, pix) < AF1_(4.0)))
+        return float4(max(tE.rgb, AF3_(0.0)), 1.0);
+
+    // Undo the SRTM applied inside FsrRcasInputF: back to linear HDR.
     FsrSrtmInvF(pix);
 
     return float4(max(pix, 0.0), 1.0);
