@@ -107,7 +107,7 @@ cbuffer perDraw {
 #define AF1_AU1(x) asfloat(x)
 // Pack two floats as f16 halves into one uint (ffx_a.h AU1_AH2_AF2). Only the
 // 16-bit RCAS variants consume con[1]; kept so FsrRcasCon stays verbatim.
-#define AU1_AH2_AF2(a) (f32tof16((a).x) | (f32tof16((a).y) << 16))
+#define AU1_AH2_AF2(a) (0u)
 
 #define FSR_RCAS_F 1
 #define FSR_RCAS_DENOISE 1

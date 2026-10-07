@@ -89,7 +89,7 @@ cbuffer perDraw
     float  taaColorSpaceOklab;              float  taaJitterAwareVariance;
     float  taaVelocityAlignedVariance;      float  taaAlignmentFeedbackDrop;
     float  taaMotionBlendDropSpeed;         float  taaUseKaiser6;
-    float  taaFireflyClamp;                 float  taaFallbackFXAA;
+    float  taaFallbackFXAA;
     float  taaMotionBlendStart;             float  taaClipDistanceRejectionEnabled;
     float  taaClipDistanceRejectionAmount;  float  taaClipDistanceRejectionMinError;
     float  taaDirectionalVariance;          float  taaDebugMode;

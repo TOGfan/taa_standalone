@@ -308,7 +308,7 @@ end
 -- a fixed constant cannot serve both. The host fits
 --     S(nu) = 1 + A/nu + B/nu^2
 -- exactly at the trajectory's two extremes: exact at birth and at
--- convergence, <= ~1% across the lived range, at every slider value.
+-- convergence, ~1.4% mid-range at chi = 2.8 and up to ~6% in the chi >= 3.5 comfort regime -- the same numbers taaClip.h.hlsl states (the two comments must agree).
 --
 -- MUST MATCH taaClip.h.hlsl: kClipSigmaEmaRate (rho) and
 -- kClipStudentPriorDof (nu0). nuInf = (2 - rho) / rho.
@@ -450,7 +450,7 @@ M.defaultSettings = {
     historyOvershoot              = 1.0,
     clipOvershoot                 = 0.0,
     fireflyClamp                  = 4.0,
-    clipDistanceRejectionEnabled  = 1.0,
+    clipDistanceRejectionEnabled  = 0.0,
     clipDistanceRejectionAmount   = 0.0,
     clipDistanceRejectionMinError = 0.15,
     motionBlendStart               = 1.0,

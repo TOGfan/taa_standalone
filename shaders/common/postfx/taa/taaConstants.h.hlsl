@@ -20,7 +20,7 @@ static const float kMotionFullStrengthPx     = 8.0;     // motion that fully dro
 static const float kMinSigma                 = 0.001;
 static const float kMinSpatialContrast       = 0.001;
 static const float kMinFootprintRange        = 1e-4;
-static const float kFireflyClampEpsilon      = 0.001;
+
 static const float kFlickerPadThreshold      = 0.001;   // jitter anti-flicker padding engages above this
 
 // Fallback FXAA

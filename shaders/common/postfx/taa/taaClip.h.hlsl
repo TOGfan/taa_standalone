@@ -319,18 +319,20 @@ ColorNeighborhoodStats ComputeColorNeighborhoodStats(
         stats.residSq = 0.0;   // unused: the gate's lerp blend is 0
     }
 
-    // Firefly clamp: pulls the AABB (used by the luma-drift chroma gate and
-    // the spike test) into the mean +/- k*sigma band.
-    if (taaFireflyClamp > kFireflyClampEpsilon)
-    {
-        float3 fireflyMin = stats.mean - taaFireflyClamp * stats.sigma;
-        float3 fireflyMax = stats.mean + taaFireflyClamp * stats.sigma;
-        stats.aabbMin = clamp(stats.aabbMin, fireflyMin, fireflyMax);
-        stats.aabbMax = clamp(stats.aabbMax, fireflyMin, fireflyMax);
-    }
-
+    // (No firefly clamp, deliberately: the statistic gate's bounds no longer
+    // derive from the AABB, the reversible tonemap has already compressed
+    // HDR outliers before the stats see them, and the record's winsor cap
+    // owns temporal outlier protection. The clamp's only live effects were
+    // shrinking the spike test's range brake -- the term that keeps
+    // heavy-tailed content from shocking -- and keeping luma drift active
+    // near chromatic outliers. At its default k=4 it could never touch
+    // sigma: clamping to mean+/-4sigma leaves range >= 4sigma, keeping
+    // Popoviciu below inert.)
+    //
     // POPOVICIU: variance <= (max - min)^2 / 4 for anything supported on
-    // [min, max]. A no-op by construction on unclamped neighborhoods.
+    // [min, max]. A no-op by construction (the weighted empirical
+    // distribution is supported on the tap range); kept as cheap insurance
+    // should the estimator ever change.
     stats.sigma = min(stats.sigma, 0.5 * (stats.aabbMax - stats.aabbMin));
 
     float spatialContrast = max(stats.aabbMax.x - stats.aabbMin.x, kMinSpatialContrast);
@@ -513,8 +515,13 @@ ClipGateResult ClipHistoryToStatisticGate(
         ? (muVar * (1.0 + decayH) + (alphaStat * 0.5) * ePer * (1.0 - decayH)) * studentS
         : (stats.invNeff * stats.sigma * stats.sigma);
 
-    float3 invGateVar = 1.0 / max(gateVar * (chromaScale * chromaScale),
-                                  (kMinSigma * kMinSigma).xxx);
+    // Explicit-arity forms: this engine's HLSL->GLSL front end rejects
+    // scalar-broadcast vector constructors ("too few elements"), and
+    // 1.0/float3 leans on scalar-operator promotion it may not share.
+    float  minGateVar = kMinSigma * kMinSigma;
+    float3 invGateVar = float3(1.0, 1.0, 1.0)
+                      / max(gateVar * (chromaScale * chromaScale),
+                            float3(minGateVar, minGateVar, minGateVar));
 
     // chi = the NOMINAL coverage radius (taaVarianceGamma; chi_3(0.95) =
     // 2.7959 -- now actually true per channel), with taaClipOvershoot as
