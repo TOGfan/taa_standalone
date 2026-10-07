@@ -480,11 +480,6 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
 
 
     // ---- temporal clip state + acutance transport -------------------------
-    // The previous stable output's packed alpha, read AT THE LANDING through
-    // the DEDICATED POINT-SAMPLED binding (slot 5). ONE fetch feeds BOTH the
-    // clip-state decode and the acutance EWMA (below) -- note the fetch is
-    // now unconditional: the acutance stabilization runs with the clip
-    // memory off too (the packed energy is written regardless).
     bool  temporalStateEnabled = (taaUseHullClipping > 0.5);
     float sigmaPrevSq = -1.0;
     float agePrev     = 0.0;

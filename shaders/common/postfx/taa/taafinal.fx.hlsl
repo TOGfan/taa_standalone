@@ -370,7 +370,7 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
 
     AF1 amount = AF1_(saturate(taaSharpness));
     if (amount <= AF1_(0.001)) {
-        return float4(max(0.0, tex2Dlod(taaResultTex, float4(IN.uv0, 0.0, 0.0)).rgb), 1.0);
+        return float4(max(tex2Dlod(taaResultTex, float4(IN.uv0, 0.0, 0.0)).rgb, 0.0), 1.0);
     }
 
     ASU2 ip = ASU2(IN.uv0 / oneOverTargetSize);

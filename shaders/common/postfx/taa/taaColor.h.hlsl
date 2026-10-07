@@ -41,7 +41,7 @@ float3 YCoCgToRGB(float3 c) { return float3(c.x + c.y - c.z, c.x + c.z, c.x - c.
 // The condition is a per-draw uniform; a coherent branch skips the dead side.
 float3 ToSpace(float3 rgb)
 {
-    float3 t = Tonemap(max(0.0, rgb));
+    float3 t = Tonemap(max(rgb, 0.0));
     if (taaColorSpaceOklab > 0.5)
         return RGBToOklab(t);
     return RGBToYCoCg(t);
@@ -49,8 +49,8 @@ float3 ToSpace(float3 rgb)
 float3 FromSpace(float3 c)
 {
     if (taaColorSpaceOklab > 0.5)
-        return Untonemap(max(0.0, OklabToRGB(c)));
-    return Untonemap(max(0.0, YCoCgToRGB(c)));
+        return Untonemap(max(OklabToRGB(c), 0.0));
+    return Untonemap(max(YCoCgToRGB(c), 0.0));
 }
 
 // Clamp the history color back into the valid RGB gamut if clipping pushed

@@ -498,27 +498,11 @@ function M.applySettings(inputs)
         -- final pass actually consuming the transport.
         pre:setShaderConst("$taaAcutanceActive",
             ((tonumber(s.autoSharpen) or 0) > 0.5 and (tonumber(s.sharpness) or 0) > 0.001) and 1 or 0)
-        -- Gates the resolve's acutance metric + transport EWMA (and, with
-        -- the clip memory off, the entire historyStateTex fetch) on the
-        -- final pass actually consuming the transport.
-        pre:setShaderConst("$taaAcutanceActive",
-            ((tonumber(s.autoSharpen) or 0) > 0.5 and (tonumber(s.sharpness) or 0) > 0.001) and 1 or 0)
-        -- Gates the resolve's acutance metric + transport EWMA (and, with
-        -- the clip memory off, the entire historyStateTex fetch) on the
-        -- final pass actually consuming the transport.
-        pre:setShaderConst("$taaAcutanceActive",
-            ((tonumber(s.autoSharpen) or 0) > 0.5 and (tonumber(s.sharpness) or 0) > 0.001) and 1 or 0)
-        -- Gates the resolve's acutance metric + transport EWMA (and, with
-        -- the clip memory off, the entire historyStateTex fetch) on the
-        -- final pass actually consuming the transport.
-        pre:setShaderConst("$taaAcutanceActive",
-            ((tonumber(s.autoSharpen) or 0) > 0.5 and (tonumber(s.sharpness) or 0) > 0.001) and 1 or 0)
         -- The camera's forward displacement this frame (units of 1/rawDepth);
         -- 0 = the shader measures T_y locally. The host could provide this
         -- from the camera hook (res.pos delta dotted with the previous
         -- forward axis) once the depth convention is confirmed.
         pre:setShaderConst("$taaDepthParallaxStep",       0.0)
-        pre:setShaderConst("$taaVarianceGamma",           s.varianceGamma)
         -- The Studentization EXACTLY tracks the slider: the fit consumes
         -- the EFFECTIVE radius (chi * (1 + clipOvershoot)) -- the same
         -- threshold the gate tests.
@@ -551,7 +535,6 @@ function M.applySettings(inputs)
         pre:setShaderConst("$taaClipOvershoot",           s.clipOvershoot)
         pre:setShaderConst("$taaLumaDriftStrength",       s.lumaDriftStrength)
         pre:setShaderConst("$taaLumaDriftChromaTol",      s.lumaDriftChromaTol)
-        pre:setShaderConst("$taaFireflyClamp",            s.fireflyClamp)
         pre:setShaderConst("$taaClipDistanceRejectionEnabled",  s.clipDistanceRejectionEnabled)
         pre:setShaderConst("$taaClipDistanceRejectionAmount",   s.clipDistanceRejectionAmount)
         pre:setShaderConst("$taaClipDistanceRejectionMinError", s.clipDistanceRejectionMinError)
@@ -618,8 +601,5 @@ function M.setupHistory(state)
         -- motion field is always last frame's data.
     end
 end
-
-M.build()
-M.applySettings()
 
 return M
