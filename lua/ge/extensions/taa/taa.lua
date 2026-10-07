@@ -1,6 +1,6 @@
 local M = {}
 
-local MOD_VERSION = "1.14"
+local MOD_VERSION = "1.15"
 local settingsPath = "settings/taa_standalone.json"
 local active = true
 local pfx = nil
@@ -291,6 +291,19 @@ local function ensureChain()
     local savedData = jsonReadFile(settingsPath)
     if savedData and type(savedData) == "table" and savedData.settings then
         pfx.applySettings(savedData.settings)
+    else
+        -- No settings key in the file (a version-change reset stripped it,
+        -- or this is a first run whose initial saveState wrote none).
+        -- mod.build() just destroyed and recreated every PostEffect this
+        -- module owns, and setShaderConst state dies with the old objects:
+        -- the module's load-time applySettings() either never ran (require
+        -- is cached across mod reloads) or was applied to the objects that
+        -- were just deleted. resetSettings() rebuilds M.settings from the
+        -- defaults AND pushes them to the live chain -- without this the
+        -- chain renders on engine-default constants (feedback 0/0 = zero
+        -- temporal accumulation = the raw jittered frame on screen) until
+        -- the user touches a setting.
+        pfx.resetSettings()
     end
     -- Anything staged while the chain was down was already merged into the
     -- settings file by saveState(); it is live now.
@@ -319,6 +332,12 @@ local function start()
     -- persist the live (default) settings so the file is complete again.
     if settingsResetPending then
         settingsResetPending = false
+        -- Push the defaults to the LIVE chain too, not just the file:
+        -- ensureChain() early-returns against a chain that was already up
+        -- when the reset happened, and on a hot reload the cached module's
+        -- M.settings still holds the old version's values until this resets
+        -- them.
+        if pfx and pfx.resetSettings then pfx.resetSettings() end
         saveState()
     end
     return true

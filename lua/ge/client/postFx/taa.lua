@@ -290,6 +290,10 @@ function M.build()
     taaPreFx:registerObject("TAA_PreFx")
     fsLast = {}   -- fresh objects: force the next setFrameState to send
     M.setFrameState(1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+    -- Every setShaderConst this module ever made lived on objects that
+    -- destroy() just deleted; a rebuilt chain must re-push the current
+    -- settings or it renders on engine-default constants.
+    M.applySettings()
 end
 
 
