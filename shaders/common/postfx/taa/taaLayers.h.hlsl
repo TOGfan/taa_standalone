@@ -35,6 +35,19 @@ void ComputeSurfaceGradients(float depthRaw[9], out float gradX, out float gradY
     gradY = Minmod(dyD, dyU);
 }
 
+// The phase-selected 2x2 depth quad (shared by the foreground-edge and flat
+// landing-depth paths).
+float BilerpDepthQuad(float depthRaw[9], float2 fracPx)
+{
+    return Bilerp2x2(depthRaw[0],
+        (fracPx.x >= 0.0) ? depthRaw[4] : depthRaw[3],
+        (fracPx.y >= 0.0) ? depthRaw[2] : depthRaw[1],
+        (fracPx.x >= 0.0)
+            ? ((fracPx.y >= 0.0) ? depthRaw[8] : depthRaw[6])
+            : ((fracPx.y >= 0.0) ? depthRaw[7] : depthRaw[5]),
+        abs(fracPx));
+}
+
 struct LayerSurface
 {
     bool   isDilationZone;
@@ -225,14 +238,7 @@ LayerSurface ClassifyLayerSurface(
     {
         // Flat: center depth at the current frame / bilinear at landing
         // sites, plus the layer-aware velocity selection.
-        s.effectiveDepth      = isLandingSite ? Bilerp2x2(
-            depthRaw[0],
-            (fracPx.x >= 0.0) ? depthRaw[4] : depthRaw[3],
-            (fracPx.y >= 0.0) ? depthRaw[2] : depthRaw[1],
-            (fracPx.x >= 0.0)
-                ? ((fracPx.y >= 0.0) ? depthRaw[8] : depthRaw[6])
-                : ((fracPx.y >= 0.0) ? depthRaw[7] : depthRaw[5]),
-            abs(fracPx)) : depthRaw[0];
+        s.effectiveDepth      = isLandingSite ? BilerpDepthQuad(depthRaw, fracPx) : depthRaw[0];
         s.effectiveVelocityUV = SelectLayerAwareQuadVelocity(velocityUV, fracPx, sizePixels, coherenceRadiusPx);
     }
     return s;
@@ -337,7 +343,6 @@ SurfaceEdgeState AnalyzeSurfaceEdges(CurrentFrameNeighborhood neighborhood, bool
 // Foreground crest geometry (feeds the disocclusion tolerances).
 struct ForegroundGeometry
 {
-    float crestDrop;
     float slope;
 };
 
@@ -355,8 +360,7 @@ ForegroundGeometry ComputeForegroundGeometry(
     float gapSpanPx  = max(length(neighborhood.closestOffsetPx - neighborhood.secondClosestOffsetPx), 1.0);
     float layerGapSlope = sameObject ? (max(layerGap, 0.0) / gapSpanPx) : 0.0;
 
-    fg.crestDrop = crestDrop;
-    fg.slope     = max(crestSlope, layerGapSlope);
+    fg.slope = max(crestSlope, layerGapSlope);
     return fg;
 }
 

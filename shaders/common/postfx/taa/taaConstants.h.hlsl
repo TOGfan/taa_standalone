@@ -66,20 +66,9 @@ static const float kCenterLandingFracPx      = 0.1;
 static const float kMinParallaxInfoPx2       = 2.0;
 static const float kTyUnmeasuredFrac         = 0.02;
 
-// Exact-hull simplex clipper budget: unrolled simplex pivots, plus one final
-// certificate pass on the last basis. Reaching the TRUE exit facet of a
-// 9-point hull from the initial basis takes a handful of Dantzig pivots
-// (each strictly raises the plane); 5 covers the generic case, and the
-// noise-scaled certificate below means near-facet planes certify.
-static const int   kHullSimplexPivots  = 5;
-// Certificate tolerance floor, in exit-HEIGHT units; scaled at runtime by
-// the neighborhood's z range (the data's own noise scale). A tap this far
-// above the plane does not force another pivot.
-static const float kHullSimplexCertEps = 1e-4;
 
-// Sign-bit transport of the revocation flag through the alpha channel:
-// negative = revoked.
-static const float kRevokedAlphaEpsilon      = 1e-30;
+
+
 
 // Debug views
 static const float kDebugVelocityScale       = 0.1;

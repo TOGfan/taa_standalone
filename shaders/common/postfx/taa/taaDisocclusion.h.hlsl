@@ -206,11 +206,12 @@ HistoryLandingSurface SampleHistoryLandingSurface(
     float  depths[9];
     float2 velocities[9];
     float  flags[9];
+    float2 tapUVs[9];
+    Build3x3TapUVs(snappedUV, vp.texelSize, vp.minUV, vp.maxUV, tapUVs);
     [unroll]
     for (int i = 0; i < 9; ++i)
     {
-        float2 tapUV = clamp(snappedUV + kOffsets3x3[i] * vp.texelSize, vp.minUV, vp.maxUV);
-        float4 m     = tex2Dlod(historyMotionTex, float4(tapUV, 0.0, 0.0));
+        float4 m = tex2Dlod(historyMotionTex, float4(tapUVs[i], 0.0, 0.0));
         depths[i]     = m.z;    // previous frame's depth (raw / baked band / revoked)
         velocities[i] = m.xy;   // previous frame's velocity
         flags[i]      = m.w;    // post-validation layer record
@@ -250,15 +251,17 @@ HistoryLandingSurface SampleHistoryLandingSurface(
     // with layer-consistent differences.
     MeasureVelocityFieldShapeCoherent(velocities, vp.sizePixels, coherenceRadiusPx, h.maxCurvaturePx, h.maxPairGradPx);
 
+    // Squared-domain coherence test; the sqrt is paid only on passing taps.
+    float cohRSq = coherenceRadiusPx * coherenceRadiusPx;
     [unroll]
     for (int m = 0; m < 9; ++m)
     {
         float2 deltaPx = (velocities[m] - h.effectiveVelocityJitteredPrevUV) * vp.sizePixels;
-        float  lenPx   = length(deltaPx);
-        if (lenPx <= coherenceRadiusPx)
+        float  deltaSq = dot(deltaPx, deltaPx);
+        if (deltaSq <= cohRSq)
         {
             float distPx = max(length(kOffsets3x3[m]), 1.0);
-            h.coherentGradPx = max(h.coherentGradPx, lenPx / distPx);
+            h.coherentGradPx = max(h.coherentGradPx, sqrt(deltaSq) / distPx);
         }
     }
     return h;
@@ -291,6 +294,7 @@ bool EstimateLayerForwardParallax(
     bool   isForegroundEdge,
     CameraBasis currentCamera,
     CameraBasis previousCamera,
+    float3 prevForward,          // hoisted: CameraForwardAxis(previousCamera)
     float  fitRadiusPx,
     ViewportParams vp,
     out float ty,
@@ -308,8 +312,8 @@ bool EstimateLayerForwardParallax(
     float4 mRot  = float4(jG.x - 1.0, jG.y, jG.z, jG.w - 1.0);   // J_G - I
     float2 g0    = uRot0 - frameBaseUV;                           // g(u0)
 
-    float3 prevForward = CameraForwardAxis(previousCamera);
     float2 px = vp.sizePixels;
+    float  fitRadiusSq = fitRadiusPx * fitRadiusPx;   // squared-domain layer mask
 
     // dot(BuildCameraRay(u), prevForward) is linear in u: the per-tap dot
     // collapses to two mads against these hoisted axis projections.
@@ -335,10 +339,12 @@ bool EstimateLayerForwardParallax(
     for (int i = 0; i < 9; ++i)
     {
         // Layer mask, part 1: velocity coherence with the resolved layer.
-        // NaN-robust form: garbage input must fall OUT of the mask -- with
-        // NaN, (len > r) evaluates false and would INCLUDE the tap,
-        // poisoning the fit; (!(len <= r)) excludes it.
-        if (!(length((velocityUV[i] - refVelocityUV) * px) <= fitRadiusPx))
+        // Squared-domain compare (the magnitude is not reused elsewhere).
+        // NaN-robustness preserved: with NaN, (dot <= rSq) evaluates false
+        // and the negation excludes the tap, so garbage input cannot poison
+        // the fit. Was one sqrt per tap on the default-ON path.
+        float2 maskD = (velocityUV[i] - refVelocityUV) * px;
+        if (!(dot(maskD, maskD) <= fitRadiusSq))
             continue;
         // Layer mask, part 2: the depth-side rule (see the section header).
         if (isDilationZone)        { if (i == 0 || depthRaw[i] <= depthRaw[0]) continue; }
@@ -414,11 +420,15 @@ float ComputeDepthDisocclusionScore(
     if (taaDepthRejection <= 0.001) return 0.0;
 
     // --- the transport -----------------------------------------------------
+    // Both forward axes hoisted once (the parallax fit reuses prevForward;
+    // they were previously recomputed at every call site).
+    float3 prevFwd = CameraForwardAxis(previousCamera);
+    float3 curFwd  = CameraForwardAxis(currentCamera);
+
     float  wCur = 1.0 / max(effectiveDepthRaw, kEpsilon);
     float3 dCur = frameBaseUV.x * currentCamera.rightTanFov + currentCamera.forward
                 - frameBaseUV.y * currentCamera.downTanFov;
-    float  bCur = dot(dCur, CameraForwardAxis(previousCamera))
-               / max(dot(dCur, CameraForwardAxis(currentCamera)), 1e-6);
+    float  bCur = dot(dCur, prevFwd) / max(dot(dCur, curFwd), 1e-6);
     float  wHist = 1.0 / max(landingDepthRaw, kEpsilon);
 
     // --- early-out ----------------------------------------------------------
@@ -433,7 +443,7 @@ float ComputeDepthDisocclusionScore(
         effectiveVelocityUV, frameBaseUV, stableUV,
         depthRaw, velocityJitteredUV, tapUVs,
         isDilationZone, isForegroundEdge,
-        currentCamera, previousCamera, fitRadiusPx, vp, ty, tySigma);
+        currentCamera, previousCamera, prevFwd, fitRadiusPx, vp, ty, tySigma);
 
     if (!tyMeasured)
     {
@@ -518,12 +528,13 @@ bool PursuitConfirmsDivergence(
 
     float  depths[9];
     float2 velocities[9];
+    float2 tapUVs[9];
+    Build3x3TapUVs(snappedUV, vp.texelSize, vp.minUV, vp.maxUV, tapUVs);
     [unroll]
     for (int k = 0; k < 9; ++k)
     {
-        float2 tapUV = clamp(snappedUV + kOffsets3x3[k] * vp.texelSize, vp.minUV, vp.maxUV);
-        depths[k]     = tex2Dlod(depthTex,    float4(tapUV, 0.0, 0.0)).r;
-        velocities[k] = tex2Dlod(velocityTex, float4(tapUV, 0.0, 0.0)).rg;
+        depths[k]     = tex2Dlod(depthTex,    float4(tapUVs[k], 0.0, 0.0)).r;
+        velocities[k] = tex2Dlod(velocityTex, float4(tapUVs[k], 0.0, 0.0)).rg;
     }
 
     SurfaceEdgeState landingEdge = AnalyzeSurfaceEdgesCore(depths, taaUseDepthDilation > 0.5);
@@ -541,12 +552,14 @@ bool PursuitConfirmsDivergence(
     MeasureVelocityFieldShapeCoherent(velocities, vp.sizePixels, coherenceRadiusPx, maxCurvaturePx, maxPairGradPx);
 
     float landingSpreadPx = 0.0;
+    float cohRSq = coherenceRadiusPx * coherenceRadiusPx;
     [unroll]
     for (int m = 0; m < 9; ++m)
     {
         float2 deltaPx = (velocities[m] - landingVelocityJitteredUV) * vp.sizePixels;
-        if (length(deltaPx) <= coherenceRadiusPx)
-            landingSpreadPx = max(landingSpreadPx, length(deltaPx));
+        float  deltaSq = dot(deltaPx, deltaPx);
+        if (deltaSq <= cohRSq)
+            landingSpreadPx = max(landingSpreadPx, sqrt(deltaSq));
     }
 
     bool landingContinuous = IsContinuousVelocityField(maxCurvaturePx, maxPairGradPx);

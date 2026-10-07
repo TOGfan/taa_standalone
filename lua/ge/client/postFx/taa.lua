@@ -60,6 +60,13 @@ end
 -- prev2Yaw/prev2Pitch are likewise passed NEGATED: RotationFlowUV uses the
 --   same (mirrored) convention as basis(), so -angles yields the true t-2
 --   content shift, matching the sense of the two bases above.
+-- setFrameState no-op detection: when the camera state is bit-identical
+-- frame to frame (paused, menus, orbit-static, jitter disabled) the ~30
+-- named setShaderConst calls are skipped entirely; under active jitter every
+-- value changes and the check costs 8 compares. M.build() resets this so
+-- freshly created objects always receive their constants.
+local fsLast = {}
+
 function M.setFrameState(tanX, tanY, yaw, pitch, prevYaw, prevPitch, prev2Yaw, prev2Pitch)
     local pre = scenetree.TAA_PreFx
     if not pre then return end
@@ -67,10 +74,29 @@ function M.setFrameState(tanX, tanY, yaw, pitch, prevYaw, prevPitch, prev2Yaw, p
     tanX = math.max(tanX or 1.0, 1e-4)
     tanY = math.max(tanY or 1.0, 1e-4)
 
+    if  tanX == fsLast.tanX and tanY == fsLast.tanY
+    and (yaw  or 0.0) == (fsLast.yaw  or 0.0) and (pitch  or 0.0) == (fsLast.pitch  or 0.0)
+    and (prevYaw  or 0.0) == (fsLast.prevYaw  or 0.0) and (prevPitch  or 0.0) == (fsLast.prevPitch  or 0.0)
+    and (prev2Yaw or 0.0) == (fsLast.prev2Yaw or 0.0) and (prev2Pitch or 0.0) == (fsLast.prev2Pitch or 0.0) then
+        return
+    end
+    fsLast.tanX, fsLast.tanY = tanX, tanY
+    fsLast.yaw,   fsLast.pitch   = yaw or 0.0,   pitch or 0.0
+    fsLast.prevYaw,  fsLast.prevPitch  = prevYaw or 0.0,  prevPitch or 0.0
+    fsLast.prev2Yaw, fsLast.prev2Pitch = prev2Yaw or 0.0, prev2Pitch or 0.0
+
     pre:setShaderConst("$taaTanHalfFovX", tanX)
     pre:setShaderConst("$taaTanHalfFovY", tanY)
-    pre:setShaderConst("$taaJitPrev2Yaw",   -(prev2Yaw or 0.0))
-    pre:setShaderConst("$taaJitPrev2Pitch", -(prev2Pitch or 0.0))
+    -- The t-2 jitter rotation pre-evaluated on the CPU: the angles are
+    -- per-draw uniforms; the shader's per-pixel sin/cos of them was 4 wasted
+    -- transcendentals per pixel. The negation convention is preserved
+    -- exactly (sin/cos OF the already-negated angle).
+    local p2y = -(prev2Yaw or 0.0)
+    local p2p = -(prev2Pitch or 0.0)
+    pre:setShaderConst("$taaJitPrev2YawSin",   math.sin(p2y))
+    pre:setShaderConst("$taaJitPrev2YawCos",   math.cos(p2y))
+    pre:setShaderConst("$taaJitPrev2PitchSin", math.sin(p2p))
+    pre:setShaderConst("$taaJitPrev2PitchCos", math.cos(p2p))
 
     local function basis(yawA, pitchA)
         local sy, cy = math.sin(yawA), math.cos(yawA)
@@ -197,7 +223,12 @@ function M.build()
     taaPreFx:setField("texture", 5, "#TAA_History")
     taaPreFx:setField("target", 0, "#TAA_Result")
     taaPreFx:setField("targetFormat", 0, "GFXFormatR32G32B32A32F")
-    taaPreFx:setField("targetClear", 0, "PFXTargetClear_OnDraw")
+    -- The resolve writes EVERY texel every frame (fullscreen quad at scale
+    -- 1.0, all branches return a color, no discard) -- an OnDraw clear was a
+    -- redundant fullscreen 32F clear per frame (~33 MB at 1080p, ~2 GB/s at
+    -- 60fps) immediately overwritten. First-frame and post-resize contents
+    -- are fully overwritten too.
+    taaPreFx:setField("targetClear", 0, "PFXTargetClear_None")
 
     -- ------------------------------------------------------------------
     -- Final pass (debug view rendering / auto-parity / manual sharpening):
@@ -210,6 +241,10 @@ function M.build()
     local taaFinalFx = createObject("PostEffect")
     taaFinalFx:setField("shader", 0, "TAA_Final_ShaderData"); taaFinalFx:setField("stateBlock", 0, "TAA_Copy_StateBlock")
     taaFinalFx:setField("texture", 0, "#TAA_Result")
+    -- Fullscreen write of every pixel (inherited targetScale 1.0, all paths
+    -- return a color): an engine-default OnDraw clear would be pure waste.
+    -- Harmless no-op if the engine ignores clears on $backBuffer.
+    taaFinalFx:setField("targetClear", 0, "PFXTargetClear_None")
     -- Read-only view of the stored history for debug mode 5. This child runs
     -- BEFORE the history-copy child in the pass chain, so it sees exactly the
     -- buffer contents the resolve consumed this frame (never races the copy).
@@ -253,6 +288,7 @@ function M.build()
     taaStoreMotionFx:registerObject("TAA_StoreMotionFx"); taaPreFx:add(taaStoreMotionFx)
 
     taaPreFx:registerObject("TAA_PreFx")
+    fsLast = {}   -- fresh objects: force the next setFrameState to send
     M.setFrameState(1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
 end
 
@@ -292,33 +328,31 @@ local function chiSq3Cdf(x)
          - math.sqrt(2.0 * x / math.pi) * math.exp(-x * 0.5)
 end
 
-local function beta15Cdf(u, b)
-    -- P(Beta(1.5, b) <= u): Simpson on t = s^2 (kills the sqrt
-    -- singularity; n is a power of two so the [0,1] step is exact).
-    if u <= 0.0 then return 0.0 end
-    if u >= 1.0 then return 1.0 end
-    local n = 512
-    local function integral(hi)
-        local h = hi / n
-        local sum = 0.0
-        for i = 0, n do
-            local s = i * h
-            local w = (i == 0 or i == n) and 1.0 or (((i % 2) == 1) and 4.0 or 2.0)
-            sum = sum + w * 2.0 * s * s * (1.0 - s * s) ^ (b - 1.0)
-        end
-        return sum * h / 3.0
+local function beta15PdfSimpson(hi, n, bm1)
+    -- Simpson on t = s^2 over [0, hi] (kills the sqrt singularity; n is a
+    -- power of two so the [0,1] step is exact). bm1 = b - 1.
+    local h = hi / n
+    local sum = 0.0
+    for i = 0, n do
+        local s = i * h
+        local w = (i == 0 or i == n) and 1.0 or (((i % 2) == 1) and 4.0 or 2.0)
+        sum = sum + w * 2.0 * s * s * (1.0 - s * s) ^ bm1
     end
-    return integral(math.sqrt(u)) / integral(1.0)
+    return sum * h / 3.0
 end
 
 local function f3nuQuantile(p, nu)
     -- q with P(F(3, nu) <= q) = p, via P(F <= q) = I_u(1.5, nu/2),
-    -- u = 3q / (3q + nu).
+    -- u = 3q / (3q + nu). The Simpson NORMALIZER is constant per b -- hoisted
+    -- out of the bisection (it was recomputed on every evaluation: ~2x the
+    -- work per fit, and every varianceGamma/clipOvershoot tick refits).
     local b = nu * 0.5
+    local invNorm = 1.0 / beta15PdfSimpson(1.0, 512, b - 1.0)
     local lo, hi = 0.0, 1.0
     for _ = 1, 48 do
         local mid = 0.5 * (lo + hi)
-        if beta15Cdf(mid, b) < p then lo = mid else hi = mid end
+        local cdf = beta15PdfSimpson(math.sqrt(mid), 512, b - 1.0) * invNorm
+        if cdf < p then lo = mid else hi = mid end
     end
     local u = 0.5 * (lo + hi)
     return nu * u / (3.0 * (1.0 - u))
@@ -403,8 +437,7 @@ M.defaultSettings = {
     -- debug mode 11 shows static-content shrinkage (blue) on fine detail.
     clipScopedMu                  = 1.0,
     useHullClipping               = 1.0,
-    kdopVarianceClipping          = 0.0,
-    colorSpaceOklab               = 1.0,
+    colorSpaceOklab               = 0.0,
     jitterAwareVariance           = 1.0,
     velocityAlignedVariance       = 0.0,
     alignmentFeedbackDrop         = 0.25,
@@ -456,6 +489,26 @@ function M.applySettings(inputs)
         pre:setShaderConst("$taaFeedbackMax",             s.feedbackMax)
         pre:setShaderConst("$taaVarianceGamma",           s.varianceGamma)
         pre:setShaderConst("$taaClipScopedMu",            s.clipScopedMu)
+        -- Gates the resolve's acutance metric + transport EWMA (and, with
+        -- the clip memory off, the entire historyStateTex fetch) on the
+        -- final pass actually consuming the transport.
+        pre:setShaderConst("$taaAcutanceActive",
+            ((tonumber(s.autoSharpen) or 0) > 0.5 and (tonumber(s.sharpness) or 0) > 0.001) and 1 or 0)
+        -- Gates the resolve's acutance metric + transport EWMA (and, with
+        -- the clip memory off, the entire historyStateTex fetch) on the
+        -- final pass actually consuming the transport.
+        pre:setShaderConst("$taaAcutanceActive",
+            ((tonumber(s.autoSharpen) or 0) > 0.5 and (tonumber(s.sharpness) or 0) > 0.001) and 1 or 0)
+        -- Gates the resolve's acutance metric + transport EWMA (and, with
+        -- the clip memory off, the entire historyStateTex fetch) on the
+        -- final pass actually consuming the transport.
+        pre:setShaderConst("$taaAcutanceActive",
+            ((tonumber(s.autoSharpen) or 0) > 0.5 and (tonumber(s.sharpness) or 0) > 0.001) and 1 or 0)
+        -- Gates the resolve's acutance metric + transport EWMA (and, with
+        -- the clip memory off, the entire historyStateTex fetch) on the
+        -- final pass actually consuming the transport.
+        pre:setShaderConst("$taaAcutanceActive",
+            ((tonumber(s.autoSharpen) or 0) > 0.5 and (tonumber(s.sharpness) or 0) > 0.001) and 1 or 0)
         -- The camera's forward displacement this frame (units of 1/rawDepth);
         -- 0 = the shader measures T_y locally. The host could provide this
         -- from the camera hook (res.pos delta dotted with the previous
@@ -512,6 +565,8 @@ function M.applySettings(inputs)
     -- this pass -- its lifecycle is never touched (see build()).
     if mot then
         mot:setShaderConst("$taaUseDepthDilation", s.useDepthDilation)
+        -- Gates the writer's fast path (a 2-fetch write) -- see taaMotion.
+        mot:setShaderConst("$taaUseMotionField", s.useMotionField)
     end
 
     if fin then

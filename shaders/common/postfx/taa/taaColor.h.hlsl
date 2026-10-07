@@ -36,15 +36,21 @@ float3 RGBToYCoCg(float3 c) { return float3(0.25 * c.r + 0.5 * c.g + 0.25 * c.b,
 float3 YCoCgToRGB(float3 c) { return float3(c.x + c.y - c.z, c.x + c.z, c.x - c.y - c.z); }
 
 // RGB <-> tonemapped working space (Oklab or YCoCg, selected by config).
+// BRANCH, not ternary: ?: materializes BOTH conversions and selects -- in
+// YCoCg mode that wasted ~27 pow (cube roots) + 27 matrix applies per pixel.
+// The condition is a per-draw uniform; a coherent branch skips the dead side.
 float3 ToSpace(float3 rgb)
 {
-    float3 tonemapped = Tonemap(max(0.0, rgb));
-    return (taaColorSpaceOklab > 0.5) ? RGBToOklab(tonemapped) : RGBToYCoCg(tonemapped);
+    float3 t = Tonemap(max(0.0, rgb));
+    if (taaColorSpaceOklab > 0.5)
+        return RGBToOklab(t);
+    return RGBToYCoCg(t);
 }
 float3 FromSpace(float3 c)
 {
-    float3 rgb = (taaColorSpaceOklab > 0.5) ? OklabToRGB(c) : YCoCgToRGB(c);
-    return Untonemap(max(0.0, rgb));
+    if (taaColorSpaceOklab > 0.5)
+        return Untonemap(max(0.0, OklabToRGB(c)));
+    return Untonemap(max(0.0, YCoCgToRGB(c)));
 }
 
 // Clamp the history color back into the valid RGB gamut if clipping pushed

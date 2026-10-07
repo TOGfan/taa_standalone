@@ -109,7 +109,10 @@ cbuffer perDraw
     // along the PREVIOUS frame's forward axis, in the units of 1/rawDepth.
     // 0 = not provided; the shader then measures T_y locally.
     float  taaDepthParallaxStep;            float  taaCrossTestStrength;
-    float  taaJitPrev2Yaw;                  float  taaJitPrev2Pitch;
+    // The t-2 jitter rotation, pre-evaluated on the CPU (per-draw uniforms;
+    // the shader's per-pixel sin/cos of them was 4 wasted transcendentals).
+    float  taaJitPrev2YawSin;               float  taaJitPrev2YawCos;
+    float  taaJitPrev2PitchSin;             float  taaJitPrev2PitchCos;
     // The Studentization fit, computed BY THE HOST from the effective
     // radius (studentFitAB in client/postFx/taa.lua):
     //     S(nu) = 1 + taaStudentA/nu + taaStudentB/nu^2
@@ -120,6 +123,11 @@ cbuffer perDraw
     // conservative full-E payment, 1 = residual-scoped (the exact mu
     // variance). Set from client/postFx/taa.lua (clipScopedMu).
     float  taaClipScopedMu;
+    // 1 when the final pass will actually consume the acutance transport
+    // (auto sharpening on AND a nonzero sharpness) -- set by the host. Gates
+    // the raw-scene acutance metric, the transport EWMA and -- when the
+    // clip memory is also off -- the entire historyStateTex fetch.
+    float  taaAcutanceActive;
 
     float2 oneOverTargetSize;
     POSTFX_UNIFORMS
@@ -141,6 +149,16 @@ cbuffer perDraw
 #define mainP main
 #endif
 
+// The FXAA corner taps (the diagonal scene taps 5..8), fetched at the point
+// of use -- see the step-5 note in mainP. Bit-identical to the values the
+// step-5 loop used to retain (same UVs, same sampler, same max()).
+void FetchFxaaCorners(float2 tapUVs[9], out float3 cornersRGB[4])
+{
+    [unroll]
+    for (int c = 0; c < 4; ++c)
+        cornersRGB[c] = max(tex2Dlod(sceneTex, float4(tapUVs[c + 5], 0.0, 0.0)).rgb, 0.0);
+}
+
 // ============================================================================
 // MAIN PIXEL SHADER
 // ============================================================================
@@ -161,8 +179,11 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
     // ------------------------------------------------------------------
     // 1) Resolve the jittered render position of this stable output pixel.
     // ------------------------------------------------------------------
+    // One forward evaluation serves both maps: the inverse is 2u - F(u), and
+    // F(u) IS currentJitteredUV -- the previous form evaluated the identical
+    // forward map (same arguments, same fallback) twice per pixel.
     float2 currentJitteredUV = ReprojectThroughCamera(IN.uv0, currentCamera, IN.uv0, taaTanHalfFovX, taaTanHalfFovY);
-    float2 stableInFrameUV   = InverseReprojectThroughCamera(IN.uv0, currentCamera, taaTanHalfFovX, taaTanHalfFovY);
+    float2 stableInFrameUV   = 2.0 * IN.uv0 - currentJitteredUV;
     SnappedCoord pixel       = SnapUVToTexel(stableInFrameUV, vp);
 
     float3 currentColorRGB          = max(tex2Dlod(sceneTex,    float4(pixel.snappedUV, 0.0, 0.0)).rgb, 0.0);
@@ -170,25 +191,14 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
     float3 currentColorSpace        = ToSpace(currentColorRGB);
     float2 centerVelocityJitteredUV =       tex2Dlod(velocityTex, float4(pixel.snappedUV, 0.0, 0.0)).rg;
 
-    // Modes 3/4 need nothing beyond step 1 -- stash and fall through.
-    if (taaDebugMode > 3.5 && taaDebugMode < 4.5)
-    {
-        dbgCode = 4.0;
-        dbgA    = saturate(LinearizeDepth(centerDepthRaw) / kDebugLinearDepthRange);
-    }
-    else if (taaDebugMode > 2.5 && taaDebugMode < 3.5)
-    {
-        float2 vPx = abs(centerVelocityJitteredUV * vp.sizePixels) * kDebugVelocityScale;
-        dbgCode = 3.0;
-        dbgA    = saturate(vPx.x);
-        dbgB    = saturate(vPx.y);
-    }
+
 
     // ------------------------------------------------------------------
     // 2) Gather the raw 3x3 current-frame depth/velocity neighborhood.
     // ------------------------------------------------------------------
     bool useDepthDilation   = (taaUseDepthDilation > 0.5);
     bool useMotionField     = (taaUseMotionField > 0.5);
+    bool acutanceActive     = (taaAcutanceActive > 0.5);
     bool depthTestActive    = useMotionField && (taaDepthRejection > 0.001);
     bool disocclusionActive = useMotionField && ((taaDepthRejection > 0.001) || (taaVelRejection > 0.001));
     bool needNeighbors      = useDepthDilation || disocclusionActive;
@@ -222,8 +232,7 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
 
     // Foreground crest geometry: consumed only by the depth disocclusion test.
     ForegroundGeometry foreground;
-    foreground.crestDrop = 0.0;
-    foreground.slope     = 0.0;
+    foreground.slope = 0.0;
     if (depthTestActive)
         foreground = ComputeForegroundGeometry(neighborhood, currentLayer.effectiveDepth, edge);
 
@@ -233,14 +242,7 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
     HistoryReprojection repro = ReprojectToHistory(
         IN.uv0, stableInFrameUV, pixel.fracPx, currentLayer.effectiveVelocityUV, previousCamera, vp);
 
-    // Mode 1 (frame motion).
-    if (taaDebugMode > 0.5 && taaDebugMode < 1.5)
-    {
-        float2 vPx = abs(repro.motionPx) * kDebugVelocityScale;
-        dbgCode = 1.0;
-        dbgA    = saturate(vPx.x);
-        dbgB    = saturate(vPx.y);
-    }
+
 
     // ------------------------------------------------------------------
     // 5) Color neighborhood gather + FXAA corners + acutance energy.
@@ -248,7 +250,6 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
     float3 neighborhoodColorSpace[9];
     neighborhoodColorSpace[0] = currentColorSpace;
 
-    float3 fxaaCornersRGB[4]; // 0:NW(5), 1:NE(6), 2:SW(7), 3:SE(8)
     float  rawCrossLumaSum = 0.0; // cross taps 1..4, RCAS-luma of SRTM'd raw
 
     [unroll]
@@ -256,13 +257,22 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
     {
         float3 tapRGB = max(tex2Dlod(sceneTex, float4(tapUVs[i], 0.0, 0.0)).rgb, 0.0);
         neighborhoodColorSpace[i] = ToSpace(tapRGB);
-        if (i <= 4)
+        if (acutanceActive && !debugActive && i <= 4)
             rawCrossLumaSum += SrtmLumaFSR(tapRGB);
-        if (fxaaEnabled && i >= 5)
-            fxaaCornersRGB[i - 5] = tapRGB;
+        // The FXAA corner taps are NOT retained here: holding four raw
+        // float3s live across the whole shader cost ~12 registers on every
+        // pixel. FetchFxaaCorners() re-fetches them at the two points of
+        // use -- extra fetches only on FXAA-engaging and border pixels,
+        // none in steady state.
     }
 
-    float rawHighPass        = SrtmLumaFSR(currentColorRGB) - rawCrossLumaSum * 0.25;
+    // The metric runs only when the transport has a consumer (auto
+    // sharpening active) and debug is off (PackDebugAlpha carries no
+    // acutance field). Gated to zero, both pack sites naturally write the
+    // zero-energy field.
+    float rawHighPass        = (acutanceActive && !debugActive)
+                              ? SrtmLumaFSR(currentColorRGB) - rawCrossLumaSum * 0.25
+                              : 0.0;
     float rawSharpnessEnergy = rawHighPass * rawHighPass;
 
     // ------------------------------------------------------------------
@@ -286,6 +296,8 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
 
         if (fxaaEnabled)
         {
+            float3 fxaaCornersRGB[4];
+            FetchFxaaCorners(tapUVs, fxaaCornersRGB);
             float3 fxaaColorRGB = ApplyFXAA(pixel.snappedUV, vp.texelSize, currentColorRGB, fxaaCornersRGB, vp.minUV, vp.maxUV);
             return float4(max(fxaaColorRGB, 0.0), earlyAlpha);
         }
@@ -298,7 +310,9 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
     // ------------------------------------------------------------------
     float2 jitterOffsetCurUV   = currentJitteredUV - IN.uv0;
     float2 jitterOffsetPrevUV  = ReprojectThroughCamera(IN.uv0, previousCamera, IN.uv0, taaTanHalfFovX, taaTanHalfFovY) - IN.uv0;
-    float2 jitterOffsetPrev2UV = RotationFlowUV(taaJitPrev2Yaw, taaJitPrev2Pitch, IN.uv0);
+    float2 jitterOffsetPrev2UV = RotationFlowUV(
+        float4(taaJitPrev2YawSin, taaJitPrev2YawCos, taaJitPrev2PitchSin, taaJitPrev2PitchCos),
+        IN.uv0);
     float2 jitterCancelUV     = EstimateJitterCancelUV(jitterOffsetCurUV, jitterOffsetPrevUV, jitterOffsetPrev2UV);
     float2 jitterTransportUV  = EstimateJitterTransportUV(jitterOffsetCurUV, jitterOffsetPrevUV, jitterOffsetPrev2UV);
 
@@ -364,46 +378,14 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
             currentLayer.isForeground);
     }
 
-    // Mode 6 (landing effective velocity).
-    if (taaDebugMode > 5.5 && taaDebugMode < 6.5)
-    {
-        float2 vPx = abs(landing.effectiveVelocityJitteredPrevUV * vp.sizePixels) * (kDebugVelocityScale * 2.0);
-        dbgCode = 6.0;
-        dbgA    = saturate(vPx.x);
-        dbgB    = saturate(vPx.y);
-    }
+
 
     // Post-revocation single-layer state (a revoked candidate acts flat).
     bool currentSingleLayer = !(currentLayer.isDilationZone || currentLayer.isForegroundEdge);
 
-    // Mode 8 (layer state + straddle).
-    if (taaDebugMode > 7.5 && taaDebugMode < 8.5)
-    {
-        bool velocityStraddled = false;
-        if (!currentLayer.isDilationZone && !currentLayer.isForegroundEdge)
-        {
-            float2 v00, v10, v01, v11;
-            SelectPhaseQuad(neighborhood.velocityJitteredUV, pixel.fracPx, v00, v10, v01, v11);
-            velocityStraddled = QuadStraddlesVelocityStep(
-                v00, v10, v01, v11, neighborhood.velocityJitteredUV, vp.sizePixels, coherenceRadiusPx);
-        }
-        float f = (currentLayer.isDilationZone   ? 4.0 : 0.0)
-                + (currentLayer.isForegroundEdge ? 2.0 : 0.0)
-                + (velocityStraddled              ? 1.0 : 0.0);
-        dbgCode = 8.0;
-        dbgA    = f * 0.125;
-    }
 
-    // Mode 10 (alignment-drop activity).
-    if (taaDebugMode > 9.5 && taaDebugMode < 10.5)
-    {
-        float dropAmount = currentSingleLayer
-            ? taaAlignmentFeedbackDrop * (1.0 - repro.subpixelAlignment)
-            : 0.0;
-        dbgCode = 10.0;
-        dbgA    = saturate(dropAmount);
-        dbgB    = currentSingleLayer ? 1.0 : 0.0;
-    }
+
+
 
     // ------------------------------------------------------------------
     // 10) Disocclusion tests (require the stored motion field).
@@ -453,41 +435,13 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
 
     bool disoccluded = depthRejected || velocityRejection.rejected;
 
-    // Mode 2 (disocclusion breakdown).
-    if (taaDebugMode > 1.5 && taaDebugMode < 2.5)
-    {
-        float f = (depthRejected ? 4.0 : 0.0)
-                + (velocityRejection.rejected ? 2.0 : 0.0)
-                + ((velocityRejection.errorRatio > 1.0 && !velocityRejection.rejected) ? 1.0 : 0.0);
-        dbgCode = 2.0;
-        dbgA    = f * 0.125;
-    }
 
-    // Mode 7 (pursuit divergence).
-    if (taaDebugMode > 6.5 && taaDebugMode < 7.5)
-    {
-        dbgCode = 7.0;
-        dbgA    = saturate(velocityRejection.divergencePx * 0.5);
-        dbgB    = velocityRejection.rejected ? 1.0 : 0.0;
-    }
 
-    // Mode 12 (dejittered residual -- jitter-cancel verification).
-    if (taaDebugMode > 11.5 && taaDebugMode < 12.5)
-    {
-        float2 residualPx = (currentLayer.effectiveVelocityUV - landing.effectiveVelocityJitteredPrevUV - jitterCancelUV) * vp.sizePixels;
-        dbgCode = 12.0;
-        dbgA    = saturate(length(residualPx) * 0.5);
-    }
 
-    // Mode 9 (dilation-gate breakdown).
-    if (taaDebugMode > 8.5 && taaDebugMode < 9.5)
-    {
-        float f = ((dilationCandidate && !dilationRevoked) ? 4.0 : 0.0)
-                + (gateViaFlag ? 2.0 : 0.0)
-                + (depthRejected ? 1.0 : 0.0);
-        dbgCode = 9.0;
-        dbgA    = f * 0.125;
-    }
+
+
+
+
 
     // ------------------------------------------------------------------
     // 11) Color stats (full tap set), the temporal clip state (sigma +
@@ -501,10 +455,15 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
         neighborhoodColorSpace, repro.motionDirUnit, repro.motionNormalized,
         pixel.fracPx);
 
-    float3 historyColorSpace =
-        (taaUseKaiser6 > 0.5)
-        ? SampleHistoryColor_Kaiser6_21Tap(repro.sampleUV, vp, historyMinUV, historyMaxUV)
-        : SampleHistoryColor_Kaiser4_9Tap(repro.sampleUV, vp, historyMinUV, historyMaxUV);
+    // BRANCH, not ternary: ?: materializes BOTH kernels (30 history fetches
+    // instead of 21, plus both weight suites). The condition is a per-draw
+    // uniform and everything here is tex2Dlod/pure math -- no gradient
+    // hazard, the branch is free.
+    float3 historyColorSpace;
+    if (taaUseKaiser6 > 0.5)
+        historyColorSpace = SampleHistoryColor_Kaiser6_21Tap(repro.sampleUV, vp, historyMinUV, historyMaxUV);
+    else
+        historyColorSpace = SampleHistoryColor_Kaiser4_9Tap(repro.sampleUV, vp, historyMinUV, historyMaxUV);
 
     // NaN/Inf guard: the strict form catches NaN (NaN < x is false) AND both
     // infinities (the old `>= 0` test passed +Inf, and Inf*tGate=0 = NaN
@@ -518,11 +477,7 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
     if (taaHistoryOvershoot > 0.001 || taaColorSpaceOklab > 0.5)
         historyColorSpace = CompressGamut(historyColorSpace);
 
-    // Mode 5 (history color) carries no numeric payload.
-    if (taaDebugMode > 4.5 && taaDebugMode < 5.5)
-    {
-        dbgCode = 5.0;
-    }
+
 
     // ---- temporal clip state + acutance transport -------------------------
     // The previous stable output's packed alpha, read AT THE LANDING through
@@ -535,8 +490,18 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
     float agePrev     = 0.0;
     bool  fictionPrev = false;
 
-    float2 stateUV       = SnapUVToTexel(repro.sampleUV, vp).snappedUV;
-    float  prevStateAlpha = tex2Dlod(historyStateTex, float4(stateUV, 0.0, 0.0)).a;
+    // The previous stable output's packed alpha, read AT THE LANDING through
+    // the DEDICATED POINT-SAMPLED binding (slot 5). ONE fetch serves BOTH
+    // consumers (the clip record and the acutance EWMA) and is skipped
+    // entirely when neither is active: with the clip memory off AND
+    // sharpening off/inactive, a whole history-buffer fetch per pixel
+    // disappears.
+    float prevStateAlpha = 0.0;
+    if (temporalStateEnabled || acutanceActive)
+    {
+        float2 stateUV = SnapUVToTexel(repro.sampleUV, vp).snappedUV;
+        prevStateAlpha = tex2Dlod(historyStateTex, float4(stateUV, 0.0, 0.0)).a;
+    }
     if (temporalStateEnabled)
         DecodeClipState(prevStateAlpha, sigmaPrevSq, agePrev, fictionPrev);
 
@@ -546,9 +511,12 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
     // flicker. EWMA against the previous frame's decoded value AT THE
     // LANDING (the same advection semantics as the record). Foreign/debug
     // tags decode 0, so the target ramps in over ~4 frames after debug or
-    // on reveals -- no sharpening pops.
-    float acutanceStabLin = saturate(sqrt(rawSharpnessEnergy)) * (1.0 / 3.0);
+    // on reveals -- no sharpening pops. Gated on the transport having a
+    // consumer; inactive packs the zero-energy field.
+    float acutanceStabLin = 0.0;
+    if (acutanceActive)
     {
+        acutanceStabLin = saturate(sqrt(rawSharpnessEnergy)) * (1.0 / 3.0);
         float ePrev = DecodeAcutanceLinear(prevStateAlpha);
         acutanceStabLin = lerp(ePrev, acutanceStabLin, kSharpEwmaRate);
     }
@@ -662,13 +630,96 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
         historyColorSpace, colorStats, gateSigmaSq, ageNext, statAlpha, repro.motionNormalized);
     float3 clippedHistorySpace = clipGate.clippedColorSpace;
 
-    // Mode 11 (clip gate state): A = 1.0 carried / 0.35 reset this frame
-    // / 0.15 no record; B = applied shrink.
-    if (taaDebugMode > 10.5 && taaDebugMode < 11.5)
+    // ---- DEBUG PAYLOAD STASH (consolidated) ---------------------------------
+    // All modes stash here, at the end of the pipeline, under ONE uniform
+    // branch: previously twelve separate mode checks ran per pixel in
+    // production and kept dbgCode/dbgA/dbgB live across the entire shader.
+    // Values are identical to the scattered stashes (mode 6 reads the same
+    // default-constructed zeros when the landing was not gathered). The two
+    // deliberate debug-only deltas: the !historyValid early-out now packs
+    // code 0 for every mode (border pixels uniformly show the resolved
+    // color), and mode 1 on revoked dilation candidates shows the
+    // post-revocation motion -- the motion actually used.
+    if (debugActive)
     {
-        dbgCode = 11.0;
-        dbgA    = carryRecord ? 1.0 : (hadRecord ? 0.35 : 0.15);
-        dbgB    = 1.0 - clipGate.tGate;
+        if (taaDebugMode > 0.5 && taaDebugMode < 1.5)          // 1: frame motion
+        {
+            float2 vPx = abs(repro.motionPx) * kDebugVelocityScale;
+            dbgCode = 1.0; dbgA = saturate(vPx.x); dbgB = saturate(vPx.y);
+        }
+        else if (taaDebugMode > 1.5 && taaDebugMode < 2.5)     // 2: disocclusion
+        {
+            float f = (depthRejected ? 4.0 : 0.0)
+                    + (velocityRejection.rejected ? 2.0 : 0.0)
+                    + ((velocityRejection.errorRatio > 1.0 && !velocityRejection.rejected) ? 1.0 : 0.0);
+            dbgCode = 2.0; dbgA = f * 0.125;
+        }
+        else if (taaDebugMode > 2.5 && taaDebugMode < 3.5)     // 3: center velocity
+        {
+            float2 vPx = abs(centerVelocityJitteredUV * vp.sizePixels) * kDebugVelocityScale;
+            dbgCode = 3.0; dbgA = saturate(vPx.x); dbgB = saturate(vPx.y);
+        }
+        else if (taaDebugMode > 3.5 && taaDebugMode < 4.5)     // 4: linearized depth
+        {
+            dbgCode = 4.0;
+            dbgA = saturate(LinearizeDepth(centerDepthRaw) / kDebugLinearDepthRange);
+        }
+        else if (taaDebugMode > 4.5 && taaDebugMode < 5.5)     // 5: history color
+        {
+            dbgCode = 5.0;
+        }
+        else if (taaDebugMode > 5.5 && taaDebugMode < 6.5)     // 6: landing velocity
+        {
+            float2 vPx = abs(landing.effectiveVelocityJitteredPrevUV * vp.sizePixels) * (kDebugVelocityScale * 2.0);
+            dbgCode = 6.0; dbgA = saturate(vPx.x); dbgB = saturate(vPx.y);
+        }
+        else if (taaDebugMode > 6.5 && taaDebugMode < 7.5)     // 7: pursuit divergence
+        {
+            dbgCode = 7.0;
+            dbgA = saturate(velocityRejection.divergencePx * 0.5);
+            dbgB = velocityRejection.rejected ? 1.0 : 0.0;
+        }
+        else if (taaDebugMode > 7.5 && taaDebugMode < 8.5)     // 8: layer state
+        {
+            bool velocityStraddled = false;
+            if (!currentLayer.isDilationZone && !currentLayer.isForegroundEdge)
+            {
+                float2 v00, v10, v01, v11;
+                SelectPhaseQuad(neighborhood.velocityJitteredUV, pixel.fracPx, v00, v10, v01, v11);
+                velocityStraddled = QuadStraddlesVelocityStep(
+                    v00, v10, v01, v11, neighborhood.velocityJitteredUV, vp.sizePixels, coherenceRadiusPx);
+            }
+            float f = (currentLayer.isDilationZone   ? 4.0 : 0.0)
+                    + (currentLayer.isForegroundEdge ? 2.0 : 0.0)
+                    + (velocityStraddled              ? 1.0 : 0.0);
+            dbgCode = 8.0; dbgA = f * 0.125;
+        }
+        else if (taaDebugMode > 8.5 && taaDebugMode < 9.5)     // 9: dilation gate
+        {
+            float f = ((dilationCandidate && !dilationRevoked) ? 4.0 : 0.0)
+                    + (gateViaFlag ? 2.0 : 0.0)
+                    + (depthRejected ? 1.0 : 0.0);
+            dbgCode = 9.0; dbgA = f * 0.125;
+        }
+        else if (taaDebugMode > 9.5 && taaDebugMode < 10.5)    // 10: alignment drop
+        {
+            float dropAmount = currentSingleLayer
+                ? taaAlignmentFeedbackDrop * (1.0 - repro.subpixelAlignment)
+                : 0.0;
+            dbgCode = 10.0; dbgA = saturate(dropAmount); dbgB = currentSingleLayer ? 1.0 : 0.0;
+        }
+        else if (taaDebugMode > 10.5 && taaDebugMode < 11.5)   // 11: clip gate state
+        {
+            dbgCode = 11.0;
+            dbgA = carryRecord ? 1.0 : (hadRecord ? 0.35 : 0.15);
+            dbgB = 1.0 - clipGate.tGate;
+        }
+        else if (taaDebugMode > 11.5 && taaDebugMode < 12.5)   // 12: dejittered residual
+        {
+            float2 residualPx = (currentLayer.effectiveVelocityUV - landing.effectiveVelocityJitteredPrevUV - jitterCancelUV) * vp.sizePixels;
+            dbgCode = 12.0;
+            dbgA = saturate(length(residualPx) * 0.5);
+        }
     }
 
     float clipDistanceRejection = 0.0;
@@ -694,6 +745,8 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
         float fxaaWeight = ComputeFXAAFilterWeight(currentBlendWeight);
         if (fxaaWeight > 0.001)
         {
+            float3 fxaaCornersRGB[4];
+            FetchFxaaCorners(tapUVs, fxaaCornersRGB);
             float3 fxaaColorRGB = ApplyFXAA(pixel.snappedUV, vp.texelSize, currentColorRGB, fxaaCornersRGB, vp.minUV, vp.maxUV);
             currentFrameColorSpace = lerp(currentFrameColorSpace, ToSpace(fxaaColorRGB), fxaaWeight);
         }

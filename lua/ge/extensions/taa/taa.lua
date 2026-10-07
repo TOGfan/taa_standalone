@@ -18,10 +18,9 @@ local tmpQuat = quat(0, 0, 0, 1)
 local prevYaw, prevPitch = 0, 0
 local prev2Yaw, prev2Pitch = 0, 0
 
--- Last known projection parameters, so no-jitter frames keep the shader's
+-- Last known projection parameter, so no-jitter frames keep the shader's
 -- tangent-space math consistent instead of falling back to a hardcoded FOV.
 local lastFov = 65.0
-local lastTanX, lastTanY = 1.0, 1.0
 
 -- Canvas size, tracked so resolution changes reset the history warmup (the
 -- history buffer's contents do not survive a resize).
@@ -101,9 +100,9 @@ local function publishNoJitter()
     -- the disocclusion tangent-space math still consumes taaTanHalfFov, so
     -- keep it consistent with the last valid projection / current canvas size.
     local w, h = frameSize()
-    lastTanY = math.tan(math.rad(lastFov) * 0.5)
-    lastTanX = lastTanY * (w / h)
-    if pfx then pfx.setFrameState(lastTanX, lastTanY, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0) end
+    local tanY = math.tan(math.rad(lastFov) * 0.5)
+    local tanX = tanY * (w / h)
+    if pfx then pfx.setFrameState(tanX, tanY, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0) end
     prevYaw, prevPitch = 0, 0
     prev2Yaw, prev2Pitch = 0, 0
 end
@@ -132,7 +131,6 @@ local function applyJitter(data)
     local tanHalfFovY = math.tan(fovRad * 0.5)
     local tanHalfFovX = tanHalfFovY * (w / h)
     lastFov = fovDeg
-    lastTanX, lastTanY = tanHalfFovX, tanHalfFovY
 
     local period = pfx.settings.useR2Jitter and 32 or 16
     jitterIndex = (jitterIndex + 1) % period
@@ -237,6 +235,15 @@ local function saveState()
     jsonWriteFile(settingsPath, { version = MOD_VERSION, active = active, settings = currentSettings }, true)
 end
 
+-- Debounced persistence: settings APPLY immediately but the JSON write
+-- trails by 0.4s (a slider drag used to do one disk write per tick).
+-- Flushed in onPreRender / stop().
+local savePending, saveTimer = false, 0.0
+local function saveStateSoon()
+    savePending = true
+    saveTimer = 0.4
+end
+
 local function loadState()
     local savedData = jsonReadFile(settingsPath)
 
@@ -319,6 +326,7 @@ end
 
 local function stop()
     active = false
+    if savePending then savePending = false; saveState() end
     if pfx then
         pfx.setEnabled(false)
         pfx.setupHistory("reset")
@@ -356,6 +364,16 @@ M.onExtensionUnloaded = function()
 end
 
 M.onPreRender = function(dt)
+    -- Debounced settings persistence (see saveStateSoon): flushed here so it
+    -- runs regardless of the active/init branches below.
+    if savePending then
+        saveTimer = saveTimer - dt
+        if saveTimer <= 0.0 then
+            savePending = false
+            saveState()
+        end
+    end
+
     if not initDone then
         if worldReadyState < 1 then return end
         initDone = true
@@ -440,7 +458,7 @@ M.uiSetSettings = function(settings)
         pendingSettings = pendingSettings or {}
         tableMerge(pendingSettings, settings)
     end
-    saveState()
+    saveStateSoon()
 end
 
 M.uiSetSetting = function(key, value)

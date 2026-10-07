@@ -23,23 +23,19 @@
 // the resolve's landing-side re-classification with the shared depth-curvature
 // rules, with the layer/revocation semantics baked in.
 //
-// SCHEDULING: a standalone ROOT pass at PFXAfterBin, not a child of the
-// resolve. This pass needs three sampled textures, and child passes only
-// reliably bind two texture slots on the Vulkan backend (slots 0/1 bind; the
-// third fails its descriptor update every frame). As a root it binds like the
-// resolve does. PFXAfterBin guarantees, without priority guesswork:
-//   * the whole resolve chain (PFXBeforeBin, children included) has finished,
-//     so #TAA_Result holds THIS frame's output and the revocation bit in its
-//     sign-encoded alpha is fresh;
-//   * this pass overwrites #TAA_HistMotion strictly AFTER this frame's
-//     resolve read the previous contents, and strictly before the next
-//     frame's resolve reads the new one;
-//   * #prepass[Depth] and #velocitybuffer are persistent frame resources,
-//     valid at any phase.
+// SCHEDULING: a CHILD of the resolve pass (TAA_PreFx), executing inside the
+// resolve's pass chain after the history-copy sibling. As a child it binds
+// its three texture slots the same way the resolve does. The pass is NEVER
+// touched after creation -- no enable()/disable(), no scheduling fields of
+// its own; any lifecycle manipulation re-registers it outside the resolve's
+// pass chain on the Vulkan backend and its named-target bindings then fail
+// ("missing vulkan resource" spam). useMotionField therefore gates the
+// resolve's stored-field ANALYSIS only; this pass always runs (a single
+// fullscreen write whose output is ignored when the resolve does not read
+// the field).
 // The writer ignores the revocation bit for non-candidates, so the
 // conservative "revoked" encodings of the resolve's early/debug returns are
-// always safe. The pass is enabled/disabled together with the resolve chain
-// AND the useMotionField setting.
+// always safe.
 //
 // Fetch budget: the classifier needs all nine depths, but the velocities are
 // fetched lazily -- the center tap always, the crest tap only inside dilation
@@ -53,11 +49,9 @@
 
 uniform_sampler2D(depthTex,         0); // #prepass[Depth]
 uniform_sampler2D(velocityTex,      1); // #velocitybuffer
-// #TAA_History: the history-copy child's bit-exact copy of the resolve
-// output (alpha sign included). The resolve's own #TAA_Result target is only
-// a live resource inside the resolve's pass chain, so this root pass reads
-// the persistent copy instead -- the same binding the resolve itself uses
-// for #TAA_History at its slot 2.
+// #TAA_Result: the resolve wrote it THIS frame; as a child of the resolve we
+// run inside its pass chain, after the final/history-copy siblings, so the
+// revocation sign in its alpha is fresh.
 uniform_sampler2D(resolveOutputTex, 2);
 
 // ============================================================================
@@ -65,12 +59,13 @@ uniform_sampler2D(resolveOutputTex, 2);
 // ============================================================================
 cbuffer perDraw
 {
-    float taaUseDepthDilation;  float taaTanHalfFovX;
-    float taaTanHalfFovY;       float taaCurPX;
-    float taaCurPY;             float taaCurPZ;
-    float taaCurQX;             float taaCurQY;
-    float taaCurQZ;             float taaCurRX;
-    float taaCurRY;             float taaCurRZ;
+    float taaUseDepthDilation;  float taaUseMotionField;
+    float taaTanHalfFovX;       float taaTanHalfFovY;
+    float taaCurPX;             float taaCurPY;
+    float taaCurPZ;             float taaCurQX;
+    float taaCurQY;             float taaCurQZ;
+    float taaCurRX;             float taaCurRY;
+    float taaCurRZ;
 
     float2 oneOverTargetSize;
     POSTFX_UNIFORMS
@@ -99,6 +94,20 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
     // rotational jitter exceeds half a texel -- the screen perimeter.)
     float2 stableInFrameUV = InverseReprojectThroughCamera(IN.uv0, currentCamera, taaTanHalfFovX, taaTanHalfFovY);
     SnappedCoord pixel     = SnapUVToTexel(stableInFrameUV, vp);
+
+    // Fast path: when the resolve does not read the stored field
+    // (useMotionField off), write the CHEAP VALID center sample instead of
+    // the raw classification -- the output is never consumed, and writing a
+    // valid (not garbage) field means toggling the setting back on needs no
+    // warm-up. Saves the 9-tap depth gather + the classifier + the crest
+    // scan on every pixel. The PASS itself still runs: its lifecycle must
+    // never be touched (see the header).
+    if (taaUseMotionField < 0.5)
+    {
+        float2 centerVelocity = tex2Dlod(velocityTex, float4(pixel.snappedUV, 0.0, 0.0)).rg;
+        float  centerDepth    = tex2Dlod(depthTex,    float4(pixel.snappedUV, 0.0, 0.0)).r;
+        return float4(centerVelocity, centerDepth, 0.0);
+    }
 
     float2 tapUVs[9];
     Build3x3TapUVs(pixel.snappedUV, vp.texelSize, vp.minUV, vp.maxUV, tapUVs);

@@ -66,7 +66,7 @@
                 :min="item.min"
                 :max="item.max"
                 :step="item.step || 0.01"
-                :modelValue="config[item.id]"
+                :modelValue="sliderModel(item)"
                 @update:modelValue="val => onSliderChange(item, val)"
                 :with-input="true"
                 :disabled="!isActive"
@@ -77,7 +77,7 @@
                   :accent="ACCENTS.outlined"
                   @click="resetSetting(item)"
                   class="bng-reset-btn"
-                  :style="{ visibility: config[item.id] !== item.default ? 'visible' : 'hidden' }"
+                  :style="{ visibility: sliderModified(item) ? 'visible' : 'hidden' }"
                   title="Reset to default"
                 />
               </div>
@@ -148,6 +148,37 @@ const config = ref({})
 const hoveredItem = ref(null)
 const openDropdown = ref(null)
 
+// ---- clip-coverage slider math -------------------------------------------
+// The clipping slider operates in ACCEPTED-HISTORY PERCENTAGE space; the
+// stored setting (varianceGamma) stays the chi radius so the shader
+// contract, the settings file and the Lua Student-fit plumbing are
+// untouched. acceptance = CDF_chi2_3(chiEff^2), chiEff = chi * (1 + clipOvershoot).
+function erf(x) { // Abramowitz & Stegun 7.1.26 (|eps| <= 1.5e-7)
+  const sign = x < 0 ? -1 : 1
+  x = Math.abs(x)
+  const t = 1 / (1 + 0.3275911 * x)
+  const poly = 0.254829592 + t * (-0.284496736 + t * (1.421413741 + t * (-1.453152027 + t * 1.061405429)))
+  return sign * (1 - poly * t * Math.exp(-x * x))
+}
+function chiSq3Cdf(x) {
+  if (x <= 0) return 0
+  return erf(Math.sqrt(x / 2)) - Math.sqrt((2 * x) / Math.PI) * Math.exp(-x / 2)
+}
+function chiToCoverage(chi, overshoot) {
+  const eff = Math.max(parseFloat(chi) || 0, 0) * (1 + Math.max(parseFloat(overshoot) || 0, 0))
+  return chiSq3Cdf(eff * eff) * 100
+}
+function coverageToChi(pct) {
+  const p = Math.min(Math.max(pct, 0.1), 99.995) / 100
+  let lo = 0, hi = 8
+  for (let i = 0; i < 60; i++) {
+    const mid = (lo + hi) / 2
+    if (chiSq3Cdf(mid * mid) < p) lo = mid
+    else hi = mid
+  }
+  return (lo + hi) / 2
+}
+
 // The sharpness slider changes meaning with the Auto Sharpening toggle:
 // auto = parity target fraction, manual = fixed RCAS strength.
 const sharpnessAuto = {
@@ -156,7 +187,7 @@ const sharpnessAuto = {
   desc: "Target fraction of the raw frame's local sharpness to restore (Auto Sharpening on). The sharpening amount is derived per pixel in closed form from the measured blur -- the ratio of local high-frequency (acutance) energy between the raw scene and the resolved image -- so heavily accumulated (blurred) areas get boosted while fresh, disoccluded and border pixels get almost none. Aliasing is not re-introduced: the target never exceeds the raw image's own energy, sub-perceptual detail is ignored via a noise floor, and RCAS's contrast limiter and noise suppression only ever reduce the boost further. 1.0 = full perceptual parity with the raw image, 0 disables sharpening."
 }
 const sharpnessManual = {
-  id: 'sharpness', type: 'float', min: 0.0, max: 1.0, step: 0.01, default: 1.0,
+  id: 'sharpness', type: 'float', min: 0.0, max: 1.0, step: 0.01, default: 0.85,
   name: "Sharpness (Manual Strength)",
   desc: "Fixed FSR RCAS sharpening strength (Auto Sharpening off), applied uniformly to every pixel with no acutance measurement: 0 disables, 1.0 is the maximum lobe RCAS permits (very strong). RCAS's built-in contrast limiter and noise suppression remain active, so edges are protected from ringing and grain amplification. Values around 0.3-0.5 are a typical manual starting point."
 }
@@ -197,10 +228,20 @@ const settingsSchema = [
   name: "History Clipping",
   items: [
     { id: 'useHullClipping', type: 'numBool', default: 1.0, name: "Temporal Clip Memory", desc: "Gives the history clip a per-pixel memory: an exponential record of how much the resolved image has actually been changing at this texel (the frame-to-frame innovation), stored in the output's alpha channel and transported with the content through reprojection. The clip gate's size is driven by this record instead of the current frame's neighborhood spread alone -- which is what lets fine sub-pixel detail (specular sparkle, thin highlights, dense textures) accumulate its true anti-aliased value instead of being clipped away every frame (the classic fine-detail shimmer). The record also learns the history resampler's own blur, so no extra clip margin is needed to compensate for the resampling kernel. Resets on disocclusion and re-warms within about 7 frames; costs one extra history-buffer read. Off: the gate sizes itself from the current neighborhood's statistics only (classic variance-clipping behavior -- fine detail shimmers again)." },
-    { id: 'varianceGamma', type: 'float', min: 0.0, max: 5.0, step: 0.01, default: 2.8, name: "Clip Coverage Radius", desc: "The clip gate's statistical coverage radius, in standard deviations of what the accumulated history value is permitted to be (the chi of a 3-dimensional confidence region): 1.0 = 20% coverage, 1.5 = 52%, 2.0 = 74%, 2.5 = 90%, 2.8 = 95%. Lower = tighter clip: sharper and less ghosting, but statistically valid fine detail gets clipped and shimmers. Higher = looser: stabler detail, more smear potential. 2.8 is the principled default; below ~2.2 sub-pixel content is measurably under-covered. NOTE: the meaning changed from the old variance-box scale -- a saved value of 1.0-2.0 from before now corresponds to heavy under-coverage, so re-tune." },
+    { id: 'varianceGamma', type: 'float', unit: 'coverage', min: 20.0, max: 99.99, step: 0.01,
+      // default is in STORED units (chi), matching the Lua defaultSettings:
+      // defaultSettings feeds applyPreset() raw, so a display-unit default
+      // here made every preset write varianceGamma = 95.06 (chi!) into the
+      // config and the settings file. All display-unit conversions live in
+      // the helpers below.
+      default: 2.8,
+      name: "Clip Coverage (Accepted History)",
+      desc: "The percentage of statistically valid history the clip gate accepts untouched each frame (the coverage of the 3-degree-of-freedom confidence region). 95% is the principled default. The false clips that remain at any setting are marginal -- a one-frame few-percent pull toward the neighborhood mean, invisible -- so the reason to go higher is heavy-tailed content (specular sparkle, noise) rather than shimmer: 99.9% is a ~4.0-sigma gate, 99.99% is ~4.6 (the pre-normalization-fix gate at the old default behaved like 99.997%). Lower = tighter: sharper and less ghosting, but below ~82% legitimate sub-pixel detail starts getting clipped and shimmers. This is the EFFECTIVE coverage: the Clip Radius Margin below widens it beyond what this slider alone shows." },
+    { id: 'colorSpaceOklab', type: 'numBool', default: 0.0, name: "Perceptual Working Color Space (Oklab)", desc: "Runs the history clipping statistics in Oklab, a perceptually uniform color space: the clip gate's error budget then weights color differences roughly the way human vision does, so clipping decisions favor what you'd actually notice. Off switches to the cheaper YCoCg space -- the resolve's single biggest ALU block is the nine-tap Oklab conversion (three cube roots per tap), so off is a measurable GPU saving, and is what the Performance and Balanced presets select. The cost: chroma error gets weighted like luma error, so colored-edge clipping decisions are slightly less perceptual; expect subtly different chroma-shimmer / colored-ghost behavior at equal slider values." },
     { id: 'chromaVarianceMod', type: 'float', min: 0.5, max: 2.0, step: 0.01, default: 1.0, name: "Chroma Bounds Scale", desc: "Independent multiplier for the color (non-brightness) axes of the clip gate. Above 1 gives chroma more room than brightness (helps colored fine detail accumulate); below 1 clamps chroma harder (tighter control of colored-edge ghosting at the cost of chroma shimmer)." },
     { id: 'softClip', type: 'float', min: 0.0, max: 1.0, step: 0.01, default: 0.0, name: "Soft Clip Strength", desc: "Eases history into the clip gate instead of snapping hard, in near-static scenes. Reduces clipping 'popping' at the cost of a slight ghost linger; fades out with motion." },
-    { id: 'clipOvershoot', type: 'float', min: 0.0, max: 0.5, step: 0.01, default: 0.0, name: "Clip Radius Margin", desc: "Multiplies the clip gate's radius by (1 + this) -- a pure comfort margin. With Temporal Clip Memory on, the record learns the resampling footprint by itself, so 0 is correct; use a small value (0.05-0.1) only with the memory off if legitimate edge detail looks clipped. The meaning changed from the old neighborhood-bounds margin -- old typical values would now massively oversize the gate." },
+    { id: 'clipOvershoot', type: 'float', min: 0.0, max: 0.5, step: 0.01, default: 0.0, name: "Clip Radius Margin", desc: "Multiplies the clip gate's radius by (1 + this) -- a pure comfort margin, included in the EFFECTIVE coverage shown in the Clip Coverage slider above (raising it widens the coverage). With Temporal Clip Memory on, the record learns the resampling footprint by itself, so 0 is correct; use a small value (0.05-0.1) only with the memory off if legitimate edge detail looks clipped." },
+      { id: 'clipScopedMu', type: 'float', min: 0.0, max: 1.0, step: 0.05, default: 1.0, name: "Clip Variance Scoping (Advanced)", desc: "How exactly the clip gate models the neighborhood mean's own variance. 1.0 (default) = residual-scoped, the statistically exact form: edge ghosts get clipped from roughly 0.2x the local contrast upward. 0 = the conservative full payment (~0.5x, the pre-fix behavior apart from the per-channel normalization). Back this off toward 0, or raise the coverage, if debug mode 11 shows static fine detail taking visible shrinkage (blue). Intermediate values blend continuously." },
     { id: 'fireflyClamp', type: 'float', min: 1.0, max: 10.0, step: 0.1, default: 4.0, name: "Firefly Clamp", desc: "Largely legacy under the statistic gate: the clip bounds no longer derive from the sample bounding box, so a single bright outlier can no longer stretch the clip itself. This now only tightens the neighborhood statistics feeding the gate's spatial floor and the drift diagnostics. Leave at default." }
   ]
   },
@@ -211,19 +252,19 @@ const settingsSchema = [
       { id: 'directionalVariance', type: 'numBool', default: 1.0, name: "Directional Padding", desc: "Expands the padding along the color direction of the expected jitter shift rather than uniformly. Only active when Jitter Anti-Flicker Padding is above zero (legacy path)." },
       { id: 'jitterFlickerFade', type: 'numBool', default: 0.0, name: "Fade Padding in Motion", desc: "Disables the jitter anti-flicker padding as pixel velocity rises, since reprojection error dominates jitter error in motion." },
       { id: 'lumaVariance', type: 'numBool', default: 0.0, name: "Luma-Weighted Statistics", desc: "Downweights bright samples when computing neighborhood statistics (Karas-style), keeping the gate's spatial floor from being stretched by specular fireflies." },
-      { id: 'jitterAwareVariance', type: 'numBool', default: 1.0, name: "Jitter-Aware Statistics", desc: "Weights neighborhood samples by their distance from the jittered sampling position instead of the pixel center. This places the clip gate's CENTER on the phase-correct mean -- the anti-aliased value itself -- rather than a phase-skewed one. Keep enabled: disabling it lets the gate center wander with the jitter phase and re-introduces shimmer." },
+      { id: 'jitterAwareVariance', type: 'numBool', default: 1.0, name: "Jitter-Aware Statistics", desc: "Weights neighborhood samples by their distance from the jittered sampling position instead of the pixel center, placing the clip statistics on the current phase's mixture. Since the gate's test-vector correction (the kernel-centroid fix), either position is statistically sound -- the correction removes the phase wander from every test -- but On remains the default: it centers the statistics on the anti-aliased value by construction rather than by correction. Off is slightly cheaper (plain table weights) and is a reasonable Performance-mode selection." },
       { id: 'velocityAlignedVariance', type: 'numBool', default: 0.0, name: "Velocity-Aligned Statistics", desc: "Downweights neighborhood samples that lie behind the direction of motion, tightening the gate's spatial floor along motion trails." }
     ]
   },
   {
     name: "Advanced Rejection",
     items: [
-      { id: 'useMotionField', type: 'numBool', default: 1.0, name: "Motion-Field Validation", desc: "Runs the extra motion-field pass (a fullscreen write storing each texel's resolved motion, depth and layer state) and uses last frame's field in the resolve to validate depth-dilated motion, gate history ownership, and run the depth and velocity disocclusion tests below. Disabling removes that pass plus all landing-side analysis in the resolve -- a large fraction of the total TAA cost -- at the price of disocclusion being detected only through color clipping (more ghosting behind moving objects and at reveals). The Performance preset disables this." },
+      { id: 'useMotionField', type: 'numBool', default: 1.0, name: "Motion-Field Validation", desc: "Runs the extra motion-field pass (a fullscreen write storing each texel's resolved motion, depth and layer state) and uses last frame's field in the resolve to validate depth-dilated motion, gate history ownership, and run the depth and velocity disocclusion tests below. Disabling reduces the writer to a minimal two-fetch fullscreen write (the pass must keep running for chain stability) and skips all landing-side analysis in the resolve -- a large fraction of the total TAA cost -- at the price of disocclusion being detected only through color clipping (more ghosting behind moving objects and at reveals). The Performance preset disables this." },
       { id: 'depthRejection', type: 'float', min: 0.0, max: 1.0, step: 0.001, default: 0.05, name: "Disocclusion Sensitivity (Depth)", desc: "Threshold of the geometry-based depth disocclusion test: how much closer than the current surface transported one frame forward (exact under camera rotation; the layer's forward motion is fitted per surface from the neighborhood's measured parallax) the history depth must be before it is rejected as stale. Lower = more sensitive. 0 disables the depth test (the velocity test then runs standalone). Requires Motion-Field Validation." },
       { id: 'velRejection', type: 'float', min: 0.0, max: 10.0, step: 0.1, default: 5.0, name: "Disocclusion Threshold (Velocity)", desc: "Pixel threshold of the velocity disocclusion test. History whose recorded surface motion no longer matches the current pixel is flagged, then confirmed by pursuing that surface into the current frame -- only a confirmed divergence rejects, so motion-vector noise alone cannot. 0 disables. Lower catches subtler ghosts behind accelerating occluders; too low speckles static scenes. The comparison is exactly de-jittered, so values down to ~0.5 are viable; 1.5 is conservative. Tune with debug modes 2 (green should appear only on true reveals) and 7. Known limitation: on fast-moving or rotating foregrounds, pixels in the object's edge dilation zone can trigger occasional random rejections (point-sampled motion of a fast layer); if that bothers you, raise Velocity Noise Allowance or lower Pursuit Confirmation Strength. Requires Motion-Field Validation." },
       { id: 'velGradientScale', type: 'float', min: 0.0, max: 4.0, step: 0.05, default: 1.0, name: "Velocity Noise Allowance", desc: "Scales the velocity-coherent noise allowance of the disocclusion alert (how much neighboring motion-vector variation is treated as noise rather than signal). Raise if noisy velocity content -- vegetation, particles, alpha-tested edges, or fast-foreground edge dilation zones -- causes speckled alerts in debug mode 2; lower for a stricter alert." },
       { id: 'crossTestStrength', type: 'float', min: 0.0, max: 1.0, step: 0.05, default: 0.35, name: "Pursuit Confirmation Strength", desc: "How strongly the current-frame pursuit must confirm a flagged velocity mismatch before history is actually rejected (scales the measured divergence against its tolerance). Higher = more velocity rejections; lower makes the pursuit stricter about confirming, which also suppresses the dilation-zone false positives on fast foregrounds. 0.35 is conservative; 0.6-1.0 is reasonable once verified against debug modes 2 and 7." },
-      { id: 'clipDistanceRejectionEnabled', type: 'numBool', default: 1.0, name: "Smear Rejection", desc: "Drops history weight where the clip gate had to shrink the history a long way (measured in units of the gate's own sigma, so sub-pixel detail does not trigger it) -- a ghosting indicator for content without motion vectors (animated textures, particles)." },
+      { id: 'clipDistanceRejectionEnabled', type: 'numBool', default: 0.0, name: "Smear Rejection", desc: "Drops history weight where the clip gate had to shrink the history a long way (measured in units of the gate's own sigma, so sub-pixel detail does not trigger it) -- a ghosting indicator for content without motion vectors (animated textures, particles)." },
       { id: 'clipDistanceRejectionAmount', type: 'float', min: 0.0, max: 1.0, step: 0.001, default: 0.0, name: "Smear Rejection Tolerance", desc: "How far the clip distance must exceed the minimum error before history is fully rejected." },
       { id: 'clipDistanceRejectionMinError', type: 'float', min: 0.001, max: 0.5, step: 0.001, default: 0.15, name: "Smear Rejection Min Error", desc: "Minimum clip distance before smear rejection begins to engage." }
     ]
@@ -263,10 +304,21 @@ settingsSchema.forEach(cat => {
 })
 
 const presets = {
-  Performance: { feedbackMax: 0.95, feedbackMin: 0.95, useKaiser6: 0, colorSpaceOklab: 0, useMotionField: 0 },
-  Balanced: { useKDopClipping: 0, colorSpaceOklab: 0 }, 
+  Performance: {
+    feedbackMax: 0.95, feedbackMin: 0.95,
+    useKaiser6: 0, colorSpaceOklab: 0, useMotionField: 0,
+    clipScopedMu: 0,
+    // --- aggressive tier: uncomment for max performance (each has a visible
+    // --- cost; see the preset-notes discussion):
+    // useDepthDilation: 0,            // -16 fetches/px: the biggest gate; silhouettes lose dilated motion
+    // autoSharpen: 0, sharpness: 0,   // the whole sharpening pipeline becomes free
+    // useHullClipping: 0,             // fine-detail shimmer; the state fetch only vanishes if sharpening is off too
+    // jitterAwareVariance: 0,         // ~50 ops/px; statistically sound since the C2 test-vector fix
+    // fallbackFXAA: 0,                // 4 fetches on transient pixels; aliased reveals
+  },
+  Balanced: { colorSpaceOklab: 0 },
   Clarity: { feedbackMax: 0.95, feedbackMin: 0.95, },
-  Smooth: { }
+  Smooth: { varianceGamma: 4.594 }
 }
 
 // Per-item display override: the sharpness row follows the auto-sharpen toggle.
@@ -290,16 +342,49 @@ function formatDefault(item) {
     const opt = item.options.find(o => o.value === item.default)
     return opt ? opt.label : item.default
   }
-  return item.default
+  return item.unit === 'coverage' ? `${chiToCoverage(item.default, 0).toFixed(2)} %` : item.default
 }
 
 function resetSetting(item) {
-  config.value[item.id] = item.default
+  if (item.unit === 'coverage') {
+    // item.default is the default chi: restore the default EFFECTIVE
+    // coverage given the current radius margin.
+    const margin = 1 + Math.max(parseFloat(config.value.clipOvershoot) || 0, 0)
+    config.value.varianceGamma = +(item.default / margin).toFixed(4)
+  } else {
+    config.value[item.id] = item.default
+  }
   updateSetting(item.id)
 }
 
+function sliderModel(item) {
+  if (item.unit === 'coverage')
+    return Math.min(99.99, +chiToCoverage(config.value.varianceGamma, config.value.clipOvershoot).toFixed(2))
+  return config.value[item.id]
+}
+
+function sliderModified(item) {
+  if (item.unit === 'coverage') {
+    // Compare display against display, rounded identically (both sides call
+    // the same chiToCoverage, so the defaults compare exactly equal at any
+    // erf precision). Semantic: "the EFFECTIVE coverage differs from the
+    // default coverage" -- margin-independent by design.
+    const defaultDisp = +chiToCoverage(item.default, 0).toFixed(2)
+    return Math.abs(sliderModel(item) - defaultDisp) >= 0.005
+  }
+  return config.value[item.id] !== item.default
+}
+
 function onSliderChange(item, val) {
-  config.value[item.id] = val
+  if (item.unit === 'coverage') {
+    // The slider is the EFFECTIVE coverage (radius margin included); back
+    // out the base radius the shader and the Lua Student fit consume.
+    const chi = coverageToChi(val)
+    const margin = 1 + Math.max(parseFloat(config.value.clipOvershoot) || 0, 0)
+    config.value.varianceGamma = +(chi / margin).toFixed(4)
+  } else {
+    config.value[item.id] = val
+  }
   updateSetting(item.id)
 }
 
@@ -326,7 +411,10 @@ function getOptionLabel(item, val) {
 
 function applyPreset(presetOverrides) {
   for (const key in defaultSettings) { config.value[key] = defaultSettings[key] }
-  for (const key in presetOverrides) { config.value[key] = presetOverrides[key] }
+  for (const key in presetOverrides) {
+    if (!(key in defaultSettings)) continue   // guard against stale preset keys
+    config.value[key] = presetOverrides[key]
+  }
 
   if (!window.bngApi || !window.bngApi.engineLua) return
   // Single round-trip: the Lua side applies the whole table and saves once

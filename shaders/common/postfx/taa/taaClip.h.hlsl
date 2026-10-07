@@ -202,6 +202,11 @@ ColorNeighborhoodStats ComputeColorNeighborhoodStats(
     bool jitterCenteredWeights = (taaJitterAwareVariance > 0.5);
     float2 weightCenterPx = jitterCenteredWeights ? jitterPx : float2(0.0, 0.0);
 
+    // The LS-residual machinery (the scoped mu share's input) is skipped
+    // entirely when scoping is off -- a per-draw uniform branch. residSq is
+    // then unused (the gate's lerp blend factor is 0).
+    bool clipScopedOn = (taaClipScopedMu > 0.001);
+
     float w9[9];
 
     [unroll]
@@ -214,9 +219,13 @@ ColorNeighborhoodStats ComputeColorNeighborhoodStats(
         stats.aabbMax = max(stats.aabbMax, tapColorSpace);
 
         float2 offsetFromCenterPx = tapOffsetPx - weightCenterPx;
-        float w = jitterCenteredWeights
-            ? exp2(-dot(offsetFromCenterPx, offsetFromCenterPx) * kLog2E)
-            : kStdWeights[i];
+        // BRANCH, not ternary: a ternary materializes the exp2 even when the
+        // standard weights are selected (the condition is a per-draw uniform).
+        float w;
+        if (jitterCenteredWeights)
+            w = exp2(-dot(offsetFromCenterPx, offsetFromCenterPx) * kLog2E);
+        else
+            w = kStdWeights[i];
 
         if (taaLumaVariance > 0.5) { w *= (1.0 / (1.0 + max(tapColorSpace.x, 0.0))); }
         if (taaVelocityAlignedVariance > 0.5 && i > 0)
@@ -224,17 +233,19 @@ ColorNeighborhoodStats ComputeColorNeighborhoodStats(
             w *= lerp(1.0, saturate(dot(tapOffsetPx, motionDirUnit) * kInvLength[i] * 0.5 + 0.5), motionFactor);
         }
 
-        w9[i] = w;
-
         weightedSum       += tapColorSpace * w;
         weightedSumSq     += tapColorSpace * tapColorSpace * w;
         totalWeight       += w;
         totalWeightSq     += w * w;
         weightedOffsetSum += tapOffsetPx * w;
-        weightedOffXSqSum += tapOffsetPx.x * tapOffsetPx.x * w;
-        weightedOffYSqSum += tapOffsetPx.y * tapOffsetPx.y * w;
-        weightedCovXSum   += tapOffsetPx.x * tapColorSpace * w;
-        weightedCovYSum   += tapOffsetPx.y * tapColorSpace * w;
+        if (clipScopedOn)
+        {
+            w9[i] = w;   // stored only for the LS second pass (gated with it)
+            weightedOffXSqSum += tapOffsetPx.x * tapOffsetPx.x * w;
+            weightedOffYSqSum += tapOffsetPx.y * tapOffsetPx.y * w;
+            weightedCovXSum   += tapOffsetPx.x * tapColorSpace * w;
+            weightedCovYSum   += tapOffsetPx.y * tapColorSpace * w;
+        }
     }
 
     float invTotalWeight = 1.0 / max(totalWeight, kEpsilon);
@@ -250,8 +261,6 @@ ColorNeighborhoodStats ComputeColorNeighborhoodStats(
     // the actual one (grid truncation included -- it tracks only ~0.81x the
     // phase at corner phases).
     float2 kernelCentroidPx = weightedOffsetSum * invTotalWeight;
-    float  vXX = max(weightedOffXSqSum * invTotalWeight - kernelCentroidPx.x * kernelCentroidPx.x, 1e-6);
-    float  vYY = max(weightedOffYSqSum * invTotalWeight - kernelCentroidPx.y * kernelCentroidPx.y, 1e-6);
 
     // ---- gradient estimator (1): central differences ------------------------
     // The established phase-bit regressor. The taps sample the stable field
@@ -271,11 +280,19 @@ ColorNeighborhoodStats ComputeColorNeighborhoodStats(
     // ---- gradient estimator (2): weighted-LS slopes (decoupled normal
     // equations; the small offset cross-covariance is neglected, which
     // UNDER-explains -> OVER-estimates the residual -> the safe direction).
-    // NOT used for the phase corrections.
-    float3 covX  = weightedCovXSum * invTotalWeight - kernelCentroidPx.x * stats.mean;
-    float3 covY  = weightedCovYSum * invTotalWeight - kernelCentroidPx.y * stats.mean;
-    float3 lsGX = covX / vXX;
-    float3 lsGY = covY / vYY;
+    // NOT used for the phase corrections. The whole estimator + residual
+    // pass is gated on the scoping uniform (see clipScopedOn above).
+    float3 lsGX = 0.0;
+    float3 lsGY = 0.0;
+    if (clipScopedOn)
+    {
+        float  vXX = max(weightedOffXSqSum * invTotalWeight - kernelCentroidPx.x * kernelCentroidPx.x, 1e-6);
+        float  vYY = max(weightedOffYSqSum * invTotalWeight - kernelCentroidPx.y * kernelCentroidPx.y, 1e-6);
+        float3 covX  = weightedCovXSum * invTotalWeight - kernelCentroidPx.x * stats.mean;
+        float3 covY  = weightedCovYSum * invTotalWeight - kernelCentroidPx.y * stats.mean;
+        lsGX = covX / vXX;
+        lsGY = covY / vYY;
+    }
 
     // ---- the LS residual: noise + curvature, dof-corrected -----------------
     // Second pass over the (in-register) taps. The mean squared residual of a
@@ -283,17 +300,24 @@ ColorNeighborhoodStats ComputeColorNeighborhoodStats(
     // the dof the fit absorbed; N_eff = 1/invNeff corrects, clamped at 3x
     // (corner-phase kernels have N_eff ~ 3.7 -- their invNeff is
     // correspondingly larger, which partially self-corrects).
-    float3 ssr = float3(0.0, 0.0, 0.0);
-    [unroll]
-    for (int j = 0; j < 9; ++j)
+    if (clipScopedOn)
     {
-        float2 dOff = kOffsets3x3[j] - kernelCentroidPx;
-        float3 fit  = stats.mean + lsGX * dOff.x + lsGY * dOff.y;
-        float3 r    = neighborhoodColorSpace[j] - fit;
-        ssr += w9[j] * (r * r);
+        float3 ssr = float3(0.0, 0.0, 0.0);
+        [unroll]
+        for (int j = 0; j < 9; ++j)
+        {
+            float2 dOff = kOffsets3x3[j] - kernelCentroidPx;
+            float3 fit  = stats.mean + lsGX * dOff.x + lsGY * dOff.y;
+            float3 r    = neighborhoodColorSpace[j] - fit;
+            ssr += w9[j] * (r * r);
+        }
+        float dofCorr = 1.0 / max(1.0 - 3.0 * stats.invNeff, 1.0 / 3.0);
+        stats.residSq = max(ssr * invTotalWeight * dofCorr, 0.0);
     }
-    float dofCorr = 1.0 / max(1.0 - 3.0 * stats.invNeff, 1.0 / 3.0);
-    stats.residSq = max(ssr * invTotalWeight * dofCorr, 0.0);
+    else
+    {
+        stats.residSq = 0.0;   // unused: the gate's lerp blend is 0
+    }
 
     // Firefly clamp: pulls the AABB (used by the luma-drift chroma gate and
     // the spike test) into the mean +/- k*sigma band.

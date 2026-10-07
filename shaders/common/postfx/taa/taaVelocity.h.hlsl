@@ -90,15 +90,19 @@ float MeasureVelocityCoherentGradientPx(
     float2 sizePixels,
     float  coherenceRadiusPx)
 {
+    // Squared-domain coherence test; the sqrt is paid only on passing taps
+    // (NaN deltas compare false and are excluded, as before).
+    float rSq = coherenceRadiusPx * coherenceRadiusPx;
     float gradientMax = 0.0;
     [unroll]
     for (int i = 1; i < 9; ++i)
     {
         float2 deltaPx = (neighborVelocityJitteredUV[i] - anchorVelocityJitteredUV) * sizePixels;
-        if (length(deltaPx) <= coherenceRadiusPx)
+        float  deltaSq = dot(deltaPx, deltaPx);
+        if (deltaSq <= rSq)
         {
             float distPx = max(length(kOffsets3x3[i]), 1e-3);
-            gradientMax = max(gradientMax, length(deltaPx) / distPx);
+            gradientMax = max(gradientMax, sqrt(deltaSq) / distPx);
         }
     }
     return gradientMax;
@@ -109,10 +113,17 @@ void MeasureVelocityFieldShapeCoherent(
     float2 v[9], float2 sizePixels, float coherenceRadiusPx,
     out float maxCurvaturePx, out float maxPairGradPx)
 {
+    // Squared-domain coherence mask (the curvature/gradient magnitudes below
+    // are computed only on surviving pairs and stay unsquared).
+    float rSq = coherenceRadiusPx * coherenceRadiusPx;
     bool ok[9];
+    ok[0] = true;
     [unroll]
-    for (int i = 0; i < 9; ++i)
-        ok[i] = (i == 0) || (length((v[i] - v[0]) * sizePixels) <= coherenceRadiusPx);
+    for (int i = 1; i < 9; ++i)
+    {
+        float2 dPx = (v[i] - v[0]) * sizePixels;
+        ok[i] = dot(dPx, dPx) <= rSq;
+    }
 
     float2 curvH  = (ok[3] && ok[4]) ? (v[0] - 0.5 * (v[3] + v[4])) * sizePixels : float2(0.0, 0.0);
     float2 curvV  = (ok[1] && ok[2]) ? (v[0] - 0.5 * (v[1] + v[2])) * sizePixels : float2(0.0, 0.0);
@@ -144,8 +155,11 @@ void SelectPhaseQuad(
         : ((phasePx.y >= 0.0) ? velocityJitteredUV[7] : velocityJitteredUV[5]);
 }
 
-// Max pairwise velocity step inside a 2x2 quad, in px.
-float QuadVelocityStepPx(float2 v00, float2 v10, float2 v01, float2 v11, float2 sizePixels)
+// Max pairwise velocity step inside a 2x2 quad, SQUARED, in px^2. The max of
+// lengths equals the sqrt of the max of squared lengths (monotone), so the
+// straddle pre-screen compares against the squared radius and pays a single
+// sqrt only when it trips: six sqrt -> six dot on EVERY flat pixel.
+float QuadVelocityStepSq(float2 v00, float2 v10, float2 v01, float2 v11, float2 sizePixels)
 {
     float2 d10 = (v10 - v00) * sizePixels;
     float2 d01 = (v01 - v00) * sizePixels;
@@ -153,8 +167,8 @@ float QuadVelocityStepPx(float2 v00, float2 v10, float2 v01, float2 v11, float2 
     float2 d1x = (v11 - v10) * sizePixels;
     float2 dx1 = (v11 - v01) * sizePixels;
     float2 dxx = (v10 - v01) * sizePixels;
-    return max(max(length(d10), length(d01)),
-               max(max(length(d11), length(d1x)), max(length(dx1), length(dxx))));
+    return max(max(dot(d10, d10), dot(d01, d01)),
+               max(max(dot(d11, d11), dot(d1x, d1x)), max(dot(dx1, dx1), dot(dxx, dxx))));
 }
 
 // Does the phase-selected 2x2 quad straddle a velocity layer step? BOTH
@@ -169,9 +183,12 @@ bool QuadStraddlesVelocityStep(
     float2 v00, float2 v10, float2 v01, float2 v11,
     float2 velocityJitteredUV[9], float2 sizePixels, float coherenceRadiusPx)
 {
-    float quadStepPx = QuadVelocityStepPx(v00, v10, v01, v11, sizePixels);
-    if (quadStepPx <= coherenceRadiusPx)
+    float quadStepSq = QuadVelocityStepSq(v00, v10, v01, v11, sizePixels);
+    if (quadStepSq <= coherenceRadiusPx * coherenceRadiusPx)
         return false;
+    // NaN-safe exactly as before: a NaN quadStep fails the <= test and falls
+    // through to the full test, which rejects it identically.
+    float quadStepPx = sqrt(quadStepSq);
 
     float maxCurvaturePx, maxPairGradPx;
     MeasureVelocityFieldShape(velocityJitteredUV, sizePixels, maxCurvaturePx, maxPairGradPx);
@@ -199,12 +216,8 @@ float2 SelectLayerAwareQuadVelocity(float2 velocityJitteredUV[9], float2 phasePx
 
 float2 BilerpVelocityQuad(float2 velocityUV[9], float2 fracPx)
 {
-    float2 v00 = velocityUV[0];
-    float2 v10 = (fracPx.x >= 0.0) ? velocityUV[4] : velocityUV[3];
-    float2 v01 = (fracPx.y >= 0.0) ? velocityUV[2] : velocityUV[1];
-    float2 v11 = (fracPx.x >= 0.0)
-        ? ((fracPx.y >= 0.0) ? velocityUV[8] : velocityUV[6])
-        : ((fracPx.y >= 0.0) ? velocityUV[7] : velocityUV[5]);
+    float2 v00, v10, v01, v11;
+    SelectPhaseQuad(velocityUV, fracPx, v00, v10, v01, v11);
     return Bilerp2x2(v00, v10, v01, v11, abs(fracPx));
 }
 
@@ -276,22 +289,30 @@ bool ForegroundPairRigidMagnitude(
 }
 
 // The smallest nonzero pairwise velocity step in the 3x3, in px: the honest
-// local noise scale of the buffer.
+// local noise scale of the buffer. Squared-domain min (sqrt is monotone and
+// the >0 test squares its floor); the per-tap pixel conversion is hoisted
+// out of the pair loop. One sqrt instead of 36.
 float MeasureVelocityQuantStepPx(float2 velocityJitteredUV[9], float2 sizePixels)
 {
-    float minStepPx = kLargeValue;
+    float2 vPx[9];
+    [unroll]
+    for (int k = 0; k < 9; ++k) { vPx[k] = velocityJitteredUV[k] * sizePixels; }
+
+    float kLargeSq  = kLargeValue * kLargeValue;
+    float minStepSq = kLargeSq;
     [unroll]
     for (int i = 0; i < 9; ++i)
     {
         [unroll]
         for (int j = i + 1; j < 9; ++j)
         {
-            float stepPx = length((velocityJitteredUV[j] - velocityJitteredUV[i]) * sizePixels);
-            if (stepPx > 1e-6)
-                minStepPx = min(minStepPx, stepPx);
+            float2 d = vPx[j] - vPx[i];
+            float stepSq = dot(d, d);
+            if (stepSq > 1e-12)
+                minStepSq = min(minStepSq, stepSq);
         }
     }
-    return (minStepPx < kLargeValue) ? minStepPx : kVelQuantFloorPx;
+    return (minStepSq < kLargeSq) ? sqrt(minStepSq) : kVelQuantFloorPx;
 }
 
 void MeasureShallowForegroundGeometry(

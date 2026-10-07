@@ -46,19 +46,22 @@ CameraBasis GetPreviousFrameCameraBasis()
 
 // Exact rotational flow offset of a yaw/pitch rotation at uv. In the shared
 // offset sense (s_tau = F_tau^{-1}(g) - g) this is exactly s_{t-2} when fed
-// the t-2 jitter angles -- position-exact. VERIFY with debug mode 12 on a
+// the t-2 jitter rotation -- position-exact. VERIFY with debug mode 12 on a
 // static scene: the residual must collapse to noise.
-float2 RotationFlowUV(float yaw, float pitch, float2 uv)
+// rotSinCos = (sin(yaw), cos(yaw), sin(pitch), cos(pitch)): the HOST
+// pre-evaluates these -- they are per-draw uniforms, and the per-pixel
+// sin/cos this function used to do was 4 wasted transcendentals per pixel.
+float2 RotationFlowUV(float4 rotSinCos, float2 uv)
 {
     float3 d = float3((uv.x * 2.0 - 1.0) * max(taaTanHalfFovX, 1e-4),
                        1.0,
                       (1.0 - uv.y * 2.0) * max(taaTanHalfFovY, 1e-4));
 
-    float cy = cos(yaw), sy = sin(yaw);
+    float sy = rotSinCos.x, cy = rotSinCos.y;
     float3 r = float3(d.x * cy - d.y * sy,
                       d.x * sy + d.y * cy,
                       d.z);
-    float cp = cos(pitch), sp = sin(pitch);
+    float sp = rotSinCos.z, cp = rotSinCos.w;
     float3 e = float3(r.x,
                       r.y * cp - r.z * sp,
                       r.y * sp + r.z * cp);

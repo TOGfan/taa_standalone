@@ -359,8 +359,11 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
         bool revoked = (t.a < 0.0);          // the sign stays genuine
 
         // Mode 5's subject: the stored history as the resolve read it this
-        // frame (the history-copy child runs after this pass).
-        float3 historyRGB = max(tex2Dlod(taaHistoryTex, float4(IN.uv0, 0.0, 0.0)).rgb, 0.0);
+        // frame (the history-copy child runs after this pass). Only mode 5
+        // reads it -- skip the fetch in every other view.
+        float3 historyRGB = (code == 5u)
+            ? max(tex2Dlod(taaHistoryTex, float4(IN.uv0, 0.0, 0.0)).rgb, 0.0)
+            : float3(0.0, 0.0, 0.0);
 
         return float4(RenderDebugView(code, pa, pb, revoked, resultRGB, historyRGB), 1.0);
     }
@@ -423,12 +426,13 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
         return float4(max(tE.rgb, AF3_(0.0)), 1.0);
     }
 
-    // con.x = exp2(-stops) = strength: the RCAS-internal limiter scales the
-    // lobe down from the requested value (never up).
-    AF1 stops = -log2(max(strength, AF1_(1.0 / 1024.0)));
-
-    AU4 con;
-    FsrRcasCon(con, stops);
+    // con.x is the ONLY word the 32-bit RCAS path consumes (the lobe scale in
+    // FsrRcasF's `lobe * AF1_AU1(con.x)`); con[1] belongs to the 16-bit
+    // variants. FsrRcasCon would compute exp2(-stops), exactly undoing the
+    // log2 needed to build stops -- set the word directly, skipping the
+    // transcendental round trip (and its rounding). FsrRcasCon stays verbatim
+    // above for the FSR embedding; it is intentionally uncalled.
+    AU4 con = AU4(AU1_AF1(max(strength, AF1_(1.0 / 1024.0))), 0u, 0u, 0u);
 
     AF1 pixR, pixG, pixB;
     FsrRcasF(pixR, pixG, pixB, AU2(ip), con);
