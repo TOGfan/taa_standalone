@@ -155,10 +155,7 @@ LayerSurface ClassifyLayerSurface(
     if (s.isDilationZone || s.edgeTowardCliff)
     {
         velQuantPx = MeasureVelocityQuantStepPx(velocityUV, sizePixels);
-        // The extrapolation pair gate shares the classification coherence
-        // scale (taaVelCoherence), not the function's rejection-side
-        // callers -- same decoupling as mainP's coherenceRadiusPx.
-        float gateRadiusPx = max(taaVelCoherence, velQuantPx);
+        float gateRadiusPx = max(taaVelRejection, velQuantPx);
         fgCoherentGrad = MeasureVelocityCoherentGradientPx(
             closestVelocityUV, velocityUV, sizePixels, gateRadiusPx);
         MeasureShallowForegroundGeometry(
