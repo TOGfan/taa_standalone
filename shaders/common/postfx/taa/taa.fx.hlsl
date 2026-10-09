@@ -6,56 +6,38 @@
 // motion; every jitter-free comparison subtracts s_t - 2*s_{t-1} + s_{t-2}.
 // The history buffer stores the previous frame's STABLE output.
 //
-// v3.8.4: THE 9-TAP SPATIAL ESTIMATOR. The record/drift estimator consumes
-// the FULL 3x3 same-layer subset (was: the center + cardinal cross). The
-// sampling noise of the variance estimate drops ~30% and the mask can drop
-// four taps before the estimate degrades as much as dropping two did
-// before -- fewer false under/over-shoots of the record, fewer false
-// clips of legitimate history. THE COUPLED NORMAL EQUATIONS are mandatory:
-// the diagonals make sum(w*x*y) nonzero, and the old decoupled per-axis
-// fit would be BIASED there -- the 2x2 solve is what keeps the extension
-// from breaking the phase correction and the drift estimate.
+// PIPELINE (per output pixel):
+//   1-3)   snap the stable position; gather the raw current-frame 3x3
+//          (depth/velocity/color); classify the effective surface layer
+//          (dilation zone / foreground edge / flat) and resolve its
+//          effective depth + velocity.
+//   4)     reproject into the history through the previous camera's basis
+//          with the EFFECTIVE velocity.
+//   7-8)   exact jitter plumbing (cancel/transport identities) and the
+//          own-history dilation validation through the stored motion
+//          field.
+//   9-10)  history landing analysis and the depth/velocity disocclusion
+//          tests.
+//   11)    the statistical core: the 9-tap spatial record/drift estimator
+//          (same-layer mask minus the stored edge flags), the drift
+//          predict step, the persistence detector, the record update and
+//          the Mahalanobis gate (taaClip.h.hlsl).
+//   12-13) feedback, the temporal blend, the VarH transport recursion and
+//          the packed output.
 //
-// v3.8.4: the drift predict step (soft-thresholded, gain-capped via the
-// taaDriftMaxGain UI dial), the unified phase correction (the estimator's
-// LS gradient replaces the central difference wherever the estimator is
-// valid), and the age-discounted walk consumers (migration, gate prior,
-// floor, hard alarm -- the 50%-crossing identity preserved by carrying the
-// discount on both sides).
-//
-// v3.9 (statistical audit): the gate's mu share is Studentized at its own
-// estimation dof (Satterthwaite over the record + spatial components --
-// the flat gate's realized null law was ~3.4x hotter than the coded
-// coverage); the sampled correlations are shrunk before the conditioning
-// clamp; the VarH chain runs READ semantics with the implied Var(x) input
-// and the two host-measured kernel gains; the transport scatter's static
-// floor is the measured velocity-quantization scale; the drift event guard
-// is a per-channel drift-vs-step posterior (the magnitude cap stays as the
-// belt) with the soft threshold at 2 estimator sigmas (inside the
-// Studentized gate -- the smooth-lighting band); debug mode 13 exposes the
-// realized null law for calibration.
-//
-// v3.10: THE PERSISTENCE DETECTOR replaces the matched LLR pair (the pair's
-// fallback half was statistically inverted in the sub-gate range -- it
-// could not detect what it was built to detect, and its H0 noise floor
-// fed the migration and the blend floor: flicker, no ghosting). One
-// transported scalar: T, the EMA of the drift estimator's luma
-// t-statistic, normalized to a pinned ~N(0,1) null. Consumers are all
-// smooth: the drift-corrector UNLOCK (the trail-eviction engine), the
-// confirmed blend floor, and the alarm. The step-target migration and the
-// fallback clean-fusion are gone with the walk.
-//
-// v3.10.1 (audit fixes): the persistence evidence prices against the
-// detector's realized 1.22-sigma null (kGhostEvCoef, taaClip; was
-// unit-sigma -- the confirmed blend floor ran ~3x hot at deep
-// confirmation); taaClip's Studentization consumes the honest per-
-// estimator dofs (the flat mu share at the resid-fit count, the sampled
-// correlations at the un-clamped effective count -- see taaClip's
-// v3.10.1 header note and the mode-13 measurement procedure at the
-// nuMuFlat site).
+// THE 9-TAP SPATIAL ESTIMATOR consumes the full 3x3 same-layer subset,
+// weighted by the kernel weights (which downweight the diagonals and
+// thereby bound their ~2x larger parallax residual in the variance). The
+// LS plane fit uses the COUPLED 2x2 normal equations -- with the diagonals
+// present, sum(w*x*y) is nonzero and a decoupled per-axis fit is biased.
+// The estimator exports the LS phase term (gS*u) so the innovation's phase
+// correction uses the same, ~2.7x tighter gradient estimate.
 //
 // OUTPUT: RGB = the resolved color, ALWAYS. A = the packed CLIP STATE
-// (format v3.8, tag 101). Debug modes carry tag 001.
+// (tag 101). Debug modes carry tag 001.
+//
+// REQUIRES: HistoryLandingSurface.tapBandFlag[9] (taaDisocclusion.h.hlsl)
+// -- the per-tap w channel of the landing 3x3 motion-field gather.
 //
 // DEBUG MODES: 0 off | 1 frame motion | 2 disocclusion breakdown |
 //   3 center velocity | 4 linearized depth | 5 history color | 6 landing
@@ -153,14 +135,13 @@ void FetchFxaaCorners(float2 tapUVs[9], out float3 cornersRGB[4])
 // ============================================================================
 // THE DRIFT-IMMUNE RECORD INGEST: the spatial second difference
 // ----------------------------------------------------------------------------
-// v3.8.4: NINE taps. The center + the full 3x3 same-layer subset, weighted
-// by the kernel weights (which downweight the diagonals and thereby bound
-// their ~2x larger parallax residual in the variance). The LS plane fit
-// uses the COUPLED 2x2 normal equations -- with the diagonals present,
-// sum(w*x*y) is nonzero and a decoupled per-axis fit is biased; the coupled
-// solve is what makes the 9-tap extension sound. The estimator also exports
-// the LS phase term (gS*u) so the innovation's phase correction can use the
-// same, ~2.7x tighter gradient estimate (FLAG 3 unification).
+// NINE taps: the center + the full 3x3 same-layer subset, weighted by the
+// kernel weights (which downweight the diagonals and thereby bound their
+// ~2x larger parallax residual in the variance). The LS plane fit uses
+// the COUPLED 2x2 normal equations -- with the diagonals present,
+// sum(w*x*y) is nonzero and a decoupled per-axis fit is biased. The
+// estimator also exports the LS phase term (gS*u) so the innovation's
+// phase correction uses the same, ~2.7x tighter gradient estimate.
 //
 // The common mode iMean = delta - u_t*grad (the taps carry the current
 // jitter phase; the accumulated history sits at the phase average) -- the
@@ -170,6 +151,20 @@ void FetchFxaaCorners(float2 tapUVs[9], out float3 cornersRGB[4])
 // scatter, and the phase correction's own error from the exact LS
 // covariance (sigma^2 * [u]^T N^{-1} [u] with N the weighted second-moment
 // matrix).
+//
+// THE EDGE-FLAG TAP MASK (historyTapIsBand): a same-depth neighbor whose
+// stored flag marks it an edge texel carries the foreground-edge band's
+// accumulation in its history (that is the band's job) -- its (current -
+// history) mismatch is the BAND's state, not this texel's. Left in the
+// estimator it inflates varSpatial (the record's spatial seed AND the
+// drift estimate's noise) and biases iMean by the neighbor's trail: the
+// persistence detector's t-statistic drops ~2x on the wake pixels behind
+// a moving foreground, stretching the very trail it exists to evict. The
+// CENTER tap is never masked: its mismatch IS the signal.
+//
+// The reductions run in ONE accumulation pass with closed-form finishes
+// (the mean-subtracted identities below); the per-tap values stay loop
+// locals -- no iVal/wVal/used arrays.
 // ============================================================================
 void EstimateSpatialRecord(
     float3 tapsSpace[9],
@@ -178,6 +173,7 @@ void EstimateSpatialRecord(
     ViewportParams vp,
     bool sameLayerMask[9],
     bool layerMaskValid,
+    bool historyTapIsBand[9],      // the stored-flag edge mask (see mainP)
     ColorNeighborhoodStats stats,
     out float recordSq,            // -1.0 = invalid (the legacy ingest runs)
     out float3 driftMean,          // the PHASE-CORRECTED local drift estimate
@@ -191,27 +187,46 @@ void EstimateSpatialRecord(
 
     if (!layerMaskValid) return;
 
-    bool   used[9];
-    float  wVal[9];
-    float3 iVal[9];
-    float  wSum = 0.0;
-    float3 iSum = float3(0.0, 0.0, 0.0);
-    float  usedF = 0.0;
+    // ONE accumulation pass. The varSpatial and coupled-plane reductions
+    // below are closed forms of these moments:
+    //   sum w*(i - iMean)^2 = sum w*i^2 - (sum w*i)^2 / W
+    //   sum w*ox*(c - cMean) = sum w*ox*c - cMean * sum w*ox
+    // (the mean-subtracted identities; the raw second moments feed the
+    // coupled normal equations directly). The cancellation is bounded:
+    // the closed forms lose 1-2 digits against mean-subtracted loops when
+    // the common mode dominates, leaving 5-6 significant digits -- far
+    // beneath the record transport's 6-bit sigma quantization and every
+    // consumer's scale.
+    float  wSum = 0.0, wSq = 0.0, usedF = 0.0;
+    float  mXX = 0.0, mYY = 0.0, mXY = 0.0, mX = 0.0, mY = 0.0;
+    float3 iSum  = float3(0.0, 0.0, 0.0);
+    float3 iSum2 = float3(0.0, 0.0, 0.0);
+    float3 cSum  = float3(0.0, 0.0, 0.0);
+    float3 cXSum = float3(0.0, 0.0, 0.0);
+    float3 cYSum = float3(0.0, 0.0, 0.0);
 
     [unroll]
     for (int t = 0; t < 9; ++t)
     {
-        used[t] = (t == 0) || sameLayerMask[t];
-        wVal[t] = 0.0;
-        iVal[t] = float3(0.0, 0.0, 0.0);
-        if (used[t])
+        if ((t == 0) || (sameLayerMask[t] && !historyTapIsBand[t]))
         {
             float3 hRGB = max(tex2Dlod(historyTex, float4(landingUV + kOffsets3x3[t] * vp.texelSize, 0.0, 0.0)).rgb, 0.0);
-            iVal[t] = tapsSpace[t] - ToSpace(hRGB);
-            wVal[t] = stats.mixWeights[t];
-            wSum   += wVal[t];
-            iSum   += iVal[t] * wVal[t];
-            usedF  += 1.0;
+            float3 iV   = tapsSpace[t] - ToSpace(hRGB);
+            float  wv   = stats.mixWeights[t];
+            float2 o    = kOffsets3x3[t];
+            wSum  += wv;
+            wSq   += wv * wv;
+            iSum  += iV * wv;
+            iSum2 += (iV * iV) * wv;
+            cSum  += tapsSpace[t] * wv;
+            cXSum += o.x * tapsSpace[t] * wv;
+            cYSum += o.y * tapsSpace[t] * wv;
+            mXX += wv * o.x * o.x;
+            mYY += wv * o.y * o.y;
+            mXY += wv * o.x * o.y;
+            mX  += wv * o.x;
+            mY  += wv * o.y;
+            usedF += 1.0;
         }
     }
     if (usedF < 2.5 || wSum < 1e-6) return;
@@ -219,46 +234,14 @@ void EstimateSpatialRecord(
     float  invW  = 1.0 / wSum;
     float3 iMean = iSum * invW;
 
-    float3 ssq = float3(0.0, 0.0, 0.0);
-    float  wSq  = 0.0;
-    [unroll]
-    for (int t2 = 0; t2 < 9; ++t2)
-    {
-        if (used[t2])
-        {
-            float3 d = iVal[t2] - iMean;
-            ssq += wVal[t2] * (d * d);
-            wSq += wVal[t2] * wVal[t2];
-        }
-    }
     float invNeffSub = wSq * invW * invW;
     float dofCorr = 1.0 / max(1.0 - invNeffSub, 0.2);
-    float3 varSpatial = max(ssq * invW * dofCorr, float3(0.0, 0.0, 0.0));
+    float3 varSpatial = max((iSum2 - iSum * iSum * invW) * invW * dofCorr, float3(0.0, 0.0, 0.0));
 
     // THE COUPLED 2x2 LS PLANE (the diagonals make mXY nonzero).
-    float3 cSum = float3(0.0, 0.0, 0.0);
-    [unroll]
-    for (int t3 = 0; t3 < 9; ++t3)
-    {
-        if (used[t3]) cSum += tapsSpace[t3] * wVal[t3];
-    }
-    float3 cMean = cSum * invW;
-    float3 gSxNum = float3(0.0, 0.0, 0.0);
-    float3 gSyNum = float3(0.0, 0.0, 0.0);
-    float  mXX = 0.0, mYY = 0.0, mXY = 0.0;
-    [unroll]
-    for (int t4 = 0; t4 < 9; ++t4)
-    {
-        if (used[t4])
-        {
-            float2 o = kOffsets3x3[t4];
-            gSxNum += wVal[t4] * o.x * (tapsSpace[t4] - cMean);
-            gSyNum += wVal[t4] * o.y * (tapsSpace[t4] - cMean);
-            mXX += wVal[t4] * o.x * o.x;
-            mYY += wVal[t4] * o.y * o.y;
-            mXY += wVal[t4] * o.x * o.y;
-        }
-    }
+    float3 cMean  = cSum * invW;
+    float3 gSxNum = cXSum - cMean * mX;
+    float3 gSyNum = cYSum - cMean * mY;
     float detN = mXX * mYY - mXY * mXY;
     float3 gSx, gSy;
     if (detN > 1e-6)
@@ -268,13 +251,13 @@ void EstimateSpatialRecord(
     }
     else
     {
-        // degenerate subset (no 2D spread): fall back to the decoupled fit,
-        // which is exact when mXY = 0 and the spread is 1D.
+        // degenerate subset (no 2D spread): the decoupled fit, exact when
+        // mXY = 0 and the spread is 1D.
         gSx = gSxNum / max(mXX, 1e-4);
         gSy = gSyNum / max(mYY, 1e-4);
     }
 
-    // v3.8.4 (FLAG 5): the record's phase energy, the full quadratic form.
+    // The record's phase energy, the full quadratic form.
     float3 phaseSq = taaJitterPhaseEx  * (gSx * gSx)
                    + taaJitterPhaseEy  * (gSy * gSy)
                    + 2.0 * taaJitterPhaseExy * (gSx * gSy);
@@ -533,7 +516,7 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
     float sigmaPrevSq = -1.0;
     float varHPrevSq  = 0.0;
     float agePrev     = 0.0;
-    float ghostTPrev  = 0.0;   // v3.10: the transported persistence statistic T
+    float ghostTPrev  = 0.0;   // the transported persistence statistic T
 
     float prevStateAlpha = 0.0;
     if (temporalStateEnabled || acutanceActive)
@@ -570,11 +553,22 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
     bool ghostTelemetry = (taaClipGhostReset > 1.5) && (taaClipGhostReset < 2.5);
     bool ghostHard      = (taaClipGhostReset > 2.5);
 
-    // v3.5: the edge's SWEEP RATE.
+    // The uniform-velocity pre-test: if all eight neighbors carry exactly
+    // the center's velocity, every pairwise step is zero -- the quant-step
+    // measurement provably returns kVelQuantFloorPx (its > 1e-12 test
+    // rejects all-zero deltas) and the edge sweep is provably exactly 0
+    // (every dPx is zero). Covers static scenes and rigid camera pans.
+    bool velUniform3x3 = true;
+    [unroll]
+    for (int vu = 1; vu < 9; ++vu)
+        velUniform3x3 = velUniform3x3
+                     && all(neighborhood.velocityJitteredUV[vu] == centerVelocityJitteredUV);
+
+    // The edge's SWEEP RATE.
     float2 sweepNrm = float2(length(0.5 * (neighborhoodColorSpace[4] - neighborhoodColorSpace[3])),
                               length(0.5 * (neighborhoodColorSpace[2] - neighborhoodColorSpace[1])));
     float  edgeSweepPx = 0.0;
-    if (dot(sweepNrm, sweepNrm) > 1e-12)
+    if (!velUniform3x3 && dot(sweepNrm, sweepNrm) > 1e-12)
     {
         sweepNrm = normalize(sweepNrm);
         [unroll]
@@ -585,85 +579,156 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
         }
     }
 
-    // v3.9 (audit §5): the transport scatter's static floor is MEASURED --
-    // the velocity buffer's own quantization/noise scale (the smallest
-    // nonzero pairwise step of the 3x3, the same honest noise scale the
-    // foreground paths use), replacing the 0.35 multiplier constant.
-    // Computed only where it can bind (sub-gate motion: at/above the gate
-    // motion the jitter-residual proxy is charged at full weight) and only
-    // when velocity neighbors were gathered (a no-motion configuration
-    // charges no transport scatter by construction).
+    // The transport scatter's static floor is MEASURED -- the velocity
+    // buffer's own quantization/noise scale (the smallest nonzero
+    // pairwise step of the 3x3, the same honest noise scale the
+    // foreground paths use). Computed only where it can bind (sub-gate
+    // motion: at/above the gate motion the jitter-residual proxy is
+    // charged at full weight) and only when velocity neighbors were
+    // gathered (a no-motion configuration charges no transport scatter by
+    // construction).
     float transportFloorPx = 0.0;
     if (needNeighbors && repro.motionMagnitudePx < kTransportGatePx)
-        transportFloorPx = MeasureVelocityQuantStepPx(neighborhood.velocityJitteredUV, vp.sizePixels);
+        transportFloorPx = velUniform3x3 ? kVelQuantFloorPx
+                                         : MeasureVelocityQuantStepPx(neighborhood.velocityJitteredUV, vp.sizePixels);
+
+    // ---- the estimator's edge-tap mask ----------------------------------------
+    // The stored motion field's flag channel (w) at the estimator's own
+    // history-tap positions. BOTH stored edge flags mark stable texels
+    // whose accumulated history is the edge TRANSITION's mix, not a
+    // layer's flat content: flag 1 = foreground edge (the crest's own
+    // accumulation), flag 2 = kept dilation candidate (the band's). The
+    // flag is read at the LANDING position, so flag 1 cannot be left to
+    // the depth mask: the depth mask is evaluated at the CURRENT 3x3's
+    // positions -- a landing-side crest texel can sit under a
+    // currently-background tap and pass it while its history is
+    // foreground-mixed. With both masked, the dilation band's own
+    // estimator correctly bails (its landing 3x3 is edge/band-flagged) --
+    // the band's statistics are the step model's business, and the drift
+    // corrector / persistence detector do not act on the band's
+    // legitimate accumulation. The CENTER tap is never masked (its
+    // mismatch is the signal).
+    // When the landing analysis ran, its gather already read the motion
+    // field over this exact 3x3 -- the flags ride along at zero fetch
+    // cost (tapBandFlag, taaDisocclusion). The explicit fetches remain
+    // only for the configuration with the motion field on but no landing
+    // gather (both disocclusion tests off, depth dilation on). The range
+    // check (<= 2.5) keeps a garbage/NaN flag channel (first frame after
+    // a resize) from spuriously masking. With useMotionField off the
+    // writer stores flag 0 everywhere -- the mask is simply skipped (the
+    // detector's wake latency roughly doubles in that configuration: the
+    // documented cost of the Performance preset).
+    bool historyTapIsBand[9];
+    [unroll]
+    for (int hbm = 0; hbm < 9; ++hbm)
+        historyTapIsBand[hbm] = false;
+    if (useMotionField && layerMaskValid)
+    {
+        if (needLanding)
+        {
+            [unroll]
+            for (int hfl = 1; hfl < 9; ++hfl)
+                historyTapIsBand[hfl] = (landing.tapBandFlag[hfl] >= 0.5)
+                                     && (landing.tapBandFlag[hfl] <= 2.5);
+        }
+        else
+        {
+            [unroll]
+            for (int hbf = 1; hbf < 9; ++hbf)
+            {
+                float tapFlag = tex2Dlod(historyMotionTex,
+                    float4(repro.sampleUV + kOffsets3x3[hbf] * vp.texelSize, 0.0, 0.0)).w;
+                historyTapIsBand[hbf] = (tapFlag >= 0.5) && (tapFlag <= 2.5);
+            }
+        }
+    }
 
     // ---- color stats ----
     ColorNeighborhoodStats colorStats = ComputeColorNeighborhoodStats(
         neighborhoodColorSpace, repro.motionDirUnit, repro.motionNormalized,
         pixel.fracPx, repro.jitterResidualPx, edgeSweepPx, sameLayerMask, layerMaskValid,
-        transportFloorPx);
+        transportFloorPx, historyTapIsBand);
 
-    // ---- v3.8.4: the 9-tap spatial record estimate + the drift predict ----
+    // ---- the 9-tap spatial record estimate + the drift predict ----
     // (computed BEFORE the history fetch: the correction applies to the
     // history before the innovation, the gate and the detector see it; the
     // phase term is held for the unified innovation correction below.)
     float  recordEstSpatial = -1.0;
     float3 driftCorr        = float3(0.0, 0.0, 0.0);
     float3 estPhaseLS       = float3(0.0, 0.0, 0.0);
-    float3 driftMeanEst     = float3(0.0, 0.0, 0.0);   // v3.10: hoisted -- the persistence detector consumes it
+    float3 driftMeanEst     = float3(0.0, 0.0, 0.0);   // hoisted: the persistence detector consumes it
     float3 driftVarEst      = float3(0.0, 0.0, 0.0);
     if (layerMaskValid)
     {
         EstimateSpatialRecord(neighborhoodColorSpace, repro.sampleUV, pixel.fracPx, vp,
-                              sameLayerMask, layerMaskValid, colorStats,
+                              sameLayerMask, layerMaskValid, historyTapIsBand, colorStats,
                               recordEstSpatial, driftMeanEst, driftVarEst, estPhaseLS);
 
         if (taaDriftCompensation > 0.5)
         {
-            // The soft-thresholded tracker: the noise gate (the sparse-prior
-            // Bayes action on the estimator's own sampling law); the SNR-shaped
-            // gain capped by taaDriftMaxGain is the speed/noise dial (a
-            // correction at gain g injects ~g*Var/2 of noise power into the
-            // history vs the accumulator's own (a/2)Var).
+            // The soft-thresholded tracker: the noise gate is the sparse-
+            // prior Bayes action on the estimator's own sampling law; the
+            // SNR-shaped gain capped by taaDriftMaxGain is the speed/noise
+            // dial (a correction applied at gain g injects ~g*Var/2 of
+            // noise power into the history vs the accumulator's own
+            // (a/2)Var).
             //
-            // v3.10: THE PERSISTENCE UNLOCK. Unconfirmed, the noise gate stands
-            // at kDriftThreshSigmas (2.0 estimator sigmas) -- a persistent
-            // sub-threshold offset stays invisible forever, which was the hole
-            // the old detector failed to cover. When the persistence detector
-            // confirms (|T| over kGhostConfirmT, ~1e-3 false rate, EMA-smooth
-            // ramp), the threshold drops to kGhostUnlockThrSigmas and the
-            // event guard below yields: temporal evidence substitutes for
-            // per-frame SNR. THIS -- not the blend floor -- is the ghost-trail
-            // eviction engine.
+            // THE PERSISTENCE UNLOCK: unconfirmed, the noise gate stands at
+            // kDriftThreshSigmas (2.0 estimator sigmas) -- a persistent
+            // sub-threshold offset stays invisible forever. When the
+            // persistence detector confirms (|T| over kGhostConfirmT,
+            // ~1e-3 false rate, EMA-smooth ramp), the threshold drops to
+            // kGhostUnlockThrSigmas and the event guard below yields:
+            // temporal evidence substitutes for per-frame SNR. THIS -- not
+            // the blend floor -- is the ghost-trail eviction engine.
             float  confirmW  = ghostSoft
                 ? saturate((abs(ghostTPrev) - kGhostConfirmT) / (kGhostAlarmT - kGhostConfirmT))
                 : 0.0;
             float  threshEff = lerp(kDriftThreshSigmas, kGhostUnlockThrSigmas, confirmW);
-            float3 sigmaD    = sqrt(driftVarEst);
             float3 dAbs      = abs(driftMeanEst);
-            float3 dThr      = max(dAbs - threshEff * sigmaD, float3(0.0, 0.0, 0.0));
-            float3 snr       = dThr * dThr / max(dThr * dThr + driftVarEst, float3(1e-12, 1e-12, 1e-12));
-            float3 gain      = saturate(taaDriftMaxGain) * snr;
 
-            // v3.9 (audit §4): the event guard is a per-channel POSTERIOR, not
-            // a clamp. H_drift: m ~ N(0, v + tau^2), tau = kDriftPriorScaleSigmas
-            // * sigmaClean (the lighting-rate prior); H_step: m ~ N(0, v +
-            // sigmaClean^2) (a reveal draws from the content marginal). Equal
-            // priors; the posterior scales the GAIN per channel. v3.10: on
-            // CONFIRMATION the guard yields (max(pDrift, confirmW)) -- a
-            // persistent offset that survived the geometric rejection is a
-            // ghost or a lighting change, and both want tracking. The hard
-            // magnitude cap stays as the belt.
-            float3 sigmaC = AnisoClampSigma(colorStats.sigmaClean);
-            float3 tauD   = (kDriftPriorScaleSigmas * sigmaC) * (kDriftPriorScaleSigmas * sigmaC);
-            float3 vD     = tauD + driftVarEst;
-            float3 vS     = sigmaC * sigmaC + driftVarEst;
-            float3 lrLog  = 0.5 * (log(vS / vD) + (driftMeanEst * driftMeanEst) * (1.0 / vS - 1.0 / vD));
-            float3 pDrift = 1.0 / (1.0 + exp(-lrLog));
-            gain = gain * max(pDrift, float3(confirmW, confirmW, confirmW));
+            // The event guard's whole posterior machinery is inert unless
+            // some channel clears the soft threshold or the detector has
+            // confirmed (dThr = 0 -> snr = 0 -> gain = 0, and
+            // max(pDrift, confirmW) scales a zero gain). The test runs in
+            // the squared domain so the skip path pays no sqrt. The output
+            // is identical on both paths; ~90% of pixels take the skip (a
+            // 2-sigma one-sided exceedance is ~2%/channel).
+            bool anyExcess = (dAbs.x * dAbs.x > threshEff * threshEff * driftVarEst.x)
+                          || (dAbs.y * dAbs.y > threshEff * threshEff * driftVarEst.y)
+                          || (dAbs.z * dAbs.z > threshEff * threshEff * driftVarEst.z);
+            if (anyExcess || confirmW > 0.0)
+            {
+                float3 sigmaD    = sqrt(driftVarEst);
+                float3 dThr      = max(dAbs - threshEff * sigmaD, float3(0.0, 0.0, 0.0));
+                float3 snr       = dThr * dThr / max(dThr * dThr + driftVarEst, float3(1e-12, 1e-12, 1e-12));
+                float3 gain      = saturate(taaDriftMaxGain) * snr;
 
-            float3 driftCap = kDriftCapSigmas * sigmaC;
-            driftCorr = clamp(sign(driftMeanEst) * dThr * gain, -driftCap, driftCap);
+                // The event guard is a per-channel POSTERIOR, not a clamp.
+                // H_drift: m ~ N(0, v + tau^2), tau =
+                // kDriftPriorScaleSigmas * sigmaClean (the lighting-rate
+                // prior); H_step: m ~ N(0, v + sigmaClean^2) (a reveal
+                // draws from the content marginal). Equal priors; the
+                // posterior scales the GAIN per channel. On CONFIRMATION
+                // the guard yields (max(pDrift, confirmW)) -- a persistent
+                // offset that survived the geometric rejection is a ghost
+                // or a lighting change, and both want tracking. The hard
+                // magnitude cap stays as the belt. The content scale is
+                // the pixel's OWN layer's (sigmaClean; = sigma
+                // unstraddled): the full-set sigma carries the off-layer
+                // step, a ~dFB-scaled lighting prior that stands the
+                // drift posterior down exactly on the wake pixels.
+                float3 sigmaC = AnisoClampSigma(colorStats.sigmaClean);
+                float3 tauD   = (kDriftPriorScaleSigmas * sigmaC) * (kDriftPriorScaleSigmas * sigmaC);
+                float3 vD     = tauD + driftVarEst;
+                float3 vS     = sigmaC * sigmaC + driftVarEst;
+                float3 lrLog  = 0.5 * (log(vS / vD) + (driftMeanEst * driftMeanEst) * (1.0 / vS - 1.0 / vD));
+                float3 pDrift = 1.0 / (1.0 + exp(-lrLog));
+                gain = gain * max(pDrift, float3(confirmW, confirmW, confirmW));
+
+                float3 driftCap = kDriftCapSigmas * sigmaC;
+                driftCorr = clamp(sign(driftMeanEst) * dThr * gain, -driftCap, driftCap);
+            }
         }
     }
 
@@ -689,11 +754,11 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
     // ---- the innovation, its corrected form ----------------------------------
     float3 innov       = currentColorSpace - historyColorSpace;
     float  innovSq     = dot(innov, innov);
-    // v3.8.4 (FLAG 3): the UNIFIED phase correction -- the estimator's
-    // same-layer 9-tap coupled-LS gradient (~2.7x tighter than the central
-    // difference), with the CD form as the fallback when the estimator is
-    // invalid. The convention is identical (the phase component of a raw
-    // innovation is -grad*u; it is removed by ADDING grad*u).
+    // The UNIFIED phase correction: the estimator's same-layer 9-tap
+    // coupled-LS gradient (~2.7x tighter than the central difference),
+    // with the CD form as the fallback when the estimator is invalid. The
+    // convention is identical (the phase component of a raw innovation is
+    // -grad*u; it is removed by ADDING grad*u).
     float3 phaseCorr   = (recordEstSpatial >= 0.0) ? estPhaseLS : (-colorStats.phaseShift);
     float3 innovCorr   = innov + phaseCorr;
     float  innovCorrSq = dot(innovCorr, innovCorr);
@@ -716,17 +781,17 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
     // The record's information clock.
     float nuPrev = StudentEffectiveDof(agePrev, colorStats.recordSampleDof);
 
-    // ---- v3.10: THE PERSISTENCE DETECTOR -------------------------------------
-    // One scalar, transported in the alpha's [5:0] field: T = the EMA of the
-    // drift estimator's per-frame spatial t (the LUMA common mode,
-    // driftMeanEst.x / sqrt(driftVarEst.x)), scaled by kGhostEmaNorm so the
-    // H0 law is ~N(0,1) BY CONSTRUCTION -- the ratio is self-normalized, so
-    // a variance-model error cancels between numerator and denominator (the
-    // old walk's null drift grew linearly with V's error). Under a
-    // persistent offset (a ghost trail: history stuck at stale content) the
-    // per-frame t is constant and T converges to t * kGhostEmaNorm in ~13
-    // frames. The per-frame t is clamped at +-6: a single degenerate-subset
-    // spike cannot confirm (one frame contributes at most ~3.2 to T).
+    // ---- THE PERSISTENCE DETECTOR ---------------------------------------------
+    // One scalar, transported in the alpha's [5:0] field: T = the EMA of
+    // the drift estimator's per-frame spatial t (the LUMA common mode,
+    // driftMeanEst.x / sqrt(driftVarEst.x)), scaled by kGhostEmaNorm so
+    // the H0 law is ~N(0,1) BY CONSTRUCTION -- the ratio is
+    // self-normalized, so a variance-model error cancels between
+    // numerator and denominator. Under a persistent offset (a ghost
+    // trail: history stuck at stale content) the per-frame t is constant
+    // and T converges to t * kGhostEmaNorm in ~13 frames. The per-frame t
+    // is clamped at +-6: a single degenerate-subset spike cannot confirm
+    // (one frame contributes at most ~3.2 to T).
     float ghostT = ghostTPrev;
     if (ghostModeOn && layerMaskValid)
     {
@@ -736,25 +801,29 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
                + (kGhostEmaRate * kGhostEmaNorm) * tFrame;
         ghostT = clamp(ghostT, -7.75, 7.75);
     }
-    // v3.10.1: the confirmed evidence in nats -- the exact tau = sigma0
+    // The confirmed evidence in nats -- the exact tau = sigma0
     // Gaussian-prior Bayes factor against the detector's REALIZED null,
     //     ln BF = T^2 / (4 sigma0^2) - 0.5*ln(2),
     // with sigma0^2 = kGhostNullStdSq (1.5: the t_6 input's nu/(nu-2)
-    // inflation -- kGhostEmaNorm only normalizes iid UNIT-variance inputs,
-    // so T's null std is ~1.22, not 1; the |T| thresholds above already
-    // price against it). The old unit-sigma form overstated the exponent by
-    // 1.5x: at T = 4 the blend floor read 7% where the honest value is 2%;
-    // at T = 6 it read 92% vs 36%. ZERO below the confirmation threshold --
-    // the detector contributes nothing anywhere until confirmed.
+    // inflation -- kGhostEmaNorm normalizes iid UNIT-variance inputs, so
+    // T's null std is ~1.22, not 1; the |T| thresholds price against the
+    // same null). ZERO below the confirmation threshold -- the detector
+    // contributes nothing anywhere until confirmed.
     float ghostEvNats = (ghostSoft && abs(ghostT) > kGhostConfirmT)
         ? (kGhostEvCoef * ghostT * ghostT - 0.34657)
         : 0.0;
     bool ghostAlarm = ghostHard && (abs(ghostT) >= kGhostAlarmT);
 
     // ---- change-points, in order of authority --------------------------------
+    // The plausible-range reference at a straddle is the own-layer range
+    // PLUS the coverage span -- the exact slice of what the full AABB
+    // carries: at w = 0 (unresolvable step) the span is the full dFB0 and
+    // this recovers the full-range behavior; at w = 1 it is the measured
+    // bracket (and the record is step-scale there and dominates the
+    // max() anyway). The wake is unstraddled and never sees this.
     float rangeSqSpike = colorStats.rangeSq;
-    if (ghostModeOn && layerMaskValid && colorStats.straddled)
-        rangeSqSpike = colorStats.rangeSqClean;
+    if (layerMaskValid && colorStats.straddled)
+        rangeSqSpike = colorStats.rangeSqClean + colorStats.covSpanSq;
     bool  spike   = hadRecord
         && (innovCorrSq > kClipSpikeRatio * max(sigmaPrevSq, rangeSqSpike));
 
@@ -762,17 +831,18 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
     if (hadRecord && disoccluded)
         geoCorroborated = (WhitenedInnovSq(innovCorr, partsLive) > kGeoCorroborateChiSq);
 
-    // v3.10: the alarm no longer resets the record (a confirmed trail does
-    // not need the Student dof drop; the corrector and floor evict it), and
-    // a record reset does not drain T (see the transport below).
+    // The alarm does not reset the record (a confirmed trail does not need
+    // the Student dof drop; the corrector and floor evict it), and a
+    // record reset does not drain T (see the transport below).
     bool  resetRecord = hadRecord
         && (spike || !(innovSq < kLargeValue) || geoCorroborated);
     bool  carryRecord = hadRecord && !resetRecord;
 
-    // FICTION FREEZE: one-line A/B toggle (the v3.5/v3.6 removals stand).
+    // FICTION FREEZE: one-line A/B toggle for the record/transport fiction
+    // models.
     bool fictionFreeze = false;
 
-    // v3.3: the cap references the CONTENT scale, not the record.
+    // The cap references the CONTENT scale, not the record.
     float winsorCap  = kClipWinsorC * kClipWinsorC
                      * max(partsLive.spatialPriorSq, kClipSigmaRecordFloorSq);
 
@@ -804,35 +874,31 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
     }
     else
     {
-        // Coherence note (v3.10.1): the reset seed is the Var(x) model
-        // (engaged steps) or the spatial E[i^2]-flavored estimate (flats),
-        // while the carried record converges toward E[i^2] -- a
-        // 2/(2-a) - 1 inconsistency (~1.5% at default feedback) at the
-        // reset boundary; exact at a = 1 (full-replacement frames, where
-        // resets concentrate).
+        // Coherence note: the reset seed is the Var(x) model (engaged
+        // steps) or the spatial E[i^2]-flavored estimate (flats), while
+        // the carried record converges toward E[i^2] -- a 2/(2-a) - 1
+        // inconsistency (~1.5% at default feedback) at the reset boundary;
+        // exact at a = 1 (full-replacement frames, where resets
+        // concentrate).
         sigmaStatSq = (colorStats.stepW > 0.5 || recordEstSpatial < 0.0)
             ? SeedRecordTotalSq(colorStats)
             : max(recordEstSpatial, kClipSigmaRecordFloorSq);
         ageNext     = 0.0;
     }
 
-    // ---- the statistic gate (live; re-run COLD on any reset) ----------------
+    // ---- the statistic gate ---------------------------------------------------
+    // The gate runs ONCE: resetRecord is fully determined before it (the
+    // spike test needs the corrected innovation and the range reference,
+    // the geometric corroboration needs the record split -- none need the
+    // gate), and the cold path never reads the record age, so the cold
+    // re-entry on reset pixels folds into this single call.
     float nuHonest = (colorStats.stepW > 0.5) ? colorStats.cusumStepDof : nuPrev;
 
     ClipGateResult clipGate = ClipHistoryToStatisticGate(
-        historyColorSpace, colorStats, partsLive, hadRecord,
-        agePrev, statAlpha, repro.motionNormalized,
+        historyColorSpace, colorStats, partsLive, carryRecord,
+        carryRecord ? agePrev : 0.0, statAlpha, repro.motionNormalized,
         neighborhoodColorSpace,
         ghostEvNats, nuHonest);
-
-    if (resetRecord)
-    {
-        clipGate = ClipHistoryToStatisticGate(
-            historyColorSpace, colorStats, partsLive, false,
-            0.0, statAlpha, repro.motionNormalized,
-            neighborhoodColorSpace,
-            ghostEvNats, nuHonest);
-    }
     float3 clippedHistorySpace = clipGate.clippedColorSpace;
 
     // ---- DEBUG PAYLOAD STASH ----------------------------------------------
@@ -908,11 +974,11 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
         {
             dbgCode = 11.0;
             dbgA = carryRecord ? 1.0 : (hadRecord ? 0.35 : 0.15);
-            // Telemetry: the fitted coverage on engaged steps; the persistence
-            // statistic |T|/alarm elsewhere (dim on static scenes, |T| < ~1
-            // against the 1.22-sigma null; brightness blooming along a real
-            // trail, then decaying as the corrector evicts it -- THE detector
-            // verification view).
+            // Telemetry: the fitted coverage on engaged steps; the
+            // persistence statistic |T|/alarm elsewhere (dim on static
+            // scenes, |T| < ~1 against the 1.22-sigma null; brightness
+            // blooming along a real trail, then decaying as the corrector
+            // evicts it -- THE detector verification view).
             dbgB = ghostTelemetry
                 ? ((colorStats.stepW > 0.5)
                     ? saturate(colorStats.stepC)
@@ -927,12 +993,12 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
         }
         else if (taaDebugMode > 12.5 && taaDebugMode < 13.5)   // 13: gate null law
         {
-            // v3.9 (audit §6): the realized-null calibration view. Park on a
-            // STATIC scene and read A's brightness distribution: the nominal
-            // 95th percentile sits at chi^2/16 (mid-gray at the default
-            // chi 2.8); brightness beyond that is the gate running hot, and
-            // the EMPIRICAL Student factor is (A's 95th percentile) * 16 /
-            // chi^2. B = engagement (mdd > chi^2, blue tint).
+            // The realized-null calibration view. Park on a STATIC scene
+            // and read A's brightness distribution: the nominal 95th
+            // percentile sits at chi^2/16 (mid-gray at the default
+            // chi 2.8); brightness beyond that is the gate running hot,
+            // and the EMPIRICAL Student factor is (A's 95th percentile) *
+            // 16 / chi^2. B = engagement (mdd > chi^2, blue tint).
             float chiDbg = max(taaVarianceGamma, kEpsilon) * (1.0 + max(taaClipOvershoot, 0.0));
             dbgCode = 13.0;
             dbgA = saturate(clipGate.mdd * (1.0 / 16.0));
@@ -953,8 +1019,8 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
     float historyFeedback    = ComputeHistoryFeedback(repro, clipDistanceRejection, currentSingleLayer);
     float currentBlendWeight = 1.0 - historyFeedback;
 
-    // The replacement posterior floors the blend: under H1 the Bayes action
-    // is (1-p1)*h_clipped + p1*x_current. p1 carries the CONFIRMED
+    // The replacement posterior floors the blend: under H1 the Bayes
+    // action is (1-p1)*h_clipped + p1*x_current. p1 carries the CONFIRMED
     // persistence evidence (zero below confirmation -- the detector
     // contributes nothing to the blend on ~99.9% of pixels; the floor
     // exists for sub-radius persistent ghosts the gate cannot see).
@@ -986,15 +1052,14 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
     {
         float aBlend = currentBlendWeight;
         float vTotal = 3.0 * kResampleVarSq;
-        // v3.9 (audit §3): READ semantics, carried through. varH is the
-        // variance of the READ (the Kaiser-resampled history that the gate
-        // tests), not the stored field; the recursion's input is the implied
-        // Var(x) (the record E[i^2] MINUS the read variance -- the old
-        // a^2*record overstates by 2/(2-a): 1.5% at default feedback, 11% at
-        // 0.8); and the two gains are the host-measured kernel constants --
-        // dampGain = the fixed-point read gain for the (smooth, re-read)
-        // history term, freshGain = the white-input read gain for the (white
-        // across texels) fresh-x term.
+        // READ semantics: varH is the variance of the READ (the
+        // Kaiser-resampled history that the gate tests), not the stored
+        // field; the recursion's input is the implied Var(x) (the record
+        // E[i^2] MINUS the read variance); and the two gains are the
+        // host-measured kernel constants -- dampGain = the fixed-point
+        // read gain for the (smooth, re-read) history term, freshGain =
+        // the white-input read gain for the (white across texels) fresh-x
+        // term.
         float dampGain  = 1.0 - saturate(taaVarhResampleLoss);
         float freshGain = 1.0 - saturate(taaVarhWhiteLoss);
         if (fictionFreeze)
@@ -1003,8 +1068,16 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
         }
         else if (carryRecord)
         {
-            float vxFresh  = max(sigmaStatSq - varHPrevSq, 0.0);
-            float varHNext = (1.0 - aBlend) * (1.0 - aBlend) * dampGain * varHPrevSq
+            // The recursion consumes the SAME prior-capped share the gate
+            // does (kArmingCap * spatialPriorSq, see SplitRecordVariance)
+            // -- otherwise the band-carryover state self-sustains: varH >
+            // record zeroes vxFresh every frame and the only decay is the
+            // (1-a)^2 damp, which is SLOWER than the record's own EMA --
+            // the transported ratio then grows frame over frame exactly
+            // on the texels leaving a dilation band.
+            float varHPrevCapped = min(varHPrevSq, kArmingCap * partsLive.spatialPriorSq);
+            float vxFresh  = max(sigmaStatSq - varHPrevCapped, 0.0);
+            float varHNext = (1.0 - aBlend) * (1.0 - aBlend) * dampGain * varHPrevCapped
                            + aBlend * aBlend * freshGain * vxFresh;
             varHCodeNext = EncodeVarHRatio(varHNext, max(sigmaStatSq, kEpsilon));
         }
@@ -1024,10 +1097,10 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
     float3 blendedColorSpace = lerp(clippedHistorySpace, currentFrameColorSpace, currentBlendWeight);
     blendedColorSpace.x = max(blendedColorSpace.x, 0.0);
     float3 outputRGB = max(FromSpace(blendedColorSpace), 0.0);
-    // v3.10: the persistence statistic's transport: 0.25-quanta code =
-    // round(4T) + 32 (T in [-7.75, 7.75] = codes [1, 63]). Never
-    // force-drained on a record reset: the EMA's memory is bounded, and a
-    // reset (spike/geometry) is often the moment a trail is FRESHEST.
+    // The persistence statistic's transport: 0.25-quanta code = round(4T)
+    // + 32 (T in [-7.75, 7.75] = codes [1, 63]). Never force-drained on a
+    // record reset: the EMA's memory is bounded, and a reset
+    // (spike/geometry) is often the moment a trail is FRESHEST.
     // Full-replacement frames (disocclusion, the alarm) erase the offset
     // itself, so T decays naturally through the estimator.
     float ghostCodeNext = clamp(round(ghostT * 4.0) + 32.0, 1.0, 63.0);

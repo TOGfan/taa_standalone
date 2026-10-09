@@ -31,9 +31,23 @@
 // postFx macros (tex2Dlod). Requires fragments included before:
 // taaShared.h.hlsl, taaConstants.h.hlsl, taaVelocity.h.hlsl,
 // taaLayers.h.hlsl.
+//
+// EXPORTS: HistoryLandingSurface.tapBandFlag[9] -- the per-tap w channel of
+// the landing 3x3 motion-field gather, consumed by the resolve's estimator
+// edge-tap mask (taa.fx) so the mask adds no fetches of its own.
 // ============================================================================
 #ifndef TAA_DISOCCLUSION_H_HLSL
 #define TAA_DISOCCLUSION_H_HLSL
+
+// Per-tap reciprocal squared distances of the 3x3 stencil under the
+// max(length, 1) clamp (the clamp binds only on the center tap). The
+// squared-domain scans below use these as compile-time constants.
+// MUST MATCH kOffsets3x3 (taaShared.h.hlsl).
+static const float kOffsets3x3InvDistSq[9] =
+{
+    1.0, 1.0, 1.0, 1.0, 1.0,
+    0.5, 0.5, 0.5, 0.5
+};
 
 // ============================================================================
 // DILATION-REVOCATION GATE READER (the stored quad at the candidate's landing)
@@ -48,13 +62,20 @@
 //     flag (>= 1: edge, or kept dilation band) OR by depth (at the object,
 //     crest-anchored). NO layer-matching: a foreign foreground tap DOES
 //     validate.
-// gateDepth stays layer-gated: its only consumer (touchesAlreadyDilated)
-// requires the center to be flag 2, where the gating reads crest depths.
+// The center is itself part of the support, so a center flag >= 0.75
+// decides the outcome alone (the support-flag test fires) -- the reader
+// exploits this: the first fetch settles every landing whose center is
+// edge/band-flagged, and the neighbors are fetched only for
+// background-flagged centers. The layer-gated bilinear depth is
+// deliberately absent: its only consumer's condition (centerFlag >= 1.5)
+// already forces the support-flag test true through the same subsumption,
+// so no decision can ever read it.
 // ============================================================================
 struct HistoryMotionGate
 {
     float  centerFlag;       // stored flag of the snapped landing texel
-    float  gateDepth;        // layer-gated bilinear stored depth
+    float  gateDepth;        // the center tap's stored depth; no decision
+                             // reads it (the support-flag subsumption above)
     float  supportMaxFlag;   // support max flag (ANY quad tap)
     float  supportDepthMax;  // support max depth (ANY quad tap)
 };
@@ -66,8 +87,28 @@ HistoryMotionGate SampleHistoryMotionGate(float2 historyUV, ViewportParams vp)
     float2 pixelPos  = historyUV * vp.sizePixels;
     float2 baseTexel = floor(pixelPos) + 0.5;
     float2 snappedUV = clamp(baseTexel * vp.texelSize, vp.minUV, vp.maxUV);
-    float2 fracPx    = pixelPos - baseTexel;
 
+    float4 m00 = tex2Dlod(historyMotionTex, float4(snappedUV, 0.0, 0.0));
+
+    // The center tap alone decides whenever it is edge/band-flagged: the
+    // support's flag maximum INCLUDES the center, so centerFlag >= 0.75
+    // forces supportMaxFlag >= 0.75 -> gateViaFlag -> the quad touches
+    // foreground -> no revocation, regardless of the neighbors. The
+    // remaining outputs are dead on this path: supportDepthMax only feeds
+    // the flag test's OR-partner, and gateDepth's consumer condition
+    // (centerFlag >= 1.5) makes the flag test true first. The support
+    // fields are lower bounds, valid because the >= 0.75 test is already
+    // decided.
+    if (m00.w >= 0.75)
+    {
+        g.centerFlag      = m00.w;
+        g.gateDepth       = m00.z;
+        g.supportMaxFlag  = m00.w;
+        g.supportDepthMax = m00.z;
+        return g;
+    }
+
+    float2 fracPx = pixelPos - baseTexel;
     float sx = (fracPx.x >= 0.0) ? 1.0 : -1.0;
     float sy = (fracPx.y >= 0.0) ? 1.0 : -1.0;
 
@@ -75,29 +116,17 @@ HistoryMotionGate SampleHistoryMotionGate(float2 historyUV, ViewportParams vp)
     float2 uv01 = clamp(snappedUV + float2(0.0, sy) * vp.texelSize, vp.minUV, vp.maxUV);
     float2 uv11 = clamp(snappedUV + float2(sx, sy) * vp.texelSize, vp.minUV, vp.maxUV);
 
-    float4 m00 = tex2Dlod(historyMotionTex, float4(snappedUV, 0.0, 0.0));
     float4 m10 = tex2Dlod(historyMotionTex, float4(uv10, 0.0, 0.0));
     float4 m01 = tex2Dlod(historyMotionTex, float4(uv01, 0.0, 0.0));
     float4 m11 = tex2Dlod(historyMotionTex, float4(uv11, 0.0, 0.0));
 
-    // Layer-gated bilinear depth (gateDepth's consumer requires center flag 2).
-    bool fgCenter = (m00.w >= 0.75);
-    bool match10  = ((m10.w >= 0.75) == fgCenter);
-    bool match01  = ((m01.w >= 0.75) == fgCenter);
-    bool match11  = ((m11.w >= 0.75) == fgCenter);
-
-    float2 f   = abs(fracPx);
-    float  w00 = (1.0 - f.x) * (1.0 - f.y);
-    float  w10 = f.x * (1.0 - f.y) * (match10 ? 1.0 : 0.0);
-    float  w01 = (1.0 - f.x) * f.y * (match01 ? 1.0 : 0.0);
-    float  w11 = f.x * f.y * (match11 ? 1.0 : 0.0);
-    float  invW = 1.0 / max(w00 + w10 + w01 + w11, 1e-4);
-    g.gateDepth  = (m00.z * w00 + m10.z * w10 + m01.z * w01 + m11.z * w11) * invW;
     g.centerFlag = m00.w;
+    g.gateDepth  = m00.z;
 
     // The support: ANY tap of the degenerated 2x2 quad -- flag OR depth, no
     // layer-matching. Dead-center landings degenerate to the center alone
     // (the static own-texel check).
+    float2 f = abs(fracPx);
     bool xOffCenter = (f.x >= kCenterLandingFracPx);
     bool yOffCenter = (f.y >= kCenterLandingFracPx);
     float supportDepthMax = m00.z;
@@ -164,6 +193,11 @@ struct HistoryLandingSurface
     // Extrapolation diagnostics (landing side).
     float pairGradPx;        // the active landing extrapolation pair's gradient
     float shallowVelGradPx;  // the landing's measured shallow-end velocity gradient
+
+    // The per-tap stored flags of the landing 3x3 (the same gather's w
+    // channel), exported for the resolve's estimator edge-tap mask --
+    // the mask reads these instead of re-fetching the field.
+    float tapBandFlag[9];
 };
 
 HistoryLandingSurface SampleHistoryLandingSurface(
@@ -180,6 +214,9 @@ HistoryLandingSurface SampleHistoryLandingSurface(
     h.snapDistPx       = 0.0;
     h.pairGradPx       = 0.0;
     h.shallowVelGradPx = 0.0;
+    [unroll]
+    for (int zf = 0; zf < 9; ++zf)
+        h.tapBandFlag[zf] = 0.0;
 
     // Minimal default when no disocclusion test needs the landing (debug
     // views only): the single nearest tap of the stored field. With the
@@ -193,6 +230,7 @@ HistoryLandingSurface SampleHistoryLandingSurface(
             float4 mCenter   = tex2Dlod(historyMotionTex, float4(clampedUV, 0.0, 0.0));
             h.effectiveDepthRaw               = mCenter.z;
             h.effectiveVelocityJitteredPrevUV = mCenter.xy;
+            h.tapBandFlag[0]                  = mCenter.w;
         }
         return h;
     }
@@ -205,23 +243,22 @@ HistoryLandingSurface SampleHistoryLandingSurface(
 
     float  depths[9];
     float2 velocities[9];
-    float  flags[9];
     float2 tapUVs[9];
     Build3x3TapUVs(snappedUV, vp.texelSize, vp.minUV, vp.maxUV, tapUVs);
     [unroll]
     for (int i = 0; i < 9; ++i)
     {
         float4 m = tex2Dlod(historyMotionTex, float4(tapUVs[i], 0.0, 0.0));
-        depths[i]     = m.z;    // previous frame's depth (raw / baked band / revoked)
-        velocities[i] = m.xy;   // previous frame's velocity
-        flags[i]      = m.w;    // post-validation layer record
+        depths[i]         = m.z;    // previous frame's depth (raw / baked band / revoked)
+        velocities[i]     = m.xy;   // previous frame's velocity
+        h.tapBandFlag[i]  = m.w;    // post-validation layer record (the export)
     }
 
     // THE classifier on the stored structure.
     SurfaceEdgeState landingEdge = AnalyzeSurfaceEdgesCore(depths, useDepthDilation);
 
     // --- Ownership gate ------------------------------------------------------
-    bool centerFg = (flags[0] >= 0.75);
+    bool centerFg = (h.tapBandFlag[0] >= 0.75);
     if (!currentIsForeground && !centerFg)
     {
         // Background-resolved center (flat or REVOKED): resolve strictly as
@@ -238,7 +275,7 @@ HistoryLandingSurface SampleHistoryLandingSurface(
     if (!currentIsForeground && !centerFg)
     {
         // The depth must never blend across the ownership boundary.
-        landingLayer.effectiveDepth = LandingOwnedDepth(depths, flags, fracPx);
+        landingLayer.effectiveDepth = LandingOwnedDepth(depths, h.tapBandFlag, fracPx);
     }
 
     h.effectiveDepthRaw               = landingLayer.effectiveDepth;
@@ -247,22 +284,30 @@ HistoryLandingSurface SampleHistoryLandingSurface(
     h.shallowVelGradPx                = landingLayer.shallowVelGradPx;
     h.gradRaw                         = float2(landingLayer.gradX, landingLayer.gradY);
 
-    // Field shape + velocity-coherent noise, anchored at the effective layer,
-    // with layer-consistent differences.
-    MeasureVelocityFieldShapeCoherent(velocities, vp.sizePixels, coherenceRadiusPx, h.maxCurvaturePx, h.maxPairGradPx);
-
-    // Squared-domain coherence test; the sqrt is paid only on passing taps.
-    float cohRSq = coherenceRadiusPx * coherenceRadiusPx;
-    [unroll]
-    for (int m = 0; m < 9; ++m)
+    // The velocity-side field shape and the coherent gradient feed only the
+    // velocity rejection path (its deferred tolerance block and the
+    // pursuit); with the velocity test off that path returns before reading
+    // them -- skip the measurements entirely in that configuration.
+    if (taaVelRejection > 0.001)
     {
-        float2 deltaPx = (velocities[m] - h.effectiveVelocityJitteredPrevUV) * vp.sizePixels;
-        float  deltaSq = dot(deltaPx, deltaPx);
-        if (deltaSq <= cohRSq)
+        MeasureVelocityFieldShapeCoherent(velocities, vp.sizePixels, coherenceRadiusPx, h.maxCurvaturePx, h.maxPairGradPx);
+
+        // Squared-domain coherent scan: the per-tap gradient is
+        // sqrt(deltaSq) / dist, and the max over monotone transforms
+        // collapses -- accumulate deltaSq * invDistSq (the stencil's
+        // clamped reciprocal squared distances are compile-time constants)
+        // and pay ONE sqrt at the end.
+        float cohRSq = coherenceRadiusPx * coherenceRadiusPx;
+        float cohGradSq = 0.0;
+        [unroll]
+        for (int m = 0; m < 9; ++m)
         {
-            float distPx = max(length(kOffsets3x3[m]), 1.0);
-            h.coherentGradPx = max(h.coherentGradPx, sqrt(deltaSq) / distPx);
+            float2 deltaPx = (velocities[m] - h.effectiveVelocityJitteredPrevUV) * vp.sizePixels;
+            float  deltaSq = dot(deltaPx, deltaPx);
+            if (deltaSq <= cohRSq)
+                cohGradSq = max(cohGradSq, deltaSq * kOffsets3x3InvDistSq[m]);
         }
+        h.coherentGradPx = sqrt(cohGradSq);
     }
     return h;
 }
@@ -340,9 +385,9 @@ bool EstimateLayerForwardParallax(
     {
         // Layer mask, part 1: velocity coherence with the resolved layer.
         // Squared-domain compare (the magnitude is not reused elsewhere).
-        // NaN-robustness preserved: with NaN, (dot <= rSq) evaluates false
-        // and the negation excludes the tap, so garbage input cannot poison
-        // the fit. Was one sqrt per tap on the default-ON path.
+        // NaN-robust: with NaN, (dot <= rSq) evaluates false and the
+        // negation excludes the tap, so garbage input cannot poison the
+        // fit.
         float2 maskD = (velocityUV[i] - refVelocityUV) * px;
         if (!(dot(maskD, maskD) <= fitRadiusSq))
             continue;
@@ -420,8 +465,7 @@ float ComputeDepthDisocclusionScore(
     if (taaDepthRejection <= 0.001) return 0.0;
 
     // --- the transport -----------------------------------------------------
-    // Both forward axes hoisted once (the parallax fit reuses prevForward;
-    // they were previously recomputed at every call site).
+    // Both forward axes hoisted once; the parallax fit reuses prevFwd.
     float3 prevFwd = CameraForwardAxis(previousCamera);
     float3 curFwd  = CameraForwardAxis(currentCamera);
 
@@ -453,7 +497,8 @@ float ComputeDepthDisocclusionScore(
         tySigma = kTyUnmeasuredFrac * wCur;
     }
     ty = clamp(ty, -wCur, wCur);      // degenerate-guard, not a tuning knob
-    float wExp = max(wCur * bCur + ty, 1e-4);
+    float wExp   = max(wCur * bCur + ty, 1e-4);
+    float wExpSq = wExp * wExp;
 
     // --- the one-sided occlusion gap ----------------------------------------
     float gap = wExp - wHist;         // > 0: the history surface is IN FRONT
@@ -464,12 +509,12 @@ float ComputeDepthDisocclusionScore(
 
     // (a)+(b) representation noise: both sides' depth quanta.
     float noiseZ = max(depthQuantStep, depthNoiseFloor);
-    float quantW = 2.0 * noiseZ * wExp * wExp;
+    float quantW = 2.0 * noiseZ * wExpSq;
 
     // (c) tracked-point position uncertainty x the surface's slope.
     float slopeZ = isFlat ? max(abs(layerGradX), abs(layerGradY)) : foregroundSlope;
     slopeZ = max(slopeZ, max(abs(landingGradRaw.x), abs(landingGradRaw.y)));
-    float slopeW = slopeZ * wExp * wExp;   // raw-z per px -> forward units per px
+    float slopeW = slopeZ * wExpSq;   // raw-z per px -> forward units per px
 
     float2 velSpreadPx = quadVelocitySpreadUV * vp.sizePixels;
     float reachPx = length(jitterResidualPx)
@@ -486,7 +531,7 @@ float ComputeDepthDisocclusionScore(
         float curvV = abs(depthRaw[0] - 0.5 * (depthRaw[1] + depthRaw[2]));
         curvZ = max(curvH, curvV);
     }
-    float curvW = curvZ * wExp * wExp;
+    float curvW = curvZ * wExpSq;
 
     // (e) the parallax estimate's own error (2 sigma, ~97% one-sided).
     float sigmaW = 2.0 * abs(tySigma);
@@ -551,7 +596,9 @@ bool PursuitConfirmsDivergence(
     float maxCurvaturePx, maxPairGradPx;
     MeasureVelocityFieldShapeCoherent(velocities, vp.sizePixels, coherenceRadiusPx, maxCurvaturePx, maxPairGradPx);
 
-    float landingSpreadPx = 0.0;
+    // Squared-domain spread scan: the max of sqrt(deltaSq) over the passing
+    // taps is the sqrt of the max deltaSq (monotone) -- ONE sqrt total.
+    float landingSpreadSq = 0.0;
     float cohRSq = coherenceRadiusPx * coherenceRadiusPx;
     [unroll]
     for (int m = 0; m < 9; ++m)
@@ -559,8 +606,9 @@ bool PursuitConfirmsDivergence(
         float2 deltaPx = (velocities[m] - landingVelocityJitteredUV) * vp.sizePixels;
         float  deltaSq = dot(deltaPx, deltaPx);
         if (deltaSq <= cohRSq)
-            landingSpreadPx = max(landingSpreadPx, sqrt(deltaSq));
+            landingSpreadSq = max(landingSpreadSq, deltaSq);
     }
+    float landingSpreadPx = sqrt(landingSpreadSq);
 
     bool landingContinuous = IsContinuousVelocityField(maxCurvaturePx, maxPairGradPx);
     bool advectionGated    = landingContinuous && (depthGate > 0.001);
