@@ -1,7 +1,7 @@
 // ============================================================================
 // TAA history clipping: color statistics (mixture + same-depth-layer clean
 // + the coverage step model), the temporal clip-state transport (sigma +
-// VarH + age + the matched LLR pair), the Mahalanobis gate,
+// VarH + age + the persistence statistic), the Mahalanobis gate,
 // and the feedback consumers
 // ----------------------------------------------------------------------------
 // THE CLIP: the accumulator is the ESTIMATOR, h_{t+1} = (1-a)h_t + a x_t;
@@ -10,42 +10,30 @@
 // Two clocks: the record's INFORMATION clock (age -> Student dof) and the
 // accumulator's STATE clock (VarH, transported, damped-resample recursion).
 //
-// THE MATCHED LLR PAIR (the sequential detector): the ghost's per-frame
-// signature on an engaged step is a PERSISTENT offset of the BIT-CONDITIONED
-// innovation; the discrimination is TEMPORAL. The increment is the exact
-// per-side log-likelihood ratio, Student-t in the whitening V:
-//     l_s = (nu+3)/2 [ ln(1 + q0^2/nu) - ln(1 + q_s^2/nu) ]
-// The PAIR (each side its own max(0, .)) keeps E[l | H0] < 0 per side
-// (Gibbs). v3.8 added INTERIOR COVERAGE: each side's alternative is a
-// two-component mixture {the endpoint, the half-coverage midpoint} --
-// a swept edge leaves the history stuck at intermediate coverage, which
-// the two pure levels cannot see.
-//
-// THE FALLBACK (flats): the exact alternative is the EMPIRICAL SPATIAL
-// MARGINAL -- the nine taps are literally draws from the ghost content's
-// distribution -- plus (v3.8.2) ONE low-weight TEMPORAL TAIL component:
-//     f1 = (1-w) sum_j w_j t(z; mean - x_j, V) + w t(z; 0, V + T^2)
-// covering the ghost whose old content is ABSENT from the sample (the
-// wide reveal). v3.8 fixed the SIGN of the mixture term (the pre-v3.8
-// form was a magnitude detector that pinned the walk under H0).
+// v3.10: THE PERSISTENCE DETECTOR (replaces the matched LLR pair). The
+// pair's fallback half was statistically INVERTED in its own operating
+// range: its ghost alternative was a 10-component mixture whose prior-mass
+// penalty (ln(1/0.09) ~ -2.4 nats/frame) exceeds the per-frame KL of any
+// sub-gate offset (m^2/2 = 0.5 nats at m ~ 1 whitened sigma), so the walk's
+// expected drift was NEGATIVE for every ghost below ~2.2 whitened sigma --
+// the range between the noise floor and the (post-v3.9) gate radius ~1.4
+// sigma that the detector existed for. It could not detect what it was
+// built to detect; its reflected-walk H0 noise floor merely tripped the
+// migration and the blend floor on a few percent of pixels (flicker, no
+// ghosting). The replacement is one transported scalar (see the constants
+// block): T, the EMA of the drift estimator's luma t-statistic, with
+// consumers that are all smooth actions (the drift-corrector unlock, the
+// confirmed blend floor, the alarm). The step-target migration and the
+// fallback clean-fusion are gone with it (both were walk-driven
+// clip-target movers -- the edge-flicker source), and so is the
+// change-point multiplicity discount (the EMA's memory is bounded, so the
+// unknown-onset prior mass is bounded by construction).
 //
 // THE SOFT CLIP (the posterior-mean action): the alternative is the SAME
-// 10-component construction (v3.8.4: unified with the CUSUM -- the 9 taps
-// at the statistic's own variance, sharp, plus the one tail component
-// with the exact normalizer Jacobian), and the prior odds are the base +
-// motion + the DISCOUNTED transported LLR + this frame's evidence.
-//
-// v3.8.4 (FLAG 2): THE CHANGE-POINT MULTIPLICITY DISCOUNT. The transported
-// walk is evidence for "a ghost began at SOME frame in its life"; the
-// honest Bayes factor for an unknown onset time carries -ln(#candidate
-// onsets). The record's age upper-bounds the walk's life (record resets
-// drain the walk), so ln(age) is the conservative discount. It is applied
-// at EVERY posterior consumer -- the stats' migration input, the gate's
-// prior, the sequential floor, and the hard alarm threshold (in taa.fx)
-// -- so the alarm's "50% posterior crossing" identity holds by
-// construction: both sides of the crossing carry the same discount.
-// kCusumLlrClamp rises to 10 so the worst-case age-15 alarm (6.2383 +
-// ln 15 = 8.95) remains reachable.
+// 10-component construction (v3.8.4: unified -- the 9 taps at the
+// statistic's own variance, sharp, plus the one tail component with the
+// exact normalizer Jacobian), and the prior odds are the base + motion +
+// the CONFIRMED persistence evidence + this frame's evidence.
 //
 // v3.9 (statistical audit): (1) the gate's mu share is Studentized at its
 // OWN estimation dof -- Satterthwaite over the transported record and the
@@ -65,7 +53,8 @@
 //
 // TRANSPORT (tag 101): [31] sign, [30:28] tag, [27:22] sigma (6-bit),
 // [21:16] acutance (6-bit), [15:10] VarH ratio (6-bit), [9:6] age,
-// [5:0] the SIGNED LLR code (0.5-nat quanta, code = round(2L) + 32).
+// [5:0] the persistence statistic T (0.25 quanta, code = round(4T) + 32;
+// the sign is the luma direction).
 //
 // FRAGMENT HEADER: compiled only inside taa.fx.hlsl. Requires host
 // context: cbuffer perDraw (the clipping + feedback constants,
@@ -85,9 +74,9 @@ struct ColorNeighborhoodStats
 {
     float3 aabbMin;             // full set (luma drift chroma gate)
     float3 aabbMax;
-    float3 mean;                // FUSED: the (migrated) step target on
-                                // engaged straddles; the drift fusion on
-                                // the fallback; blended by stepW between
+    float3 mean;                // the step target on engaged straddles (the
+                                // coverage fit), the plain weighted mean
+                                // otherwise
     float3 sigma;               // full set (mixture): smear rejection,
                                 // clip-distance normalization
     float3 sigmaClean;          // same-layer subsample (the B level, raw)
@@ -123,13 +112,15 @@ struct ColorNeighborhoodStats
     // ---- the coverage step fit ----
     float  stepW;               // the adequacy blend [0,1]
     float3 stepTargetVar;       // the effective target variance (flip
-                                // charge, varC, levels, migration, and the
+                                // charge, varC, levels, and the
                                 // mode-blend cross term included)
     float3 stepTargetStable;    // B0 + cStable*dFB (the ingest / phase-bit
                                 // reference; the STABLE coverage, never the
                                 // migrated one)
     float3 stepDFB;             // the corrected step (F0 - B0)
-    float  stepC;               // the effective (migrated) coverage
+    float  stepC;               // the fit's own target coverage (the
+                                // telemetry export; nothing consumes it
+                                // for decisions anymore -- v3.10)
     float  stepCStable;         // the widened bracket's mid coverage
     float3 stepXModel;          // B0 + proj0*dFB (the classified sample)
     float3 stepResidVarB;       // the within-layer residual variances
@@ -158,7 +149,7 @@ struct ColorNeighborhoodStats
 // CHANGE-POINT is unmodelled, so the EMA trades record lag (ghost shelter
 // when Var drops, flicker pressure when it rises) against estimate noise.
 // rho = 0.15 is the chosen operating point. The statistically complete
-// upgrade would be a second CUSUM on innovSq feeding the rate --
+// upgrade would be a second CUSUM on innovSq feeding the record's rate --
 // deliberately not built (the transported dof + VarH clocks already absorb
 // most of the lag cost).
 static const float kClipSigmaEmaRate         = 0.15;
@@ -172,14 +163,20 @@ static const float kClipSigmaRecordFloorSq   = (1.0 / 255.0) * (1.0 / 255.0);
 // sparkles, fire) the record converges to E[i^2] and the mortality is the
 // chi^2_3 tail at 3*ratio: r = 4 -> P(chi^2_3 > 12) ~= 6.2%/frame (cheap:
 // resets re-seed from the spatial model and keep the Student dof low --
-// anti-flicker there); a 0.1% target needs r ~= 7.4. 4.0 keeps the spike's
-// content-change latency low; retune ONLY against the mortality number,
-// never by eye.
+// anti-flicker there); a 0.1% target would need r ~= 7.4. 4.0 keeps the
+// spike's content-change latency low; retune ONLY with the mortality
+// number, not by eye.
 static const float kClipSpikeRatio           = 4.0;
 static const float kClipWinsorC              = 3.0;
 static const float kGeoCorroborateChiSq      = 7.815;         // chi^2_3(0.95), whitened
 static const float kClipRejectionFeedbackFloor = 0.5;
+// The per-channel anisotropy floor: channels with genuinely less content
+// still carry the neighborhood's noise floor (a floor at 10% of the max
+// channel's sigma).
 static const float kAnisoSigmaCap            = 0.10;
+// The residual floor share: the same-layer subsample's residual variance
+// can collapse on synthetic flats; 10% of sigma_clean^2 keeps the scoped mu
+// variance positive.
 static const float kScopedResidFrac          = 0.10;
 static const float kSharpEwmaRate            = 0.25;
 static const float kClipStudentPriorDof      = 4.0;
@@ -188,9 +185,9 @@ static const float kClipMaxAge               = 15.0;          // 4-bit age
 // The record-vs-prior arming cap. The honest upper bound for a nu-dof
 // variance estimate against its prior is chi^2_nu(0.999)/nu (~3.7 at the
 // flats' nu ~ 6); 5.0 adds EMA-lag headroom for rising variance. Under
-// honest dynamics it should rarely bind -- verify with the mode-13 null-law
-// view + the record telemetry; if it binds measurably, the winsor ingest
-// (9x prior) is the dial that actually needs attention.
+// honest dynamics it should rarely bind -- verify with mode 13 + the record
+// telemetry; if it binds measurably the winsor ingest (9x prior) is the
+// dial that actually needs attention.
 static const float kArmingCap                = 5.0;
 // THE KERNEL AUDIT (v3.2): the resample's variance effect is carried by the
 // multiplicative damping in the VarH recursion (taaVarhResampleLoss /
@@ -199,12 +196,12 @@ static const float kResampleVarSq            = 0.0;
 // ---- the posterior-mean soft clip ----
 static const float kGhostLogOddsBase         = -6.2383;       // ln(1/512)
 // The motion term of the ghost prior, DERIVED as an order-of-magnitude
-// population ratio (the one population number without a measurement --
-// calibratable from mode-11 telemetry): at an ENGAGED swept step the
-// stale-landing probability is the off-coverage ~1/8; on flats it is the
-// base 1/512. The ratio 64 = (1/8)/(1/512) is the prior-odds boost at full
-// motion, and it only matters where the frame evidence is ambiguous (the
-// frame LLR overwhelms it on clean nulls and clean ghosts alike).
+// population ratio (the one underived population number left -- calibratable
+// from mode-11 telemetry): at an ENGAGED swept step the stale-landing
+// probability is the off-coverage ~1/8; on flats it is the base 1/512. The
+// ratio 64 = (1/8)/(1/512) is the prior-odds boost at full motion, and it
+// only matters where the frame evidence is ambiguous (the frame LLR
+// overwhelms it on clean nulls and clean ghosts alike).
 static const float kGhostMotionOdds          = 64.0;
 // The temporal tail width, in units of the local CLEAN-layer sigma: the
 // old content that is ABSENT from the 9-tap sample (what a ghost IS, when
@@ -229,36 +226,46 @@ static const float kMinJitterSpan = 0.35;
 // capped at 1 texel^2 of lever, and half the residual variance is charged
 // for it.
 static const float kStepLeverK    = 0.5;
-// ---- the matched LLR pair ----
-// The alarm is the posterior crossing 50% at the 1/512 base prior
-// (ln 512 = 6.2383, v3.9: the exact value) WITH the age discount carried
-// on both sides (v3.8.4). The soft onset is ~posterior 1.4% (e^2/512).
-// kCusumLlrClamp = 10 leaves headroom above the worst-case age-discounted
-// alarm (6.2383 + ln 15 = 8.95).
-static const float kCusumSoftLlr   = 2.0;    // nats: soft migration onset (~1.4% posterior)
-static const float kCusumAlarmLlr  = 6.2383;  // nats: ln(512) -- the EXACT 50%-crossing
-static const float kCusumLlrClamp  = 10.0;   // nats: the saturation
-// The interior (half-coverage) components' admission gate, in whitened
-// variance units: a component must be resolvable (offset^2 >= 2V) -- a
-// model-selection threshold.
-static const float kCusumInteriorMinSq = 2.0;
-// The fallback CUSUM's temporal-tail component's prior mass: one
-// component's worth of the mixture (9 taps + 1 tail, 1/10 each).
+// ---- v3.10: THE PERSISTENCE DETECTOR (replaces the matched LLR pair) ----
+// One transported scalar per pixel: T = the EMA of the drift estimator's
+// per-frame spatial t (the LUMA common mode), scaled so the H0 law is a
+// pinned ~N(0,1) (self-normalized: a variance-model error cancels between
+// numerator and denominator). Thresholds are set against the t_6 input's
+// variance inflation (nu/(nu-2) = 1.5 -> the normalized null's effective
+// std is ~1.22, not 1):
+//   |T| >= kGhostConfirmT (4.0): ~1e-3 engagement, EMA-smooth. The action
+//        is the drift-corrector UNLOCK -- a smooth correction, not a blend
+//        jump. This is the ghost-trail eviction engine.
+//   |T| >= kGhostAlarmT   (6.5): ~1e-7; the blend floor approaches full
+//        replacement; mode 3 additionally hard-replaces.
+// Detection floor: a persistent luma offset >= ~0.6 sigma_content confirms
+// in ~10 frames (per-frame t = mu/sigma_D with sigma_D ~ 0.5 sigma_content;
+// steady-state T = t * kGhostEmaNorm). Chroma-only trails are NOT detected
+// (one luma-weighted scalar -- the visible trails are luma; the per-channel
+// gate and corrector machinery handle the rest).
+static const float kGhostEmaRate   = 0.15;   // the detector's EMA rate (memory ~13 frames)
+static const float kGhostEmaNorm   = 3.5119; // sqrt((2-rate)/rate): the EMA's null std -> unit
+static const float kGhostConfirmT  = 4.0;    // the confirmation threshold on |T|
+static const float kGhostAlarmT    = 6.5;    // the deep-confirmation / alarm threshold
+static const float kGhostUnlockThrSigmas = 0.75; // the CONFIRMED drift threshold, in estimator sigmas (vs 2.0 unconfirmed)
+// The temporal-tail component's prior mass, shared by the gate's posterior
+// alternative (9 taps + 1 tail, 1/10 each).
 static const float kCusumTailWeight   = 0.1;
 // ---- the drift predict step ----
 static const float kDriftCapSigmas  = 3.0;   // the magnitude BELT (content sigmas)
 // v3.9 (audit §4): 3.0 -> 2.0. The soft threshold's position relative to
 // the (now Studentized) gate radius sets the smooth-lighting band: with the
-// gate's mu share carrying S(nu ~ 6) the flat gate sits at ~1.4
-// sigma_content, and the drift estimator's own noise (weighted mean +
-// phase-correction error + transport scatter ~ 0.5 sigma_content/channel)
-// put the 3-sigma onset at ~1.5 -- ABOVE the gate, i.e. the tracker was
-// redundant exactly where it was meant to be the smooth alternative. 2.0
-// engages it at ~1.0 sigma_content, inside the gate, with the noise cost
-// still bounded by the SNR gain and taaDriftMaxGain.
+// gate's mu share carrying S(nu~6) the flat gate sits at ~1.4 sigma_content,
+// and the drift estimator's own noise (mean + phase-correction error +
+// transport scatter ~ 0.5 sigma_content/channel) puts 3 sigma at ~1.5 --
+// ABOVE the gate, i.e. the tracker was redundant exactly where it was meant
+// to be the smooth alternative. 2.0 engages it at ~1.0 sigma_content,
+// inside the gate, with the noise cost still bounded by the SNR gain and
+// taaDriftMaxGain. v3.10: this is the UNCONFIRMED gate; confirmation drops
+// it to kGhostUnlockThrSigmas.
 static const float kDriftThreshSigmas = 2.0; // the soft threshold (estimator sigmas)
-// v3.9 (audit §4): the lighting-rate prior -- the per-frame drift scale as
-// a fraction of the content scale. Prices H_drift in the event guard's
+// v3.9 (audit §4): the lighting-rate prior -- the per-frame drift scale as a
+// fraction of the content scale. Prices H_drift in the event guard's
 // posterior (see the drift block in taa.fx): smooth lighting moves at most
 // ~half the content scale per frame; larger common-mode offsets are
 // step-like and the reveal paths own them. The posterior's crossover sits
@@ -268,9 +275,9 @@ static const float kDriftPriorScaleSigmas = 0.5;
 // ---- v3.8.4 (FLAG 1) + v3.9 (audit §5): the transport scatter's motion
 // gate. The static floor is MEASURED per pixel (the velocity buffer's own
 // quantization/noise scale, passed in by the resolve; was the 0.35
-// multiplier constant). kTransportGatePx is the motion scale over which
-// the jitter-residual proxy ramps to full charge (the landing error grows
-// with the reprojection error, a fraction of the velocity).
+// multiplier constant). kTransportGatePx is the motion scale over which the
+// jitter-residual proxy ramps to full charge (the landing error grows with
+// the reprojection error, a fraction of the velocity).
 static const float kTransportGatePx      = 2.0;
 
 // v3.8.4 (FLAG 5): the jitter sequence's full 2x2 phase covariance as a
@@ -446,7 +453,6 @@ ColorNeighborhoodStats ComputeColorNeighborhoodStats(
     float3 neighborhoodColorSpace[9], float2 motionDirUnit, float motionNormalized,
     float2 jitterPx, float2 jitterResidualPx, float edgeSweepPx,
     bool sameLayerMask[9], bool layerMaskValid,
-    float driftLlr, bool driftSoftActive,
     float transportFloorPx)
 {
     ColorNeighborhoodStats stats;
@@ -545,7 +551,7 @@ ColorNeighborhoodStats ComputeColorNeighborhoodStats(
     // buffer's own measured quantization/noise scale (mainP's lazy
     // MeasureVelocityQuantStepPx -- was the 0.35 multiplier constant, which
     // charged a fraction of the jitter phase the tested statistic no longer
-    // carries). All consumers (the gate, the CUSUM's V, the drift variance)
+    // carries). All consumers (the gate, the detector's drift variance)
     // read the gated value below.
     float transportMotionPx = saturate(motionNormalized) * kMotionFullStrengthPx;
     float motionShare        = saturate(transportMotionPx / kTransportGatePx);
@@ -791,17 +797,15 @@ ColorNeighborhoodStats ComputeColorNeighborhoodStats(
 
                 if (fit.w > 0.0)
                 {
-                    // THE DRIFT MIGRATION: the LLR's live side moves the
-                    // coverage toward the sample side (the input is the
-                    // age-discounted walk -- v3.8.4).
-                    float wDrift = driftSoftActive
-                        ? saturate((abs(driftLlr) - kCusumSoftLlr) / (kCusumAlarmLlr - kCusumSoftLlr))
-                        : 0.0;
-                    float cEff = (driftLlr < 0.0)
-                        ? fit.cTarget * (1.0 - wDrift)
-                        : fit.cTarget + wDrift * (1.0 - fit.cTarget);
-                    float loEff = lerp(min(fit.cLo, fit.cHi), cEff, wDrift);
-                    float hiEff = lerp(max(fit.cLo, fit.cHi), cEff, wDrift);
+                    // v3.10: the target MIGRATION is gone. The persistence
+                    // detector's consumers (the drift-corrector unlock, the
+                    // blend floor, the alarm) all act on the history/evidence
+                    // side; none of them move the clip target -- a moving
+                    // target was the edge-flicker source. The bracket stays
+                    // at the fit's own support.
+                    float cEff = fit.cTarget;
+                    float loEff = min(fit.cLo, fit.cHi);
+                    float hiEff = max(fit.cLo, fit.cHi);
                     float flip  = MaxBinomial(loEff, hiEff);
                     float varC  = (hiEff - loEff) * (hiEff - loEff) * (1.0 / 12.0);
 
@@ -841,21 +845,10 @@ ColorNeighborhoodStats ComputeColorNeighborhoodStats(
         }
     }
 
-    // ---- THE FALLBACK fusion: mixture -> clean by the (discounted) drift
-    //      weight ----------------------------------------------------------
-    {
-        float wMig = driftSoftActive
-            ? saturate((abs(driftLlr) - kCusumSoftLlr) / (kCusumAlarmLlr - kCusumSoftLlr))
-            : 0.0;
-        if (stats.stepW < 1.0)
-        {
-            float wFb = (1.0 - stats.stepW) * wMig;
-            stats.mean           = lerp(stats.mean, stats.meanClean, wFb);
-            stats.phaseShift     = lerp(stats.phaseShift, stats.phaseShiftClean, wFb);
-            stats.gatePhaseShift = lerp(stats.gatePhaseShift, stats.gatePhaseShiftClean, wFb);
-            stats.invNeff        = lerp(stats.invNeff, stats.invNeffClean, wFb);
-        }
-    }
+    // v3.10: the fallback fusion (mean -> clean by the walk weight) is gone
+    // with the walk. The clean statistics remain computed (they feed the
+    // step model, cusumStepDof and the drift estimator's inputs); nothing
+    // migrates the clip target anymore.
     return stats;
 }
 
@@ -895,24 +888,24 @@ float DecodeVarHRatio(float code, float recordSq)
 }
 
 float PackClipStateAlpha(bool revoked, float sigma, float varHRatioCode, float age,
-                         float acutanceLinear, float llrCode)
+                         float acutanceLinear, float ghostCode)
 {
     uint u = 0x50000000u
            | ((uint(ClipPackSigmaCode(sigma) + 0.5) & 0x3Fu)        << 22)
            | ((uint(saturate(acutanceLinear) * 63.0 + 0.5) & 0x3Fu)  << 16)
            | ((uint(varHRatioCode) & 0x3Fu)                          << 10)
            | ((uint(clamp(age, 0.0, kClipMaxAge)) & 0xFu)            << 6)
-           |  (uint(clamp(llrCode, 1.0, 63.0)) & 0x3Fu);
+           |  (uint(clamp(ghostCode, 1.0, 63.0)) & 0x3Fu);
     return asfloat(revoked ? (u | 0x80000000u) : u);
 }
 
 void DecodeClipState(float alphaValue, out float sigmaSq, out float varHSq,
-                     out float recordAge, out float llrNats)
+                     out float recordAge, out float ghostT)
 {
     sigmaSq = -1.0;
     varHSq = 0.0;
     recordAge = 0.0;
-    llrNats = 0.0;
+    ghostT = 0.0;
 
     uint u   = asuint(alphaValue);
     uint tag = (u >> 28) & 0x7u;
@@ -923,7 +916,7 @@ void DecodeClipState(float alphaValue, out float sigmaSq, out float varHSq,
         code = (u >> 22) & 0x3Fu;
         varHCode = (float)((u >> 10) & 0x3Fu);
         recordAge = (float)((u >> 6) & 0xFu);
-        llrNats = ((float)(u & 0x3Fu) - 32.0) * 0.5;
+        ghostT = ((float)(u & 0x3Fu) - 32.0) * 0.25;   // v3.10: the persistence statistic, 0.25 quanta
     }
     else if (tag == 0x1u)                     // debug payload: sigma only
     {
@@ -958,8 +951,8 @@ struct RecordVarianceParts
 {
     float3 ePer;        // per-channel PRE-update E[i_k^2] (arming-capped)
     float3 varHPer;     // per-channel accumulator variance (READ semantics,
-                        // v3.9 -- what the gate and the CUSUM's step model
-                        // consume directly)
+                        // v3.9 -- what the gate and the step model consume
+                        // directly)
     float3 sPer;        // implied Var(x_k): ePer - varH - v
     float3 muVarFull;   // the mu share (conservative form; the fallback)
     float3 muVarScoped; // the mu share (residual-scoped; the fallback)
@@ -1059,160 +1052,6 @@ float WhitenedInnovSq(float3 innovCorr, RecordVarianceParts p)
 }
 
 // ============================================================================
-// THE MATCHED LLR PAIR
-// ============================================================================
-struct DriftCusumState
-{
-    float llrNext;     // the signed LLR summary (nats)
-    bool  alarm;       // RAW threshold cross (the age-discounted alarm is
-                       // computed in taa.fx where the age lives)
-};
-
-DriftCusumState UpdateDriftCusum(
-    float llrPrev,
-    float3 innovRaw,
-    float3 innovCorr,
-    ColorNeighborhoodStats stats,
-    float3 taps[9],
-    RecordVarianceParts parts,
-    float  nuFallback,
-    bool   recordLive,
-    bool   frozen)
-{
-    DriftCusumState d;
-    d.alarm = false;
-
-    if (frozen)
-    {
-        d.llrNext = llrPrev;
-        d.alarm = (abs(llrPrev) >= kCusumAlarmLlr);
-        return d;
-    }
-
-    if (stats.stepW > 0.5)
-    {
-        // ---- THE MATCHED STEP PAIR (+ interior coverage), conditioned on
-        //      the measured bit ---------------------------------------------
-        float3 dFB   = stats.stepDFB;
-        float  cS    = stats.stepCStable;
-        float3 mCond = stats.stepXModel - stats.stepTargetStable;
-        float3 z     = innovRaw - mCond;
-
-        float dFBsq = dot(dFB, dFB);
-        float proj0 = saturate(cS + dot(mCond, dFB) / max(dFBsq, 1e-10));
-
-        float3 residMix = (1.0 - cS) * stats.stepResidVarB + cS * stats.stepResidVarF;
-        float3 residBit = (1.0 - proj0) * stats.stepResidVarB + proj0 * stats.stepResidVarF;
-        float3 V = residBit
-                 + taaCusumFlipAcc * (cS * (1.0 - cS)) * (dFB * dFB)
-                 + stats.stepPhaseVarScale * (dFB * dFB)
-                 + taaCusumNoiseAcc * residMix;
-        float3 invV = float3(1.0, 1.0, 1.0) / max(V, float3(1e-12, 1e-12, 1e-12));
-
-        float nu = max(stats.cusumStepDof, 2.0);
-        float kT = 0.5 * (nu + 3.0);
-        float invNu = 1.0 / nu;
-
-        float  q0Sq   = dot(z * z, invV);
-        float  d2w    = dot(dFB * dFB, invV);
-        float3 zPlus  = z - cS * dFB;                 // H+: stuck at c_g = 0
-        float3 zMinus = z + (1.0 - cS) * dFB;          // H-: stuck at c_g = 1
-        float  qPSq   = dot(zPlus * zPlus, invV);
-        float  qMSq   = dot(zMinus * zMinus, invV);
-
-        // v3.8: the INTERIOR coverage midpoints, admitted per side when
-        // their whitened offset clears kCusumInteriorMinSq.
-        float3 zPlusMid  = z - 0.5 * cS * dFB;          // stuck at c_g = cS/2
-        float3 zMinusMid = z + 0.5 * (1.0 - cS) * dFB;  // stuck at c_g = (1+cS)/2
-        float  qPMSq = dot(zPlusMid * zPlusMid, invV);
-        float  qMMSq = dot(zMinusMid * zMinusMid, invV);
-        bool   plusMidOk  = (0.25 * cS * cS * d2w)                 >= kCusumInteriorMinSq;
-        bool   minusMidOk = (0.25 * (1.0 - cS) * (1.0 - cS) * d2w) >= kCusumInteriorMinSq;
-
-        float nllNull = kT * log(1.0 + q0Sq * invNu);
-        float tP = pow(1.0 + qPSq * invNu, -kT);
-        float tM = pow(1.0 + qMSq * invNu, -kT);
-        float mixP = plusMidOk  ? 0.5 * (tP + pow(1.0 + qPMSq * invNu, -kT)) : tP;
-        float mixM = minusMidOk ? 0.5 * (tM + pow(1.0 + qMMSq * invNu, -kT)) : tM;
-        float lPlus  = nllNull + log(mixP);
-        float lMinus = nllNull + log(mixM);
-
-        float sPlus  = max(llrPrev, 0.0);
-        float sMinus = max(-llrPrev, 0.0);
-        sPlus  = min(max(sPlus  + lPlus,  0.0), kCusumLlrClamp);
-        sMinus = min(max(sMinus + lMinus, 0.0), kCusumLlrClamp);
-        d.llrNext = sPlus - sMinus;
-    }
-    else
-    {
-        // ---- THE EMPIRICAL SPATIAL MARGINAL + THE TEMPORAL TAIL ----------
-        float3 sigAC = AnisoClampSigma(stats.sigmaClean);
-        float3 V;
-        float  nu;
-        if (recordLive)
-        {
-            V  = max(parts.ePer + stats.transportVar, float3(1e-10, 1e-10, 1e-10));
-            nu = max(nuFallback, 2.0);
-        }
-        else
-        {
-            V  = max(sigAC * sigAC + stats.transportVar, float3(1e-10, 1e-10, 1e-10));
-            nu = max(1.0 / max(stats.invNeffClean, 0.2) - 2.0, 2.0);
-        }
-        float3 invV = float3(1.0, 1.0, 1.0) / V;
-        float kT = 0.5 * (nu + 3.0);
-
-        float q0Sq = dot(innovCorr * innovCorr, invV);
-
-        // THE TEMPORAL TAIL: the tenth component -- the ghost whose old
-        // content is absent from the sample. Same construction and same
-        // bandwidth as the gate's posterior (v3.8.4: unified).
-        float  tailW = kCusumTailWeight;
-        float3 VTail = V + (kGhostPriorSigma * kGhostPriorSigma) * (sigAC * sigAC);
-        float3 invVT = float3(1.0, 1.0, 1.0) / VTail;
-        float  qTailSq = dot(innovCorr * innovCorr, invVT);
-        float  lTailNorm = 0.5 * (log(VTail.x / V.x) + log(VTail.y / V.y) + log(VTail.z / V.z));
-
-        float3 compOff[9];
-        float  lj[9];
-        float  lMax = -1e30;
-        float  logTapW = log(1.0 - tailW);
-        [unroll]
-        for (int j = 0; j < 9; ++j)
-        {
-            compOff[j] = stats.mean - taps[j];
-            float3 dd = innovCorr - compOff[j];
-            float  qj = dot(dd * dd, invV);
-            lj[j] = -kT * log(1.0 + qj / nu) + log(max(stats.mixWeights[j], 1e-4)) + logTapW;
-            lMax = max(lMax, lj[j]);
-        }
-        float lTail = log(tailW) - kT * log(1.0 + qTailSq / nu) - lTailNorm;
-        lMax = max(lMax, lTail);
-
-        float wSum = 0.0;
-        [unroll]
-        for (int j2 = 0; j2 < 9; ++j2)
-            wSum += exp(lj[j2] - lMax);
-        wSum += exp(lTail - lMax);
-
-        // l = NLL_null + ln[mixture] (the v3.8 sign fix preserved).
-        float llrMix = kT * log(1.0 + q0Sq / nu) + (lMax + log(max(wSum, 1e-10)));
-
-        float3 zw = innovCorr * sqrt(invV);
-        float azx = abs(zw.x), azy = abs(zw.y), azz = abs(zw.z);
-        float zDom = (azx >= azy && azx >= azz) ? zw.x : ((azy >= azz) ? zw.y : zw.z);
-        float zSign = (zDom >= 0.0) ? 1.0 : -1.0;
-
-        float wPrev = abs(llrPrev);
-        float wNext = min(max(wPrev + llrMix, 0.0), kCusumLlrClamp);
-        d.llrNext = zSign * wNext;
-    }
-
-    d.alarm = (abs(d.llrNext) >= kCusumAlarmLlr);
-    return d;
-}
-
-// ============================================================================
 // THE EXACT RECORD SEED
 // ============================================================================
 float SeedRecordTotalSq(ColorNeighborhoodStats stats)
@@ -1251,9 +1090,8 @@ struct ClipGateResult
                                   // histogram; the empirical Student factor
                                   // is its 95th percentile / chi^2)
     float  p1;                   // the ghost posterior (the blend floor's
-                                 // input), exported from the DISCOUNTED
-                                 // sequential evidence whenever it exceeds
-                                 // the soft onset.
+                                 // input), exported from the CONFIRMED
+                                 // persistence evidence.
 };
 
 ClipGateResult ClipHistoryToStatisticGate(
@@ -1265,26 +1103,23 @@ ClipGateResult ClipHistoryToStatisticGate(
     float  statAlpha,
     float  motionNormalized,
     float3 neighborhoodTaps[9],
-    float  llrAccum,
-    float  nuHonest,
-    bool   llrAccumIncludesFrame)
+    float  ghostEvNats,
+    float  nuHonest)
 {
     ClipGateResult r;
 
-    // v3.8.4 (FLAG 2): the change-point multiplicity discount. The record's
-    // age upper-bounds the walk's life (record resets drain the walk), so
-    // ln(age) is the conservative discount; applied here, in the migration
-    // input, and in the hard alarm threshold -- the alarm's 50%-crossing
-    // identity holds at every age by construction.
-    float seqEvidence = abs(llrAccum) - log(max(recordAge, 1.0));
-
-    // THE SEQUENTIAL BLEND FLOOR (no motion term: below the gate the only
-    // evidence is the walk; the motion odds belong to the posterior path's
-    // population).
+    // v3.10: the sequential evidence is the persistence detector's CONFIRMED
+    // statistic, mapped through the exact tau = sigma Gaussian-prior Bayes
+    // factor (ln BF = T^2/4 - 0.5*ln 2). ZERO below the confirmation
+    // threshold: on ~99.9% of pixels the gate runs as the pure clip and the
+    // detector contributes NOTHING to its null behavior (the old walk's
+    // noise floor fed this term continuously -- a flicker source). No
+    // age/multiplicity discount: the EMA's memory is bounded (~13 frames),
+    // so the unknown-onset prior mass is bounded by construction.
     float seqFloor = 0.0;
-    if (taaSoftClip > 0.001 && seqEvidence > kCusumSoftLlr)
+    if (taaSoftClip > 0.001 && ghostEvNats > 0.0)
     {
-        float logOddsSeq = kGhostLogOddsBase + seqEvidence;
+        float logOddsSeq = kGhostLogOddsBase + ghostEvNats;
         seqFloor = 1.0 / (1.0 + exp(-logOddsSeq));
     }
     r.p1 = seqFloor;
@@ -1416,14 +1251,11 @@ ClipGateResult ClipHistoryToStatisticGate(
         // v3.5: the evidence and the action are separate objects.
         //
         // v3.8.4 (FLAG 4): the posterior's alternative is the SAME
-        // 10-component construction as the CUSUM's fallback -- the 9 taps
-        // SHARP at the gate's own variance, plus one low-weight temporal
-        // tail with the exact normalizer Jacobian. The previous form
-        // broadened every component by the tail bandwidth (a KDE) and
-        // ignored the normalizer of the broadened variance -- the unified
-        // form keeps a tap-matching ghost strong evidence, bounds the
-        // tail's H0 footprint by its prior weight, and charges the exact
-        // Jacobian, identically in both consumers.
+        // 10-component construction the old detector's fallback used -- the 9
+        // taps SHARP at the gate's own variance, plus one low-weight temporal
+        // tail with the exact normalizer Jacobian. The unified form keeps a
+        // tap-matching ghost strong evidence, bounds the tail's H0 footprint
+        // by its prior weight, and charges the exact Jacobian.
         float3 gW = max(gateVar * (chromaScale * chromaScale),
                         float3(minGateVar, minGateVar, minGateVar));
         float3 sigAC = AnisoClampSigma(stats.sigmaClean);
@@ -1465,10 +1297,13 @@ ClipGateResult ClipHistoryToStatisticGate(
         // ln[mixture] - ln[t_0]; the null's NLL from the diagonal quadratic.
         float llrFrame = (lMax + log(max(wSum, 1e-10))) + kT * log(1.0 + q0Comp / nu);
 
+        // v3.10: always adds the frame evidence -- the persistence statistic
+        // is computed from the drift estimator's common mode, a DIFFERENT
+        // object than this frame-LLR on dCorr; there is no double count.
         float logOdds = kGhostLogOddsBase
                       + log(1.0 + kGhostMotionOdds * saturate(motionNormalized))
-                      + seqEvidence
-                      + (llrAccumIncludesFrame ? 0.0 : llrFrame);
+                      + ghostEvNats
+                      + llrFrame;
         float p1 = 1.0 / (1.0 + exp(-logOdds));
         r.p1 = max(p1, seqFloor);   // the blend floor export
 

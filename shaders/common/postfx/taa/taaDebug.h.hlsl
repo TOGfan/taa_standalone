@@ -31,6 +31,11 @@
 // factor is (A's 95th percentile) * 16 / chi^2. B marks engagement
 // (mdd > chi^2) with a blue tint.
 //
+// v3.10: mode 11's B channel, in clipGhostReset=2 telemetry mode on flats,
+// is the persistence statistic |T|/alarm -- dim and stable on static scenes
+// (|T| < ~1), blooming along a real trail then decaying as the unlocked
+// corrector evicts it.
+//
 // FRAGMENT HEADER: compiled only inside taaFinal.fx.hlsl. Requires fragments
 // included before: taaShared.h.hlsl (UnpackDebugAlpha).
 // ============================================================================
@@ -115,7 +120,11 @@ float3 RenderDebugView(uint code, float a, float b, bool revoked,
     // ghost-kill state), 0.35 = record RESET this frame (identity reset,
     // shock, corroborated geometry, or the NaN guard), 0.15 = no record at
     // all. B = how far the gate shrank the history toward the neighborhood
-    // mean, post-soft-clip (0 = untouched). The reveal repair reads as
+    // mean, post-soft-clip (0 = untouched); in clipGhostReset=2 telemetry
+    // mode, B = the fitted coverage on engaged steps and the persistence
+    // statistic |T|/alarm on flats (dim and stable on static scenes;
+    // blooming along a real trail, then decaying as the corrector evicts
+    // it -- THE detector verification view). The reveal repair reads as
     // either a one-frame reset flash at the departing edge or the green
     // dimming over ~4 frames with B bright while the gate dismantles the
     // remnant; a persistent dim-green + bright-B region means a ghost the
@@ -125,7 +134,7 @@ float3 RenderDebugView(uint code, float a, float b, bool revoked,
         if (a > 0.45)      c.g = saturate((a - 0.55) * 2.2);  // carried: brightness = surviving variance fraction
         else if (a > 0.25) c.g = 0.5;                         // reset this frame (A = 0.35)
         else               c.r = 0.5;                         // no record (A = 0.15)
-        c.b = b;                         // applied shrink fraction
+        c.b = b;                         // applied shrink fraction / detector telemetry
         return c;
     }
 

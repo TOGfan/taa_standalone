@@ -487,36 +487,34 @@ local function jitterPhaseCovariance()
 end
 
 -- ============================================================================
--- THE EXACT SEQUENCE / KERNEL CONSTANTS (v3.2; consumed by the matched LLR
--- pair's whitening and the VarH transport; recomputed on every apply --
+-- THE EXACT SEQUENCE / KERNEL CONSTANTS (v3.2; consumed by the accumulator's
+-- variance models and the VarH transport; recomputed on every apply --
 -- they track the jitter sequence, its scale, and the feedback rate)
 -- ----------------------------------------------------------------------------
 --   * flipAcc: the accumulator's response power to the flip pattern, per
 --     unit c(1-c) -- exact: the DFT of the actual sequence's bit pattern
 --     (per coverage bin) through the accumulator filter
 --     H(w) = a/(1-(1-a)e^{-iw}), taken at the WORST coverage bin (the
---     conservative end for the whitening: V >= the exact everywhere, so
---     the detector can only be slower, never hotter). The low-discrepancy
---     sequences' bounded discrepancy suppresses the low-frequency lines,
---     so this lands ~2 orders below the marginal Bernoulli charge
---     a/(2-a): conditioning the detector on the measured phase bit is
---     what makes that saving bankable (the marginal charge was the old
---     dead zone's entire reason to exist).
---   * noiseAcc: the EXACT steady-state accumulated-noise share varH/Var(x)
---     at the accumulation's spectral fixed point (v3.9 -- the moment
---     series in kernelChainConstants; the old a^2/(1-(1-a)^2 gbar) carried
---     the one-step kernel gain and implicitly assumed a white-input read
---     gain of 1).
---   * varhLoss: 1 - D, D = the fixed-point READ gain. varH is transported
---     in READ semantics (the Kaiser-resampled history the gate and the
---     CUSUM actually test); the history term of the recursion re-reads the
---     smooth accumulated field at the fixed-point gain. Encoded as a LOSS
---     so an unset constant (0) degrades to the legacy undamped transport.
---   * whiteLoss: 1 - w, w = the white-input read gain (E_f[sum k^2])^2.
---     The fresh current-frame content enters the accumulator white across
+--     conservative end for the variance models: V >= the exact everywhere,
+--     so the models can only be conservative, never hot). The
+--     low-discrepancy sequences' bounded discrepancy suppresses the
+--     low-frequency lines, so this lands ~2 orders below the marginal
+--     Bernoulli charge a/(2-a).
+--   * noiseAcc: the EXACT steady-state accumulated-NOISE share, varH/Var(x)
+--     at the accumulation's spectral fixed point (v3.9 -- see
+--     kernelChainConstants; the old a^2/(1-(1-a)^2 gbar) carried the
+--     one-step gain and assumed a white-input read gain of 1).
+--   * varhLoss: 1 - D, D = the fixed-point READ gain (kernelChainConstants)
+--     -- varH is transported in READ semantics (the Kaiser-resampled
+--     history the gate and the CUSUM test), and the history term of the
+--     recursion re-reads the smooth accumulated field at the fixed-point
+--     gain. Encoded as a LOSS so an unset constant (0) degrades to the
+--     legacy undamped transport.
+--   * whiteLoss: 1 - w, w = the white-input read gain (E_f[sum k^2])^2 --
+--     the fresh current-frame content enters the accumulator white across
 --     texels (its spatial correlation is the mu share's business, not the
---     noise chain's), so the fresh-x term of the recursion carries w, not
---     1. Encoded as a LOSS for the same degradation reason.
+--     noise chain's), so the fresh-x term of the recursion carries w, not 1.
+--     Encoded as a LOSS for the same degradation reason.
 --
 -- KERNEL CONTRACT (v3.8: the ACTUAL kernels, no longer a proxy): the
 -- resolve's history resample is a SEPARABLE per-axis windowed sinc --
@@ -560,15 +558,15 @@ end
 -- THE RESAMPLE KERNEL'S ACCUMULATION CHAIN (v3.9: the spectral fixed point,
 -- not the one-step proxy)
 -- ----------------------------------------------------------------------------
--- varH means Var(READ) -- the Kaiser-resampled history that the gate and
--- the CUSUM actually test. Three constants, all measured on the ACTUAL
--- per-tier kernel:
---   * w (whiteGain) = (E_f[sum_n k(n,f)^2])^2: the read gain against WHITE
+-- varH means Var(READ) -- the Kaiser-resampled history that the gate and the
+-- CUSUM actually test. Three constants, all measured on the ACTUAL per-tier
+-- kernel:
+--   * w (whiteGain)  = (E_f[sum_n k(n,f)^2])^2: the read gain against WHITE
 --     input. The fresh current-frame content enters the accumulator white
 --     across texels, so the recursion's fresh-x term carries w. Parseval:
 --     the per-axis w1D is also the frequency-mean of Kbar^2 -- a built-in
 --     consistency check on the grid below.
---   * D (readGain)  = Vr/Vs at the accumulation's fixed point. With random
+--   * D (readGain)   = Vr/Vs at the accumulation's fixed point. With random
 --     per-frame phases (the R2/Halton jitter), the stored SPECTRUM obeys
 --         S'(w) = (1-a)^2 Kbar^2(w) S(w) + a^2 Var(x),
 --     Kbar^2 = the DFT of the phase-averaged kernel autocorrelation
@@ -806,9 +804,9 @@ M.defaultSettings = {
     varianceGamma                 = 2.8,
     -- The posterior-mean soft clip's ENABLE. ON by default since v3.2: with
     -- the empirical spatial-marginal alternative and the sequential prior
-    -- (the transported LLR) the action is the exact posterior mean -- the
-    -- graded pull is where the remaining flicker:ghost headroom lives (the
-    -- hard ellipsoid is the minimax action and overpays on marginal pixels).
+    -- the action is the exact posterior mean -- the graded pull is where
+    -- the remaining flicker:ghost headroom lives (the hard ellipsoid is the
+    -- minimax action and overpays on marginal pixels).
     -- 0 = the pure hard ellipsoid (the A/B baseline).
     softClip                      = 1.0,
     chromaVarianceMod             = 1.0,
@@ -859,11 +857,13 @@ M.defaultSettings = {
     clipDistanceRejectionMinError = 0.15,
     motionBlendStart               = 1.0,
     fallbackFXAA                  = 1.0,
-    -- The FALLBACK ghost machinery (the matched LLR pair -- the primary
-    -- ghost handling, always active when Depth-Dilated Motion Search is on
-    -- -- needs no switch). 0 = off, 1 = soft (default), 2 = telemetry only,
-    -- 3 = soft + hard alarm. Applies only where the step fit is inadequate
-    -- (corners, T-junctions, sub-noise contrast) and on flats.
+    -- The GHOST TRAIL DETECTOR (v3.10: the persistence statistic -- the
+    -- EMA-normalized spatial t of the drift estimator's luma common mode;
+    -- replaced the matched LLR pair, whose fallback half was statistically
+    -- inverted in the sub-gate range). Consumers: the drift-corrector UNLOCK
+    -- (confirmed trails track below the per-frame noise gate), the confirmed
+    -- blend floor, and the alarm. 0 = off, 1 = soft (default), 2 = telemetry
+    -- only (debug mode 11), 3 = soft + hard alarm.
     clipGhostReset                = 1.0
 }
 
@@ -933,15 +933,15 @@ function M.applySettings(inputs)
         pre:setShaderConst("$taaJitterPhaseEx",  phEx)
         pre:setShaderConst("$taaJitterPhaseEy",  phEy)
         pre:setShaderConst("$taaJitterPhaseExy", phExy)
-        -- THE MATCHED LLR PAIR'S HOST CONSTANTS (see cusumHostConstants):
-        -- the accumulator's exact flip-response gain (the CUSUM whitening
-        -- and the step accumulator model), the exact accumulated-noise
-        -- share, and the VarH transport's two read gains (the fixed-point
-        -- gain for the history term, the white-input gain for the fresh-x
-        -- term). They track useJitter / useR2Jitter / jitterScale /
-        -- feedbackMax / useKaiser6, so every apply recomputes them. Both
-        -- gains are encoded as LOSSes so an unset constant (0) degrades to
-        -- the legacy undamped transport.
+        -- THE ACCUMULATOR'S HOST CONSTANTS (see cusumHostConstants): the
+        -- accumulator's exact flip-response gain (the variance models' step
+        -- charge), the exact accumulated-noise share, and the VarH
+        -- transport's two read gains (the fixed-point gain for the history
+        -- term, the white-input gain for the fresh-x term). They track
+        -- useJitter / useR2Jitter / jitterScale / feedbackMax / useKaiser6,
+        -- so every apply recomputes them. Both gains are encoded as LOSSes
+        -- so an unset constant (0) degrades to the legacy undamped
+        -- transport.
         local flipAcc, noiseAcc, varhLoss, whiteLoss = cusumHostConstants()
         pre:setShaderConst("$taaCusumFlipAcc",           flipAcc)
         pre:setShaderConst("$taaCusumNoiseAcc",          noiseAcc)
@@ -951,11 +951,12 @@ function M.applySettings(inputs)
             cusumConstantsLogged = true
             if log then
                 log("I", "TAA", string.format(
-                    "Matched-LLR host constants: flipAcc=%.2e noiseAcc=%.5f varhLoss=%.4f whiteLoss=%.4f (kernel: separable per-axis Kaiser, beta %.1f (6-tap) / %.1f (4-tap) by useKaiser6; VarH gains from the spectral fixed point -- MUST MATCH taaResample.h.hlsl)",
+                    "Accumulator host constants: flipAcc=%.2e noiseAcc=%.5f varhLoss=%.4f whiteLoss=%.4f (kernel: separable per-axis Kaiser, beta %.1f (6-tap) / %.1f (4-tap) by useKaiser6; VarH gains from the spectral fixed point -- MUST MATCH taaResample.h.hlsl)",
                     flipAcc, noiseAcc, varhLoss, whiteLoss, KAISER6_BETA, KAISER4_BETA))
             end
         end
-        -- The LR ghost detector: 0 off / 1 armed / 2 telemetry.
+        -- The persistence detector's mode: 0 off / 1 armed / 2 telemetry /
+        -- 3 armed + hard alarm.
         pre:setShaderConst("$taaClipGhostReset",         s.clipGhostReset)
         pre:setShaderConst("$taaSoftClip",                s.softClip)
         pre:setShaderConst("$taaChromaVarianceMod",       s.chromaVarianceMod)
