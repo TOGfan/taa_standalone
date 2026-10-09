@@ -29,7 +29,7 @@
 // frame, the history landing and the motion-field writer's flag channel, so
 // every landing site resolves with identical layer semantics.
 //
-// CLIP-STATE SIGMA HELPERS: the 7-bit log2 encoding of the temporal clip
+// CLIP-STATE SIGMA HELPERS: the 6-bit log2 encoding of the temporal clip
 // record's sigma lives HERE (not taaClip) because TWO transports carry it:
 // the clip-state alpha (taaClip) and the debug payload (below). One encoding,
 // two packings; DecodeClipSigmaSq accepts both tags.
@@ -84,43 +84,51 @@ float2 Bilerp2x2(float2 c00, float2 c10, float2 c01, float2 c11, float2 fraction
 // ============================================================================
 static const float kClipSigmaRef = 1.0 / 255.0;   // the clip-state sigma's unit
 
+// 6-bit sigma encoding (v3 transports): 1/4-stop steps over the same range.
+// The estimator's own noise at 9 taps is ~30%; +-9% amplitude quantization
+// is lossless in practice. BOTH transports use these -- one encoding, two
+// packings, exact debug round-trip. Code 0 = cold.
 float ClipPackSigmaCode(float s)
 {
-    return clamp((log2(max(s, 1e-6) / kClipSigmaRef) + 8.0) * 8.0, 0.0, 127.0);
+    return clamp((log2(max(s, 1e-6) / kClipSigmaRef) + 8.0) * 4.0, 0.0, 63.0);
 }
 
 float ClipUnpackSigmaCode(uint code)
 {
-    return kClipSigmaRef * exp2(code * 0.125 - 8.0);
+    return kClipSigmaRef * exp2(code * 0.25 - 8.0);
 }
 
+// v3 debug payload: [31] sign (genuine), [30:28] tag 001, [27:24] view code,
+// [23:14] payload A, [13:8] payload B, [7:6] spare, [5:0] sigma (6-bit,
+// shared encoding -- the record chain runs uninterrupted through debug).
 float PackDebugAlpha(bool revoked, float code, float a, float b, float sigma)
 {
-    uint u = 0x38000000u
-           | ((uint(code + 0.5) & 0xFu)        << 23)
-           | ((uint(a * 1023.0 + 0.5) & 0x3FFu) << 13)
-           | ((uint(b * 63.0 + 0.5)   & 0x3Fu)  << 7)
-           |  (uint(ClipPackSigmaCode(sigma) + 0.5) & 0x7Fu);
+    uint u = 0x10000000u
+           | ((uint(code + 0.5) & 0xFu)        << 24)
+           | ((uint(a * 1023.0 + 0.5) & 0x3FFu) << 14)
+           | ((uint(b * 63.0 + 0.5)   & 0x3Fu)  << 8)
+           |  (uint(ClipPackSigmaCode(sigma) + 0.5) & 0x3Fu);
     return asfloat(revoked ? (u | 0x80000000u) : u);
 }
 
-// ============================================================================
-// ACUTANCE TRANSPORT DECODE (the clip-state alpha's [19:8] field)
-// ----------------------------------------------------------------------------
-// The resolve packs the raw-scene acutance target SQRT-COMPRESSED (packed
-// linear [0,1] <-> energy [0,9]; the old linear packing saturated at E = 1
-// -- every full-contrast LDR edge and all HDR content) and TEMPORALLY
-// STABILIZED (an EWMA at kSharpEwmaRate against the previous frame's
-// decoded value at the landing; the raw measurement swings ~2x across the
-// jitter phase cycle on edges and would flicker the sharpener's boost).
-// DecodeAcutanceEnergy returns the ENERGY; a foreign tag (debug payload,
-// cleared buffer, NaN) decodes as zero: no boost, never a spurious one.
-// ============================================================================
+void UnpackDebugAlpha(float alpha, out uint code, out float a, out float b)
+{
+    uint u = asuint(alpha);
+    code = (u >> 24) & 0xFu;
+    a    = (float)((u >> 14) & 0x3FFu) * (1.0 / 1023.0);
+    b    = (float)((u >> 8) & 0x3Fu) * (1.0 / 63.0);
+}
+
+// v3.8 acutance: 6-bit field at [21:16] of the clip-state alpha (tag 101).
+// The v3.2 8-bit field gave back 2 bits for the LLR's quantization; the
+// transport EWMA (0.25 rate) and the sharpener's energy floor sit far above
+// 6-bit quantization (1.6% linear steps). Foreign tags (debug 001, the old
+// 011x/100 formats, NaN) decode 0.
 float DecodeAcutanceLinear(float alphaValue)
 {
     uint u = asuint(alphaValue);
-    if (((u >> 27) & 0xFu) == 0x6u)                     // clip-state tag
-        return (float)((u >> 8) & 0xFFFu) * (1.0 / 4095.0);
+    if (((u >> 28) & 0x7u) == 0x5u)      // clip-state tag 101 (v3.8)
+        return (float)((u >> 16) & 0x3Fu) * (1.0 / 63.0);
     return 0.0;
 }
 
@@ -131,14 +139,6 @@ float DecodeAcutanceEnergy(float alphaValue)
 }
 
 
-
-void UnpackDebugAlpha(float alpha, out uint code, out float a, out float b)
-{
-    uint u = asuint(alpha);
-    code = (u >> 23) & 0xFu;
-    a    = (float)((u >> 13) & 0x3FFu) * (1.0 / 1023.0);
-    b    = (float)((u >> 7) & 0x3Fu) * (1.0 / 63.0);
-}
 
 // ============================================================================
 // VIEWPORT & PIXEL GEOMETRY

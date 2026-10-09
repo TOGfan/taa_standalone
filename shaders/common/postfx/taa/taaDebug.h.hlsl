@@ -23,6 +23,14 @@
 //     B is 6 bits -- display-only in every view; the 0.125-quantized bit
 //     fields decode exactly through it.
 //
+// v3.9: mode 13 -- the gate's REALIZED NULL LAW (the audit's calibration
+// view). A = saturate(mdd/16) as a grayscale ramp: park on a STATIC scene
+// and read the brightness distribution; the nominal 95th percentile sits at
+// chi^2/16 (~0.49 mid-gray at the default chi 2.8). Brightness beyond that
+// on static content is the gate running hot, and the EMPIRICAL Student
+// factor is (A's 95th percentile) * 16 / chi^2. B marks engagement
+// (mdd > chi^2) with a blue tint.
+//
 // FRAGMENT HEADER: compiled only inside taaFinal.fx.hlsl. Requires fragments
 // included before: taaShared.h.hlsl (UnpackDebugAlpha).
 // ============================================================================
@@ -124,6 +132,15 @@ float3 RenderDebugView(uint code, float a, float b, bool revoked,
     // 12: dejittered residual (jitter-cancel verification).
     case 12:
         return float3(a, a, 0.0);
+
+    // 13: the gate's realized null law (v3.9, the audit's calibration view).
+    // A = saturate(mdd/16) as the histogram channel (grayscale); the nominal
+    // 95th percentile sits at chi^2/16 -- mid-gray at the default chi 2.8.
+    // Park on a STATIC scene: brightness beyond the nominal point is the
+    // gate running hot, and the empirical Student factor is (A's 95th
+    // percentile) * 16 / chi^2. B = engagement (mdd > chi^2), blue tint.
+    case 13:
+        return float3(a, a, b * 0.9);
 
     // No payload (the history-support early-out, or a mode whose data was
     // never produced for this pixel): show the resolved output.
