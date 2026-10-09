@@ -66,11 +66,12 @@ float2 Bilerp2x2(float2 c00, float2 c10, float2 c01, float2 c11, float2 fraction
 // -- debug colors in RGB would poison the accumulation). The view state
 // rides the alpha instead: the magnitude's only consumers are taaFinal's
 // auto-sharpener (bypassed in debug) and the writer's revocation SIGN (kept
-// genuine). Bit layout: 31 = revocation sign; 30..27 = 0111 (finite,
-// non-subnormal, never NaN/Inf); 26..23 = view code; 22..13 = payload A
-// [0,1] (10 bits); 12..7 = payload B [0,1] (6 bits); 6..0 = the temporal
-// clip-state sigma code (7 bits, the same encoding as the clip-state
-// alpha's field -- see taaClip.h.hlsl).
+// genuine). 
+// Bit layout: 31 = revocation sign; 30..28 = tag 001 (finite,
+// non-subnormal, never NaN/Inf); 27..24 = view code; 23..14 = payload A
+// [0,1] (10 bits); 13..8 = payload B [0,1] (6 bits); 7..6 spare (zero);
+// 5..0 = the temporal clip-state sigma code (6 bits, the same encoding as
+// the clip-state alpha's sigma field -- see taaClip.h.hlsl).
 //
 // Carrying the clip state INSIDE the debug payload is what makes the state
 // OBSERVABLE: without it, every debug frame overwrites the alpha with a

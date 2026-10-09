@@ -51,6 +51,22 @@
 // the soft threshold sits at 2 estimator sigmas (inside the Studentized
 // gate -- the smooth-lighting band).
 //
+// v3.10.1 (audit fixes, behavior-changing):
+//   (1) The flat mu share's Student dof is the RESID-FIT count (n_eff - 3)
+//       -- matching the scoped estimator's own 1/(1-3*invNeff) dof
+//       correction -- instead of the raw effective count pinned at 4 by
+//       the invNeff clamp (that pin was right only by coincidence for
+//       plain table weights; the honest value is ~2.6 at the default
+//       jitter-centered weights).
+//   (2) The sampled correlations' shrink uses the honest n_eff - 1 (the
+//       old 0.25 clamp froze it at 3): less over-shrink, a tighter
+//       ellipsoid along the luma direction on correlated RGB.
+//   (3) The persistence evidence is priced against the detector's realized
+//       null (kGhostNullStdSq / kGhostEvCoef): the confirmed blend floor
+//       was running ~3x hot at deep confirmation.
+// (1) is MEASUREMENT-GATED: verify with debug mode 13 before/after (the
+// procedure and revert line are documented at the nuMuFlat site).
+//
 // TRANSPORT (tag 101): [31] sign, [30:28] tag, [27:22] sigma (6-bit),
 // [21:16] acutance (6-bit), [15:10] VarH ratio (6-bit), [9:6] age,
 // [5:0] the persistence statistic T (0.25 quanta, code = round(4T) + 32;
@@ -232,7 +248,9 @@ static const float kStepLeverK    = 0.5;
 // pinned ~N(0,1) (self-normalized: a variance-model error cancels between
 // numerator and denominator). Thresholds are set against the t_6 input's
 // variance inflation (nu/(nu-2) = 1.5 -> the normalized null's effective
-// std is ~1.22, not 1):
+// std is ~1.22, not 1 -- kGhostNullStdSq below carries this number for the
+// evidence mapping, which must price against the same null the thresholds
+// do):
 //   |T| >= kGhostConfirmT (4.0): ~1e-3 engagement, EMA-smooth. The action
 //        is the drift-corrector UNLOCK -- a smooth correction, not a blend
 //        jump. This is the ghost-trail eviction engine.
@@ -248,6 +266,21 @@ static const float kGhostEmaNorm   = 3.5119; // sqrt((2-rate)/rate): the EMA's n
 static const float kGhostConfirmT  = 4.0;    // the confirmation threshold on |T|
 static const float kGhostAlarmT    = 6.5;    // the deep-confirmation / alarm threshold
 static const float kGhostUnlockThrSigmas = 0.75; // the CONFIRMED drift threshold, in estimator sigmas (vs 2.0 unconfirmed)
+// v3.10.1: the persistence statistic's REALIZED null variance. The per-frame
+// t input is t_dof at dof ~ 6 (9 same-layer taps - mean - 2 gradient dof),
+// variance nu/(nu-2) = 1.5; kGhostEmaNorm normalizes for iid UNIT-variance
+// inputs, so T's null variance is 1.5 (std ~ 1.2247). The |T| thresholds
+// above were set against it -- and the EVIDENCE mapping (kGhostEvCoef,
+// consumed by the resolve) must be too. Successive t frames are also
+// positively correlated (overlapping 3x3 windows, the history carryover):
+// if mode-11 telemetry on static NOISY content shows sustained |T| > ~1.5,
+// raise this to the measured inflation rather than moving the thresholds.
+static const float kGhostNullStdSq = 1.5;
+// ln BF = T^2 / (4 sigma0^2) - 0.5 ln 2  (tau = sigma0 Gaussian prior).
+// The unit-sigma form the resolve used (0.25 * T^2) overstated the
+// exponent by 1.5x -- at T = 4 the blend floor read 7% where the honest
+// value is 2%; at T = 6 it read 92% vs 36%.
+static const float kGhostEvCoef = 0.25 / kGhostNullStdSq;   // 1/6
 // The temporal-tail component's prior mass, shared by the gate's posterior
 // alternative (9 taps + 1 tail, 1/10 each).
 static const float kCusumTailWeight   = 0.1;
@@ -1027,8 +1060,8 @@ RecordVarianceParts SplitRecordVariance(
             float3 w0Floor    = stats.centerWeight * stats.centerWeight * p.sPer;
             float3 scopedBase = max(max(stats.residSq, residFloor * residFloor), w0Floor);
             float3 muVarFb    = lerp(stats.invNeff * (1.0 - alphaStat * 0.5) * p.ePer,
-                                     stats.invNeff * scopedBase,
-                                     saturate(taaClipScopedMu));
+                                    stats.invNeff * scopedBase,
+                                    saturate(taaClipScopedMu));
             p.muVar = lerp(muVarFb, stats.stepTargetVar, stats.stepW);
         }
     }
@@ -1116,6 +1149,8 @@ ClipGateResult ClipHistoryToStatisticGate(
     // noise floor fed this term continuously -- a flicker source). No
     // age/multiplicity discount: the EMA's memory is bounded (~13 frames),
     // so the unknown-onset prior mass is bounded by construction.
+    // (v3.10.1: the resolve now prices ghostEvNats against kGhostNullStdSq
+    // -- this site is unchanged, it just receives honest nats.)
     float seqFloor = 0.0;
     if (taaSoftClip > 0.001 && ghostEvNats > 0.0)
     {
@@ -1138,19 +1173,38 @@ ClipGateResult ClipHistoryToStatisticGate(
         // flats, so the coded chi^2 = 7.84 read as ~17% instead of 5%). The
         // fix: Satterthwaite over the two INDEPENDENT components -- the
         // transported record (dof: the record's information clock) and the
-        // spatial mean/target estimate (dof: the full-set effective count on
-        // flats, the step levels' estimation dof on engaged steps) -- then
-        // the host's exact F(3,nu) fit at the blended dof. Both anchors of
-        // the host fit (nu0 = 4, nu_inf ~ 74) bracket every blended dof this
-        // can produce; the max(nu, 2) guards below nu0 are degenerate-subset
-        // regimes only.
+        // spatial mean/target estimate (dof: the resid-fit count n_eff - 3
+        // on flats -- the scoped estimator's own dof correction, see
+        // nuMuFlat below; the step levels' estimation dof on engaged
+        // steps) -- then the host's exact F(3,nu) fit at the blended dof.
+        // Both anchors of the host fit (nu0 = 4, nu_inf ~ 74) bracket the
+        // typical range; the flat mu path can land at ~2.6 (below nu0),
+        // where the rational form UNDER-inflates relative to the exact S
+        // (fit(2.6) ~ 3.95 vs exact ~4.7) -- tight-side only, never wide.
         float  muRecordShare = (1.0 - stats.stepW) * (1.0 - saturate(taaClipScopedMu));
         float3 varHTerm = parts.varHPer
                         + float3(kResampleVarSq, kResampleVarSq, kResampleVarSq)
                         + muRecordShare * parts.muVar;
         float3 muTerm   = (1.0 - muRecordShare) * parts.muVar;
         float  nuVarH   = StudentEffectiveDof(recordAge, stats.recordSampleDof);
-        float  nuMuFlat = max(1.0 / max(stats.invNeff, 0.2) - 1.0, 2.0);
+        // v3.10.1 (MEASUREMENT-GATED): the flat mu share's dof is the
+        // RESID-FIT count -- the scoped base (residSq) removes an explicitly
+        // fitted plane (mean + 2 gradients; the 1/(1-3*invNeff) dofCorr in
+        // ComputeColorNeighborhoodStats is its own unbiasing), so the t-like
+        // ratio carries n_eff - 3 dof: ~2.6 at the default jitter-centered
+        // weights (invNeff ~ 0.18), ~4.1 at plain table weights -- where the
+        // old clamped form also gave 4 (a no-op there). The old n_eff - 1
+        // pin was right only by coincidence for the plain-weight family.
+        // The unscoped end (clipScopedMu -> 0) moves muVar into varHTerm via
+        // muRecordShare, where the record's clock already prices it --
+        // muTerm vanishes there, so this dof only scales the scoped blend.
+        // REVERT LINE (the mode-13 procedure): if a static scene read ~0.49
+        // at chi 2.8 BEFORE this change and lands DIMMER after, restore
+        //     max(1.0 / max(stats.invNeff, 0.2) - 1.0, 2.0)
+        // (the resid model over-discounts there: the max() floorings and
+        // the record carryover absorb more noise than the plane-fit dof
+        // models).
+        float  nuMuFlat = max(1.0 / max(stats.invNeff, 1e-3) - 3.0, 2.0);
         float  nuMu     = lerp(nuMuFlat, max(stats.cusumStepDof, 2.0), saturate(stats.stepW));
         float3 total    = varHTerm + muTerm;
         float3 nuEff    = total * total
@@ -1191,6 +1245,12 @@ ClipGateResult ClipHistoryToStatisticGate(
             gateVar = stats.invNeff * varX;
         }
     }
+    // Coherence note (v3.10.1, deliberate): the transport scatter is added
+    // AFTER the Studentization -- it is not S(nu)-inflated. Its static
+    // floor is a stable min-statistic (the measured velocity-quantization
+    // scale), but the motion-scaled share is a single noisy measurement;
+    // mode 13 UNDER MOTION is the view that would expose any under-coverage
+    // here.
     gateVar += (1.0 - stats.stepW) * stats.transportVar;   // motion-gated (v3.8.4 + v3.9)
     r.rawGateVar = gateVar;
 
@@ -1207,7 +1267,14 @@ ClipGateResult ClipHistoryToStatisticGate(
     // The shrink strips the leading-order estimation-noise bias; calibrate
     // the factor from the mode-13 static-scene histogram if it ever needs
     // to be tighter.
-    float rDof = max(1.0 / max(stats.invNeff, 0.25) - 1.0, 2.0);
+    // v3.10.1: the honest count -- covCross are mean-centered raw moments
+    // with NO plane removed, so the correlation's dof is n_eff - 1 (~4.6 at
+    // the default jitter-centered weights, ~6.1 at plain table weights).
+    // The old 0.25 inner clamp froze it at 3 (shrink 0.667 instead of
+    // ~0.78-0.84): over-shrunk correlations widened the ellipsoid along the
+    // luma direction on correlated RGB content -- pure ghost shelter on the
+    // most common content.
+    float rDof = max(1.0 / max(stats.invNeff, 1e-3) - 1.0, 2.0);
     float corrShrink = max(0.0, 1.0 - 1.0 / rDof);
     float vX = max(gateVar.x * chromaScale.x * chromaScale.x, minGateVar);
     float vY = max(gateVar.y * chromaScale.y * chromaScale.y, minGateVar);
@@ -1258,6 +1325,16 @@ ClipGateResult ClipHistoryToStatisticGate(
         // by its prior weight, and charges the exact Jacobian.
         float3 gW = max(gateVar * (chromaScale * chromaScale),
                         float3(minGateVar, minGateVar, minGateVar));
+        // Coherence note (v3.10.1, deliberate): this posterior runs at
+        // nuHonest -- the RECORD's dof (up to ~66) -- while the hard gate's
+        // radius above used the blended Satterthwaite dof (~2.6-4 on
+        // flats). Both the null and the components here are t_nuHonest in
+        // this S-inflated gW, so the pair is self-consistent as "Gaussian
+        // at the record-inflated scale"; the asymmetry (the soft action
+        // seeing finer tails than the hard floor beneath it) is intended --
+        // the hard floor carries the coverage guarantee, the posterior
+        // only ever pulls FURTHER toward the current frame than that floor
+        // requires (wPull is max'd against it below).
         float3 sigAC = AnisoClampSigma(stats.sigmaClean);
         float  tailW = kCusumTailWeight;
         float3 tailVar = gW + (kGhostPriorSigma * kGhostPriorSigma) * (sigAC * sigAC);

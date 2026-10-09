@@ -45,6 +45,15 @@
 // confirmed blend floor, and the alarm. The step-target migration and the
 // fallback clean-fusion are gone with the walk.
 //
+// v3.10.1 (audit fixes): the persistence evidence prices against the
+// detector's realized 1.22-sigma null (kGhostEvCoef, taaClip; was
+// unit-sigma -- the confirmed blend floor ran ~3x hot at deep
+// confirmation); taaClip's Studentization consumes the honest per-
+// estimator dofs (the flat mu share at the resid-fit count, the sampled
+// correlations at the un-clamped effective count -- see taaClip's
+// v3.10.1 header note and the mode-13 measurement procedure at the
+// nuMuFlat site).
+//
 // OUTPUT: RGB = the resolved color, ALWAYS. A = the packed CLIP STATE
 // (format v3.8, tag 101). Debug modes carry tag 001.
 //
@@ -103,7 +112,7 @@ cbuffer perDraw
     float  taaVelRejection;                 float  taaVelGradientScale;
     float  taaDepthParallaxStep;            float  taaCrossTestStrength;
     float  taaJitPrev2YawSin;               float  taaJitPrev2YawCos;
-    float  taaJitPrev2PitchSin;             float  taaJitPrev2PitchCos;
+    float  taaJitPrev2PitchSin;            float  taaJitPrev2PitchCos;
     float  taaStudentA;                     float  taaStudentB;
     float  taaClipScopedMu;
     float  taaAcutanceActive;               float  taaDriftCompensation;
@@ -727,12 +736,18 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
                + (kGhostEmaRate * kGhostEmaNorm) * tFrame;
         ghostT = clamp(ghostT, -7.75, 7.75);
     }
-    // The confirmed evidence in nats: the exact tau = sigma Gaussian-prior
-    // Bayes factor, ln BF = T^2/4 - 0.5*ln(2). ZERO below the confirmation
-    // threshold -- the detector contributes nothing anywhere until
-    // confirmed.
+    // v3.10.1: the confirmed evidence in nats -- the exact tau = sigma0
+    // Gaussian-prior Bayes factor against the detector's REALIZED null,
+    //     ln BF = T^2 / (4 sigma0^2) - 0.5*ln(2),
+    // with sigma0^2 = kGhostNullStdSq (1.5: the t_6 input's nu/(nu-2)
+    // inflation -- kGhostEmaNorm only normalizes iid UNIT-variance inputs,
+    // so T's null std is ~1.22, not 1; the |T| thresholds above already
+    // price against it). The old unit-sigma form overstated the exponent by
+    // 1.5x: at T = 4 the blend floor read 7% where the honest value is 2%;
+    // at T = 6 it read 92% vs 36%. ZERO below the confirmation threshold --
+    // the detector contributes nothing anywhere until confirmed.
     float ghostEvNats = (ghostSoft && abs(ghostT) > kGhostConfirmT)
-        ? (0.25 * ghostT * ghostT - 0.34657)
+        ? (kGhostEvCoef * ghostT * ghostT - 0.34657)
         : 0.0;
     bool ghostAlarm = ghostHard && (abs(ghostT) >= kGhostAlarmT);
 
@@ -789,6 +804,12 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
     }
     else
     {
+        // Coherence note (v3.10.1): the reset seed is the Var(x) model
+        // (engaged steps) or the spatial E[i^2]-flavored estimate (flats),
+        // while the carried record converges toward E[i^2] -- a
+        // 2/(2-a) - 1 inconsistency (~1.5% at default feedback) at the
+        // reset boundary; exact at a = 1 (full-replacement frames, where
+        // resets concentrate).
         sigmaStatSq = (colorStats.stepW > 0.5 || recordEstSpatial < 0.0)
             ? SeedRecordTotalSq(colorStats)
             : max(recordEstSpatial, kClipSigmaRecordFloorSq);
@@ -888,9 +909,10 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
             dbgCode = 11.0;
             dbgA = carryRecord ? 1.0 : (hadRecord ? 0.35 : 0.15);
             // Telemetry: the fitted coverage on engaged steps; the persistence
-            // statistic |T|/alarm elsewhere (dim on static scenes, |T| < ~1;
-            // brightness blooming along a real trail, then decaying as the
-            // corrector evicts it -- THE detector verification view).
+            // statistic |T|/alarm elsewhere (dim on static scenes, |T| < ~1
+            // against the 1.22-sigma null; brightness blooming along a real
+            // trail, then decaying as the corrector evicts it -- THE detector
+            // verification view).
             dbgB = ghostTelemetry
                 ? ((colorStats.stepW > 0.5)
                     ? saturate(colorStats.stepC)

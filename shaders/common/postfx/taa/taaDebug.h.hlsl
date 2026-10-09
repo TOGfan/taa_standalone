@@ -114,21 +114,21 @@ float3 RenderDebugView(uint code, float a, float b, bool revoked,
         return resultRGB * 0.2 + float3(a, planar ? 0.25 : 0.0, planar ? 0.0 : 0.25);
     }
 
-    // 11: clip gate state. A: the record's SURVIVING VARIANCE FRACTION when
-    // carried (1.0 = clean record, full room; dimming toward 0.55 = the
-    // bias is latching, the gate is entering bias-removal mode -- the
-    // ghost-kill state), 0.35 = record RESET this frame (identity reset,
-    // shock, corroborated geometry, or the NaN guard), 0.15 = no record at
-    // all. B = how far the gate shrank the history toward the neighborhood
-    // mean, post-soft-clip (0 = untouched); in clipGhostReset=2 telemetry
-    // mode, B = the fitted coverage on engaged steps and the persistence
-    // statistic |T|/alarm on flats (dim and stable on static scenes;
-    // blooming along a real trail, then decaying as the corrector evicts
-    // it -- THE detector verification view). The reveal repair reads as
-    // either a one-frame reset flash at the departing edge or the green
-    // dimming over ~4 frames with B bright while the gate dismantles the
-    // remnant; a persistent dim-green + bright-B region means a ghost the
-    // latch is still dismantling (watch it clear in 2-3 frames).
+    // 11: clip gate state. A is the record's three-level state, written by
+    // the resolve as CONSTANTS: 1.0 = carried (bright green), 0.35 = record
+    // RESET this frame (mid green; identity reset, shock, corroborated
+    // geometry, or the NaN guard), 0.15 = no record at all (red). B = how
+    // far the gate shrank the history toward the neighborhood mean,
+    // post-soft-clip (0 = untouched; static content should sit near black
+    // -- that is the tightness win); in clipGhostReset=2 telemetry mode, B
+    // = the fitted coverage on engaged steps and the persistence statistic
+    // |T|/alarm on flats (dim and stable on static scenes, |T| < ~1 against
+    // the 1.22-sigma null; blooming along a real trail, then decaying as
+    // the unlocked corrector evicts it -- THE detector verification view).
+    // A reveal reads as a one-frame reset flash at the departing edge; a
+    // persistent bright-B region on static content means either a trail
+    // being evicted (watch it clear) or a false-accumulating detector
+    // (something is wrong).
     case 11: {
         float3 c = resultRGB * 0.1;
         if (a > 0.45)      c.g = saturate((a - 0.55) * 2.2);  // carried: brightness = surviving variance fraction

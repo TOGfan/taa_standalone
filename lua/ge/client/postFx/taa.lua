@@ -310,21 +310,29 @@ end
 -- a function of the slider: S(4) is 1.18 at chi = 1.5 and 2.52 at 2.8 --
 -- a fixed constant cannot serve both. The host fits
 --     S(nu) = 1 + A/nu + B/nu^2
--- exactly at the trajectory's two extremes. The pin uses r = 4 (the typical
--- recordSampleDof of the 5-tap spatial estimator: nu_inf = 4 * (2-rho)/rho
--- = 49.3). Gray content (r -> 1, true nu_inf = 12.33) reads the fit with
--- ~1% mid-range error -- immaterial next to the F-model's own accuracy, and
--- the previous pin (12.333) remains available as the conservative choice if
--- monochrome ghost trails ever matter more than post-reset tightness.
+-- exactly at the trajectory's two extremes. The pin uses r = 6 (the 9-tap
+-- estimator's typical kernel-weighted effective count since v3.8.4:
+-- nu_inf = 6 * (2-rho)/rho ~ 74). Gray content (r -> 1, true nu_inf =
+-- 12.33) reads the fit with ~1% mid-range error -- immaterial next to the
+-- F-model's own accuracy.
 --
--- v3.9: the gate now consumes the fit at its OWN per-pixel estimation dofs
--- (Satterthwaite over the record + spatial components -- the flats' mu share
--- at nu ~ 6 from the full-set effective count, engaged steps at
--- cusumStepDof ~ 4-6, the transported record at StudentEffectiveDof). All
--- of these sit inside the anchor range [nu0, nu_inf]; the max(nu, 2) guards
--- in the shader can read the fit slightly below nu0 = 4, where the rational
--- form under-inflates relative to the exact S(2) -- acceptable for a guard
--- regime that only engages on degenerate 2-tap subsets.
+-- v3.9: the gate consumes the fit at its OWN per-pixel estimation dofs
+-- (Satterthwaite over the record + spatial components -- the flats' SCOPED
+-- mu share at its resid-fit dof n_eff - 3 (~2.6 at the default
+-- jitter-centered weights, ~4.1 for plain table weights; the shader
+-- computes it from the live invNeff), engaged steps at cusumStepDof ~ 4-6,
+-- the transported record at StudentEffectiveDof). The anchors bracket the
+-- TYPICAL range, not a hard bound: recordSampleDof can reach ~8 on
+-- near-uniform weights (nu_inf ~ 99) and kClipMaxAge caps the aged record
+-- at nu ~ 66 -- the rational form extrapolates benignly there (S -> 1).
+-- Reads slightly BELOW nu0 = 4 (the flat mu path can land at ~2.6) sit in
+-- the rational form's weak zone, where it under-inflates relative to the
+-- exact S (fit(2.6) ~ 3.9 vs exact ~4.7): tight-side only, never wide.
+-- The F(3,nu) law itself formally assumes one shared chi^2 denominator
+-- across the three channels; the per-channel estimates share the same
+-- taps, so the law is exact for gray/near-gray content and mildly
+-- approximate for decorrelated RGB (second-order next to the dof
+-- modeling).
 --
 -- MUST MATCH taaClip.h.hlsl: kClipSigmaEmaRate (rho) and
 -- kClipStudentPriorDof (nu0).
@@ -425,6 +433,9 @@ end
 -- ge/extensions/taa.lua) makes the coefficient exact for the configured
 -- sequence and scale -- for the default R2/32 sequence it lands within a
 -- few percent of the uniform 1/12.
+-- (v3.8.4: superseded by the CENTERED 2x2 covariance below -- the phase
+-- bit is measured against the accumulated phase average, so the
+-- coefficient is Var(u), not E[u^2].)
 -- The shader applies ONE constant to both axes' gradients; the per-axis
 -- energies differ only slightly over full periods, so the axis AVERAGE is
 -- the least-squares constant (switch to math.max(ex, ey) for a strictly
@@ -449,14 +460,20 @@ end
 -- ============================================================================
 -- JITTER PHASE COVARIANCE (v3.8.4: the FULL 2x2, per-axis and cross)
 -- ----------------------------------------------------------------------------
--- E[u_x^2], E[u_y^2], E[u_x u_y] of the ACTUAL jitter sequence, in texels^2.
+-- Var[u_x], Var[u_y], Cov[u_x, u_y] of the ACTUAL jitter sequence, in
+-- texels^2 -- CENTERED on the sequence mean. The innovation's phase bit is
+-- -g * (u_t - ubar): the current jitter measured against the ACCUMULATED
+-- phase average, and the accumulator's ~1/a-frame memory (~33 frames at
+-- default feedback ~ the sequence period) makes ubar the sequence mean.
+-- The UNCENTERED second moments the previous version shipped overstated
+-- the energies by ubar^2 (~0.5% on R2/32, ~1-3% on Halton-16) -- a small,
+-- strictly ghost-side slack, now removed.
 -- The shader consumes the quadratic form Q(g) = Ex*gx^2 + Ey*gy^2 +
 -- 2*Exy*gx*gy -- the variance of the jitter's projection on ANY direction
--- (the sequence covariance is PSD by construction, so Q >= 0 everywhere).
+-- (a centered covariance is PSD by construction, so Q >= 0 everywhere).
 -- Enumerating the exact sequence (the same halton/r2 code, periods and
 -- centering as the camera hook) makes the coefficients exact for the
--- configured sequence and scale. The previous single-constant form dropped
--- the cross term and averaged the axes.
+-- configured sequence and scale.
 -- With jitter disabled the energies are exactly ZERO -- tiny positive
 -- sentinels so the shader's "constant provided" gate engages the exact
 -- (noise-only) seed.
@@ -468,7 +485,8 @@ local function jitterPhaseCovariance()
         return 1e-6, 1e-6, 0.0
     end
     local period = s.useR2Jitter and 32 or 16
-    local sumX, sumY, sumXY = 0.0, 0.0, 0.0
+    local sumX, sumY = 0.0, 0.0
+    local sumXX, sumYY, sumXY = 0.0, 0.0, 0.0
     for i = 0, period - 1 do
         local hx, hy
         if s.useR2Jitter then
@@ -478,12 +496,18 @@ local function jitterPhaseCovariance()
             hx = halton(i + 1, 2) - 0.5
             hy = halton(i + 1, 3) - 0.5
         end
-        sumX  = sumX  + hx * hx
-        sumY  = sumY  + hy * hy
+        sumX  = sumX  + hx
+        sumY  = sumY  + hy
+        sumXX = sumXX + hx * hx
+        sumYY = sumYY + hy * hy
         sumXY = sumXY + hx * hy
     end
+    local n  = period
     local sc = scale * scale
-    return sc * sumX / period, sc * sumY / period, sc * sumXY / period
+    -- The centered 2x2 (per-axis variances + cross covariance).
+    return sc * (sumXX - sumX * sumX / n) / n,
+           sc * (sumYY - sumY * sumY / n) / n,
+           sc * (sumXY - sumX * sumY / n) / n
 end
 
 -- ============================================================================
@@ -580,6 +604,11 @@ end
 --     and D = Vr/Vs. (The old one-step gbar measured a SINGLE resample of
 --     white noise; the fixed-point stored field is far more correlated, and
 --     the sign of that error is not guessable -- hence the exact spectrum.)
+--     NOTE: the phase average sits INSIDE the power (Kbar^{2k}), which is
+--     EXACT here: the k kernel factors in the unrolled spectrum belong to
+--     k DIFFERENT frames, and the per-frame phases are iid -- the product's
+--     expectation factorizes into k copies of E[K^2]. The per-phase power
+--     E[(K^2)^k] would only be the FIXED-phase (jitter-off) regime.
 --   * noiseAcc      = Vr / Var(x): the exact steady-state accumulated-noise
 --     share.
 -- The scalar TRANSPORT recursion in the shader (dampGain*(1-a)^2*varH +
@@ -915,7 +944,8 @@ function M.applySettings(inputs)
         pre:setShaderConst("$taaDepthParallaxStep",       0.0)
         -- The Studentization EXACTLY tracks the slider: the fit consumes
         -- the EFFECTIVE radius (chi * (1 + clipOvershoot)) -- the same
-        -- threshold the gate tests. Pin points: nu = 4 and nu_inf(r=4)=49.3.
+        -- threshold the gate tests. Pin points: nu0 = 4 and
+        -- nu_inf(r=6) ~ 74 (STUDENT_NUINF above).
         local chiEff = (tonumber(s.varianceGamma) or 2.8)
                      * (1.0 + math.max(tonumber(s.clipOvershoot) or 0.0, 0.0))
         local studentA, studentB = studentFitAB(chiEff)
@@ -928,7 +958,8 @@ function M.applySettings(inputs)
         pre:setShaderConst("$taaDriftCompensation",      s.driftCompensation)
         pre:setShaderConst("$taaDriftMaxGain",          s.driftMaxGain)
         -- The exact-seed phase covariance (v3.8.4: the full quadratic form,
-        -- tracking useJitter / useR2Jitter / jitterScale).
+        -- tracking useJitter / useR2Jitter / jitterScale; CENTERED on the
+        -- sequence mean -- the accumulator's phase average).
         local phEx, phEy, phExy = jitterPhaseCovariance()
         pre:setShaderConst("$taaJitterPhaseEx",  phEx)
         pre:setShaderConst("$taaJitterPhaseEy",  phEy)
