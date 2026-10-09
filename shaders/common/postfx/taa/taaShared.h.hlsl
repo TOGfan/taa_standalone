@@ -46,6 +46,16 @@ static const float2 kOffsets3x3[9] =
     float2( 1, -1), float2(-1,  1), float2( 1,  1)
 };
 
+// Per-tap reciprocal squared distances of the 3x3 stencil under the
+// max(length, 1) clamp (the clamp binds only on the center tap). The
+// squared-domain scans consume these as compile-time constants.
+// MUST MATCH kOffsets3x3 above.
+static const float kOffsets3x3InvDistSq[9] =
+{
+    1.0, 1.0, 1.0, 1.0, 1.0,
+    0.5, 0.5, 0.5, 0.5
+};
+
 float LumaRGB(float3 rgb) { return dot(rgb, float3(0.2126, 0.7152, 0.0722)); }
 
 // Standard bilinear interpolation of a 2x2 quad (fraction in [0,1]).
@@ -120,24 +130,7 @@ void UnpackDebugAlpha(float alpha, out uint code, out float a, out float b)
     b    = (float)((u >> 8) & 0x3Fu) * (1.0 / 63.0);
 }
 
-// v3.8 acutance: 6-bit field at [21:16] of the clip-state alpha (tag 101).
-// The v3.2 8-bit field gave back 2 bits for the LLR's quantization; the
-// transport EWMA (0.25 rate) and the sharpener's energy floor sit far above
-// 6-bit quantization (1.6% linear steps). Foreign tags (debug 001, the old
-// 011x/100 formats, NaN) decode 0.
-float DecodeAcutanceLinear(float alphaValue)
-{
-    uint u = asuint(alphaValue);
-    if (((u >> 28) & 0x7u) == 0x5u)      // clip-state tag 101 (v3.8)
-        return (float)((u >> 16) & 0x3Fu) * (1.0 / 63.0);
-    return 0.0;
-}
 
-float DecodeAcutanceEnergy(float alphaValue)
-{
-    float lin = DecodeAcutanceLinear(alphaValue);
-    return 9.0 * lin * lin;                             // energy domain
-}
 
 
 

@@ -38,7 +38,7 @@
           >
             <!-- Top Half: Label & Switches -->
             <div class="row-header">
-              <div class="option-label">{{ displayItem(item).name }}</div>
+              <div class="option-label">{{ item.name }}</div>
 
               <div v-if="item.type === 'bool' || item.type === 'numBool'" class="inline-controls">
                 <BngSwitch 
@@ -127,10 +127,10 @@
     <div class="options-info-panel">
       <template v-if="hoveredItem">
         <div class="info-header">
-          <span class="info-title">{{ displayItem(hoveredItem).name }}</span>
-          <span class="info-default">Default: {{ formatDefault(displayItem(hoveredItem)) }}</span>
+          <span class="info-title">{{ hoveredItem.name }}</span>
+          <span class="info-default">Default: {{ formatDefault(hoveredItem) }}</span>
         </div>
-        <div class="info-desc">{{ displayItem(hoveredItem).desc }}</div>
+        <div class="info-desc">{{ hoveredItem.desc }}</div>
       </template>
       <div v-else class="info-empty">
         Hover over a setting to see details.
@@ -179,25 +179,13 @@ function coverageToChi(pct) {
   return (lo + hi) / 2
 }
 
-// The sharpness slider changes meaning with the Auto Sharpening toggle:
-// auto = parity target fraction, manual = fixed RCAS strength.
-const sharpnessAuto = {
-  id: 'sharpness', type: 'float', min: 0.0, max: 1.0, step: 0.01, default: 0.85,
-  name: "Sharpness (Auto Parity Target)",
-  desc: "Target fraction of the raw frame's local sharpness to restore (Auto Sharpening on). The sharpening amount is derived per pixel in closed form from the measured blur -- the ratio of local high-frequency (acutance) energy between the raw scene and the resolved image -- so heavily accumulated (blurred) areas get boosted while fresh, disoccluded and border pixels get almost none. Aliasing is not re-introduced: the target never exceeds the raw image's own energy, sub-perceptual detail is ignored via a noise floor, and RCAS's contrast limiter and noise suppression only ever reduce the boost further. 1.0 = full perceptual parity with the raw image, 0 disables sharpening."
-}
-const sharpnessManual = {
-  id: 'sharpness', type: 'float', min: 0.0, max: 1.0, step: 0.01, default: 0.85,
-  name: "Sharpness (Manual Strength)",
-  desc: "Fixed FSR RCAS sharpening strength (Auto Sharpening off), applied uniformly to every pixel with no acutance measurement: 0 disables, 1.0 is the maximum lobe RCAS permits (very strong). RCAS's built-in contrast limiter and noise suppression remain active, so edges are protected from ringing and grain amplification. Values around 0.3-0.5 are a typical manual starting point."
-}
+
 
 const settingsSchema = [
 {
   name: "General & Sharpening",
   items: [
-    sharpnessAuto,
-    { id: 'autoSharpen', type: 'numBool', default: 1.0, name: "Auto Sharpening", desc: "Selects how the Sharpness slider drives the final FSR RCAS pass. On: the slider is an auto-parity target -- each pixel's sharpening amount is derived from the measured acutance ratio between the raw and resolved images, restoring accumulated blur without ever exceeding the raw frame's sharpness. Off: the slider is a plain manual sharpening strength applied uniformly (also slightly cheaper -- the acutance measurement is skipped)." },
+    { id: 'sharpness', type: 'float', min: 0.0, max: 1.0, step: 0.01, default: 0.35, name: "Sharpness", desc: "Fixed FSR RCAS sharpening strength: 0 disables, 1.0 is the maximum lobe RCAS permits (very strong). RCAS's built-in contrast limiter and noise suppression remain active, so edges are protected from ringing and grain amplification. Values around 0.3-0.5 are a typical starting point." },
     { id: 'jitterScale', type: 'float', min: 0.0, max: 2.0, step: 0.01, default: 1.0, name: "Jitter Spread Scale", desc: "Scales the sub-pixel camera offset pattern. Above 1 samples a wider area within each pixel (more edge anti-aliasing, more temporal softening); below 1 tightens it." },
     { id: 'fallbackFXAA', type: 'numBool', default: 1.0, name: "Fallback Spatial AA (FXAA)", desc: "Applies FXAA edge smoothing to pixels whose temporal history was rejected, so disoccluded areas don't alias while the history rebuilds." }
   ]
@@ -321,7 +309,7 @@ const presets = {
     // --- aggressive tier: uncomment for max performance (each has a visible
     // --- cost; see the preset-notes discussion):
     // useDepthDilation: 0,            // -16 fetches/px: the biggest gate; silhouettes lose dilated motion
-    // autoSharpen: 0, sharpness: 0,   // the whole sharpening pipeline becomes free
+    // sharpness: 0,                  // the RCAS pass becomes free
     // useHullClipping: 0,             // fine-detail shimmer; the state fetch only vanishes if sharpening is off too
     // jitterAwareVariance: 0,         // ~50 ops/px; statistically sound since the C2 test-vector fix
     // fallbackFXAA: 0,                // 4 fetches on transient pixels; aliased reveals
@@ -331,14 +319,7 @@ const presets = {
   Smooth: { varianceGamma: 4.594 }
 }
 
-// Per-item display override: the sharpness row follows the auto-sharpen toggle.
-function displayItem(item) {
-  if (item && item.id === 'sharpness') {
-    const auto = config.value.autoSharpen === 1 || config.value.autoSharpen === true
-    return auto ? sharpnessAuto : sharpnessManual
-  }
-  return item
-}
+
 
 function toLuaValue(val) {
   return typeof val === 'boolean' ? (val ? 'true' : 'false') : val

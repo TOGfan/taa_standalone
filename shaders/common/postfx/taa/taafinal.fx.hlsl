@@ -6,8 +6,7 @@
 //      is the only place a debug color ever exists -- the history-copy child
 //      stores the untouched RGB, so the accumulation simply continues while
 //      debugging.
-//   2) Sharpening: auto-parity (acutance transported in the packed
-//      clip-state alpha) or manual RCAS.
+//   2) Sharpening: manual RCAS (the taaSharpness slider is the strength).
 // ============================================================================
 #include "shaders/common/postFx/postFx.h.hlsl"
 #include "shaders/common/hlsl.h"
@@ -21,7 +20,6 @@ uniform_sampler2D(taaResultTex, 0);
 uniform_sampler2D(taaHistoryTex, 1);
 
 cbuffer perDraw {
-    float taaAutoSharpen;
     float taaSharpness;
     float taaDebugMode;
 
@@ -263,82 +261,13 @@ void FsrRcasInputF(inout AF1 r, inout AF1 g, inout AF1 b)
 }
 
 // ============================================================================
-// ACUTANCE METRIC
+// MANUAL SHARPENING (RCAS)
 // ----------------------------------------------------------------------------
-// FSR SRTM + RCAS luma (x2), matching exactly how the resolve pass computed
-// the raw-scene acutance energy. TRANSPORT: it rides inside the packed
-// clip-state alpha, 12 bits at [19:8] (full layout: [31] revocation sign,
-// [30:27] tag 0110, [26:20] the temporal clip-state sigma code, [19:8] the
-// acutance energy, [7:0] the drift bias -- [7] sign, [6:1] quarter-octave
-// magnitude -- with [0] the fiction flag; the bias and flag are simply
-// ignored here). The stored energy is saturate'd at pack time, which only
-// ever LOWERS the derived boost (the safe direction), and the 12-bit
-// quantization step (2.4e-4) sits at kSharpEnergyFloor's own scale. A
-// foreign tag (the debug payload 0111, a cleared buffer, a NaN) decodes as
-// zero energy = no boost, never a spurious one.
+// taaSharpness is the fixed RCAS strength in [0, 1] (0 disables; 1 is the
+// maximum lobe RCAS permits -- very strong; ~0.3-0.5 is the typical range).
+// RCAS's built-in contrast limiter and noise suppression remain active, so
+// edges are protected from ringing and grain amplification.
 // ============================================================================
-AF1 SharpLuma(AF3 rgb)
-{
-    AF3 c = max(rgb, AF3_(0.0));
-    c *= AF3_(ARcpF1(AMax3F1(c.r, c.g, c.b) + AF1_(1.0))); // FsrSrtmF
-    return c.b * AF1_(0.5) + (c.r * AF1_(0.5) + c.g);        // RCAS luma (x2)
-}
-
-// DecodeAcutanceEnergy now lives in taaShared.h.hlsl (the resolve needs it
-// too, for the transport EWMA). It returns the ENERGY directly: the packed
-// field is sqrt-compressed (linear [0,1] <-> energy [0,9] -- the old linear
-// packing saturated at E = 1, i.e. every full-contrast LDR edge and all HDR
-// content) and pre-stabilized by the resolve (EWMA against the previous
-// frame's decoded value at the landing, so the boost cannot flicker with
-// the jitter phase).
-
-// ============================================================================
-// AUTO-PARITY / MANUAL SHARPENING
-// ----------------------------------------------------------------------------
-// taaAutoSharpen selects the mode; taaSharpness is the mode's amount in
-// [0, 1] (0 disables either mode):
-//   * AUTO (default): taaSharpness is the PARITY TARGET fraction -- 1.0
-//     restores the raw frame's local sharpness.
-//
-//     The resolve pass ships the raw scene's local acutance energy (squared
-//     cross high-pass of RCAS-luma over SRTM'd taps), packed into the
-//     clip-state alpha's 16-bit field. The same energy is measured on the
-//     resolved image from RCAS's own five cross taps (identical loads and UV
-//     math as FsrRcasF below, so the compiler can merge them -- zero extra
-//     fetches).
-//
-//     RCAS is a negative-lobe unsharp mask with 1D band response
-//         H(w) = (1 - 2L(1 + cos w)) / (1 - 4L),   L = |lobe| in [0, LIMIT]
-//     The cross-Laplacian energy of natural image detail concentrates around
-//     w_ref = 3*pi/4 (0.375 cycles/pixel). Demanding energy parity at the
-//     reference band,
-//         E_resolved * H(w_ref)^2 = amount * E_raw
-//     gives the required band gain R = sqrt(amount * E_raw / E_resolved)
-//     (both energies floored at kSharpEnergyFloor), and inverting
-//     H(w_ref) = R yields the lobe:
-//         L = (R - 1) / (4R - 2(1 + cos w_ref))
-//     evaluated in sign-safe form: R <= 1 gives L = 0, and the denominator
-//     is floored positive so an energy inversion cannot flip the lobe to
-//     its maximum.
-//
-//     Aliasing is not re-introduced: R <= 1 gives L = 0 (never sharper than
-//     raw), the noise floor ignores sub-perceptual energy, and RCAS's
-//     contrast limiter (hitMin/hitMax) and noise suppression (nz) only ever
-//     REDUCE the lobe further. The system is self-regulating: freshly reset
-//     or disoccluded pixels have E_resolved ~= E_raw -> no boost; only
-//     genuinely accumulated (blurred) pixels get sharpened.
-//   * MANUAL: taaSharpness is a fixed RCAS strength (1 = the maximum lobe
-//     RCAS permits); the acutance measurement is skipped entirely.
-// ============================================================================
-
-// Perceptual noise floor for the acutance energies (SRTM-luma^2 units):
-// structure below ~1% luma contrast is not perceptible sharpness, so neither
-// demands nor suppresses sharpening (also stops noise/aliasing energy from
-// being chased).
-static const AF1 kSharpEnergyFloor = 1e-4;
-
-// 2*(1 + cos(w_ref)) with w_ref = 3*pi/4 (see derivation in mainP).
-static const AF1 kSharpRefFreqTerm = 0.58578644;
 
 float4 mainP(PFXVertToPix IN) : SV_TARGET0
 {
@@ -376,51 +305,8 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
     ASU2 ip = ASU2(IN.uv0 / oneOverTargetSize);
     AF4 tE = FsrRcasLoadF(ip);
 
-    AF1 strength;
-    if (taaAutoSharpen > 0.5)
-    {
-        AF4 tB = FsrRcasLoadF(ip + ASU2( 0,-1));
-        AF4 tD = FsrRcasLoadF(ip + ASU2(-1, 0));
-        AF4 tF = FsrRcasLoadF(ip + ASU2( 1, 0));
-        AF4 tH = FsrRcasLoadF(ip + ASU2( 0, 1));
-
-        AF1 lB = SharpLuma(tB.rgb);
-        AF1 lD = SharpLuma(tD.rgb);
-        AF1 lE = SharpLuma(tE.rgb);
-        AF1 lF = SharpLuma(tF.rgb);
-        AF1 lH = SharpLuma(tH.rgb);
-
-        // Resolved-image acutance energy (same metric the resolve ran on raw).
-        AF1 highPass       = lE - AF1_(0.25) * (lB + lD + lF + lH);
-        AF1 energyResolved = highPass * highPass;
-
-        // Raw-scene acutance energy, cross-averaged for stability, decoded
-        // from the packed clip-state alpha (bits [19:8], sqrt-compressed and
-        // pre-stabilized by the resolve's transport EWMA). A foreign tag
-        // (debug payload, cleared buffer) decodes as zero: no boost.
-        AF1 energyRaw = AF1_(0.2) * (DecodeAcutanceEnergy(tE.a) + DecodeAcutanceEnergy(tB.a)
-                                    + DecodeAcutanceEnergy(tD.a) + DecodeAcutanceEnergy(tF.a)
-                                    + DecodeAcutanceEnergy(tH.a));
-
-        AF1 bandGain = sqrt((amount * energyRaw + kSharpEnergyFloor) /
-                            (energyResolved + kSharpEnergyFloor));
-
-        // Sign-safe inversion of H(w_ref) = bandGain: the numerator floors
-        // at 0 (never sharpen past parity) and the denominator is floored
-        // positive, so an energy inversion -- the resolved image carrying
-        // MORE acutance than the raw (FXAA-added edge energy on rejected
-        // pixels, noise) -- yields lobe = 0 instead of the sign-flipped
-        // RCAS maximum. The denominator floor never engages in the valid
-        // bandGain > 1 regime, so the derivation there is exact.
-        AF1 lobe = max(bandGain - AF1_(1.0), AF1_(0.0)) /
-                   max(AF1_(4.0) * bandGain - kSharpRefFreqTerm, AF1_(1e-4));
-        strength = clamp(lobe, AF1_(0.0), AF1_(FSR_RCAS_LIMIT)) * (AF1_(1.0) / AF1_(FSR_RCAS_LIMIT));
-    }
-    else
-    {
-        // MANUAL: the slider IS the RCAS strength.
-        strength = amount;
-    }
+    // MANUAL: the slider is the RCAS strength.
+    AF1 strength = amount;
 
     if (strength <= AF1_(0.001)) {
         return float4(max(tE.rgb, AF3_(0.0)), 1.0);

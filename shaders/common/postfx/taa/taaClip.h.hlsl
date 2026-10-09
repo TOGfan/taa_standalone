@@ -1,7 +1,7 @@
 // ============================================================================
 // TAA history clipping: color statistics (mixture + same-depth-layer clean
 // + the coverage step model), the temporal clip-state transport (sigma +
-// VarH + age + the persistence statistic), the Mahalanobis gate,
+// VarH + age + the persistence statistics), the Mahalanobis gate,
 // and the feedback consumers
 // ----------------------------------------------------------------------------
 // THE CLIP: the accumulator is the ESTIMATOR, h_{t+1} = (1-a)h_t + a x_t;
@@ -17,12 +17,15 @@
 //     edge flags: a same-depth neighbor flagged as foreground edge or kept
 //     dilation band carries the edge transition's accumulation in its
 //     history -- its mismatch is the transition's state, not this texel's.
-//   * THE PERSISTENCE DETECTOR: one transported scalar, T = the EMA of the
-//     drift estimator's luma t-statistic, self-normalized to a pinned
-//     ~N(0,1) null. Its consumers are all smooth actions: the
-//     drift-corrector UNLOCK (the ghost-trail eviction engine), the
-//     confirmed blend floor, and the alarm. Nothing migrates the clip
-//     target -- a moving target is an edge-flicker source.
+//   * THE PERSISTENCE DETECTOR: two transported scalars -- T, the EMA of
+//     the drift estimator's luma t-statistic, and Tc, the EMA of the
+//     half-wave chroma drift vector magnitude (the chroma channel extends
+//     the detector's AXIS coverage to saturated chroma trails with
+//     sub-floor luma deltas) -- each self-normalized to a pinned null.
+//     Their consumers are all smooth actions: the drift-corrector UNLOCK
+//     (the ghost-trail eviction engine), the confirmed blend floor, and
+//     the alarm. Nothing migrates the clip target -- a moving target is
+//     an edge-flicker source.
 //   * THE STATISTIC GATE: the mu share is Studentized at its own
 //     estimation dof (Satterthwaite over the transported record and the
 //     spatial mean/target estimate); the sampled correlations are shrunk
@@ -46,9 +49,11 @@
 //     confirmed persistence evidence.
 //
 // TRANSPORT (tag 101): [31] sign, [30:28] tag, [27:22] sigma (6-bit),
-// [21:16] acutance (6-bit), [15:10] VarH ratio (6-bit), [9:6] age,
-// [5:0] the persistence statistic T (0.25 quanta, code = round(4T) + 32;
-// the sign is the luma direction).
+// [21:16] the chroma persistence statistic Tc (0.25 quanta, code =
+// round(4Tc) + 32; nonnegative by the half-wave input, so codes 32-63),
+// [15:10] VarH ratio (6-bit), [9:6] age, [5:0] the luma persistence
+// statistic T (0.25 quanta, code = round(4T) + 32; the sign is the luma
+// direction).
 //
 // FRAGMENT HEADER: compiled only inside taa.fx.hlsl. Requires host
 // context: cbuffer perDraw (the clipping + feedback constants,
@@ -157,7 +162,7 @@ struct ColorNeighborhoodStats
 // rho = 0.15 is the chosen operating point. The statistically complete
 // upgrade would be a second CUSUM on innovSq feeding the record's rate --
 // deliberately not built (the transported dof + VarH clocks already absorb
-// most of the lag cost).
+// most of the lag cost, and the arming caps bound the drop-lag window).
 static const float kClipSigmaEmaRate         = 0.15;
 static const float kClipSigmaRecordFloorSq   = (1.0 / 255.0) * (1.0 / 255.0);
 // The record's outlier guard. DERIVATION (honest, both regimes): the test
@@ -184,7 +189,6 @@ static const float kAnisoSigmaCap            = 0.10;
 // can collapse on synthetic flats; 10% of sigma_clean^2 keeps the scoped mu
 // variance positive.
 static const float kScopedResidFrac          = 0.10;
-static const float kSharpEwmaRate            = 0.25;
 static const float kClipStudentPriorDof      = 4.0;
 static const float kClipStudentDecay         = -0.4689303;    // 2*log2(1-rho)
 static const float kClipMaxAge               = 15.0;          // 4-bit age
@@ -236,39 +240,39 @@ static const float kMinJitterSpan = 0.35;
 // for it.
 static const float kStepLeverK    = 0.5;
 // ---- THE PERSISTENCE DETECTOR ----
-// One transported scalar per pixel: T = the EMA of the drift estimator's
-// per-frame spatial t (the LUMA common mode), scaled so the H0 law is a
-// pinned ~N(0,1) (self-normalized: a variance-model error cancels between
-// numerator and denominator). Thresholds are set against the t_6 input's
-// variance inflation (nu/(nu-2) = 1.5 -> the normalized null's effective
-// std is ~1.22, not 1 -- kGhostNullStdSq below carries this number for the
-// evidence mapping, which must price against the same null the thresholds
-// do):
+// Two transported scalars per pixel. T: the EMA of the drift estimator's
+// per-frame LUMA spatial t, scaled so the H0 law is a pinned ~N(0,1)
+// (self-normalized: a variance-model error cancels between numerator and
+// denominator). Tc: the EMA of the half-wave CHROMA drift vector magnitude
+// (see the chroma channel block below). Thresholds are set against the
+// t_6 input's variance inflation (nu/(nu-2) = 1.5 -> the normalized null's
+// effective std is ~1.22, not 1 -- kGhostNullStdSq below carries this
+// number for the evidence mapping, which must price against the same null
+// the thresholds do):
 //   |T| >= kGhostConfirmT (4.0): ~1e-3 engagement, EMA-smooth. The action
 //        is the drift-corrector UNLOCK -- a smooth correction, not a blend
 //        jump. This is the ghost-trail eviction engine.
 //   |T| >= kGhostAlarmT   (6.5): ~1e-7; the blend floor approaches full
 //        replacement; mode 3 additionally hard-replaces.
-// Detection floor: a persistent luma offset >= ~0.6 sigma_content confirms
-// in ~10 frames (per-frame t = mu/sigma_D with sigma_D ~ 0.5 sigma_content;
-// steady-state T = t * kGhostEmaNorm). Chroma-only trails are NOT detected
-// (one luma-weighted scalar -- the visible trails are luma; the per-channel
-// gate and corrector machinery handle the rest).
-static const float kGhostEmaRate   = 0.15;   // the detector's EMA rate (memory ~13 frames)
+// Luma detection floor: a persistent luma offset >= ~0.6 sigma_content
+// confirms in ~10 frames (per-frame t = mu/sigma_D with sigma_D ~ 0.5
+// sigma_content; steady-state T = t * kGhostEmaNorm). Chroma-dominant
+// trails are the chroma channel's business (below); the luma channel
+// alone does not see them.
+static const float kGhostEmaRate   = 0.15;   // the detectors' EMA rate (memory ~13 frames)
 static const float kGhostEmaNorm   = 3.5119; // sqrt((2-rate)/rate): the EMA's null std -> unit
-static const float kGhostConfirmT  = 4.0;    // the confirmation threshold on |T|
+static const float kGhostConfirmT  = 4.0;    // the confirmation threshold (|T| luma / Tc chroma)
 static const float kGhostAlarmT    = 6.5;    // the deep-confirmation / alarm threshold
 static const float kGhostUnlockThrSigmas = 0.75; // the CONFIRMED drift threshold, in estimator sigmas (vs 2.0 unconfirmed)
-// The persistence statistic's REALIZED null variance. The per-frame t
-// input is t_dof at dof ~ 6 (9 same-layer taps - mean - 2 gradient dof),
-// variance nu/(nu-2) = 1.5; kGhostEmaNorm normalizes iid UNIT-variance
-// inputs, so T's null variance is 1.5 (std ~ 1.2247). The |T| thresholds
-// above are set against it -- and the EVIDENCE mapping (kGhostEvCoef,
-// consumed by the resolve) prices against it too. Successive t frames are
-// also positively correlated (overlapping 3x3 windows, the history
-// carryover): if mode-11 telemetry on static NOISY content shows sustained
-// |T| > ~1.5, raise this to the measured inflation rather than moving the
-// thresholds.
+// The luma statistic's REALIZED null variance. The per-frame t input is
+// t_dof at dof ~ 6 (9 same-layer taps - mean - 2 gradient dof), variance
+// nu/(nu-2) = 1.5; kGhostEmaNorm normalizes iid UNIT-variance inputs, so
+// T's null variance is 1.5 (std ~ 1.2247). The |T| thresholds above are
+// set against it -- and the EVIDENCE mapping (kGhostEvCoef, consumed by
+// the resolve) prices against it too. Successive t frames are also
+// positively correlated (overlapping 3x3 windows, the history carryover):
+// if mode-11 telemetry on static NOISY content shows sustained |T| > ~1.5,
+// raise this to the measured inflation rather than moving the thresholds.
 static const float kGhostNullStdSq = 1.5;
 // ln BF = T^2 / (4 sigma0^2) - 0.5 ln 2  (tau = sigma0 Gaussian prior),
 // priced against the detector's REALIZED null (sigma0^2 =
@@ -276,6 +280,40 @@ static const float kGhostNullStdSq = 1.5;
 // 1.5x: at T = 4 the blend floor would read 7% where the honest value is
 // 2%; at T = 6 it would read 92% vs 36%.
 static const float kGhostEvCoef = 0.25 / kGhostNullStdSq;   // 1/6
+// ---- THE CHROMA PERSISTENCE CHANNEL ----
+// A second transported scalar, Tc: the EMA of the half-wave chroma drift
+// VECTOR magnitude, extending the detector's AXIS coverage to the trails
+// the luma channel cannot see -- saturated chroma smears with sub-floor
+// luma deltas (colored lights, emissives on neutral backgrounds). The
+// per-frame input is
+//     tC = max( length(driftMean.yz / sqrt(driftVar.yz))
+//               - kGhostChromaNullMean, 0.0 ) * kGhostChromaScale
+// over the estimator's own per-channel scales. The VECTOR magnitude is
+// DIRECTION-BLIND-FREE (any chroma direction reads at full vector
+// strength; a signed per-axis pick would cancel on the anti-diagonal half
+// of the chroma plane). The HALF-WAVE at the null mean makes the channel
+// ONE-SIDED (quiet chroma is never evidence) and keeps gray content at
+// Tc ~ 0 instead of a deeply negative baseline a new trail would have to
+// climb out of. The CENTERING is essential: a magnitude's null mean is
+// nonzero, and an uncentered input would confirm everywhere.
+// NULL LAW: under H0 each per-axis chroma t is the same t_6-family
+// statistic as the luma channel; the vector magnitude's mean and variance
+// then depend on the chroma channels' correlation rho (E[m]: ~1.5 at
+// rho=0 falling to ~1.3 at rho=1; var(m): ~0.65 rising to ~1.25 -- both
+// bounded, since E[m^2] = 2x the per-axis variance regardless of rho).
+// The constants anchor the CONSERVATIVE end of each band (the mean at its
+// maximum, the variance at its maximum), so the SHARED thresholds and the
+// SHARED evidence coefficient carry a per-channel false rate <= the luma
+// channel's everywhere in the band, one-sided. Both are calibration
+// points, not tuning knobs -- verify on static content via the mode-11
+// telemetry (the channel-separation swap is documented at the dbgB site).
+// FLOOR: the channel's detection floor is a chroma vector magnitude of
+// ~2.5 per-axis sigma_D (~2.2x the luma floor: the centering subtraction
+// plus the conservative anchors) -- the mission is saturated chroma
+// trails (multi-sigma vectors), not depth parity with the luma channel.
+static const float kGhostChromaNullMean = 1.50;   // E[m] under H0, the rho=0 anchor
+static const float kGhostChromaNullVar  = 1.25;   // var(m) under H0, the rho=1 anchor
+static const float kGhostChromaScale    = sqrt(kGhostNullStdSq / kGhostChromaNullVar);  // ~1.10
 // The temporal-tail component's prior mass, shared by the gate's posterior
 // alternative (9 taps + 1 tail, 1/10 each).
 static const float kCusumTailWeight   = 0.1;
@@ -290,7 +328,7 @@ static const float kDriftCapSigmas  = 3.0;   // the magnitude BELT (content sigm
 // meant to be the smooth alternative. 2.0 engages it at ~1.0
 // sigma_content, inside the gate, with the noise cost still bounded by the
 // SNR gain and taaDriftMaxGain. This is the UNCONFIRMED gate; confirmation
-// drops it to kGhostUnlockThrSigmas.
+// (either channel) drops it to kGhostUnlockThrSigmas.
 static const float kDriftThreshSigmas = 2.0;
 // The lighting-rate prior -- the per-frame drift scale as a fraction of
 // the content scale. Prices H_drift in the event guard's posterior (see
@@ -1056,11 +1094,11 @@ float DecodeVarHRatio(float code, float recordSq)
 }
 
 float PackClipStateAlpha(bool revoked, float sigma, float varHRatioCode, float age,
-                         float acutanceLinear, float ghostCode)
+                         float ghostCodeC, float ghostCode)
 {
     uint u = 0x50000000u
            | ((uint(ClipPackSigmaCode(sigma) + 0.5) & 0x3Fu)        << 22)
-           | ((uint(saturate(acutanceLinear) * 63.0 + 0.5) & 0x3Fu)  << 16)
+           | ((uint(clamp(ghostCodeC, 1.0, 63.0)) & 0x3Fu)           << 16)
            | ((uint(varHRatioCode) & 0x3Fu)                          << 10)
            | ((uint(clamp(age, 0.0, kClipMaxAge)) & 0xFu)            << 6)
            |  (uint(clamp(ghostCode, 1.0, 63.0)) & 0x3Fu);
@@ -1068,12 +1106,13 @@ float PackClipStateAlpha(bool revoked, float sigma, float varHRatioCode, float a
 }
 
 void DecodeClipState(float alphaValue, out float sigmaSq, out float varHSq,
-                     out float recordAge, out float ghostT)
+                     out float recordAge, out float ghostT, out float ghostTc)
 {
     sigmaSq = -1.0;
     varHSq = 0.0;
     recordAge = 0.0;
     ghostT = 0.0;
+    ghostTc = 0.0;
 
     uint u   = asuint(alphaValue);
     uint tag = (u >> 28) & 0x7u;
@@ -1084,7 +1123,8 @@ void DecodeClipState(float alphaValue, out float sigmaSq, out float varHSq,
         code = (u >> 22) & 0x3Fu;
         varHCode = (float)((u >> 10) & 0x3Fu);
         recordAge = (float)((u >> 6) & 0xFu);
-        ghostT = ((float)(u & 0x3Fu) - 32.0) * 0.25;   // the persistence statistic, 0.25 quanta
+        ghostT  = ((float)(u & 0x3Fu) - 32.0) * 0.25;          // the luma persistence statistic, 0.25 quanta
+        ghostTc = ((float)((u >> 16) & 0x3Fu) - 32.0) * 0.25;  // the chroma persistence statistic, 0.25 quanta
     }
     else if (tag == 0x1u)                     // debug payload: sigma only
     {
@@ -1320,12 +1360,13 @@ ClipGateResult ClipHistoryToStatisticGate(
     ClipGateResult r;
 
     // The sequential evidence is the persistence detector's CONFIRMED
-    // statistic, mapped through the exact tau = sigma Gaussian-prior Bayes
-    // factor (ln BF = T^2/4 - 0.5*ln 2). ZERO below the confirmation
-    // threshold: on ~99.9% of pixels the gate runs as the pure clip and
-    // the detector contributes NOTHING to its null behavior. No
-    // age/multiplicity discount: the EMA's memory is bounded (~13 frames),
-    // so the unknown-onset prior mass is bounded by construction.
+    // statistic (either channel), mapped through the exact tau = sigma
+    // Gaussian-prior Bayes factor (ln BF = T^2/4 - 0.5*ln 2). ZERO below
+    // the confirmation threshold: on ~99.9% of pixels the gate runs as
+    // the pure clip and the detector contributes NOTHING to its null
+    // behavior. No age/multiplicity discount: the EMA's memory is bounded
+    // (~13 frames), so the unknown-onset prior mass is bounded by
+    // construction.
     float seqFloor = 0.0;
     if (taaSoftClip > 0.001 && ghostEvNats > 0.0)
     {
@@ -1563,9 +1604,9 @@ ClipGateResult ClipHistoryToStatisticGate(
         // ln[mixture] - ln[t_0]; the null's NLL from the diagonal quadratic.
         float llrFrame = (lMax + log(max(wSum, 1e-10))) + kT * log(1.0 + q0Comp / nu);
 
-        // The frame evidence always adds: the persistence statistic is
-        // computed from the drift estimator's common mode, a DIFFERENT
-        // object than this frame-LLR on dCorr; there is no double count.
+        // The frame evidence always adds: the persistence statistics are
+        // computed from the drift estimator's common modes, DIFFERENT
+        // objects than this frame-LLR on dCorr; there is no double count.
         float logOdds = kGhostLogOddsBase
                       + log(1.0 + kGhostMotionOdds * saturate(motionNormalized))
                       + ghostEvNats

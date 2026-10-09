@@ -39,15 +39,6 @@
 #ifndef TAA_DISOCCLUSION_H_HLSL
 #define TAA_DISOCCLUSION_H_HLSL
 
-// Per-tap reciprocal squared distances of the 3x3 stencil under the
-// max(length, 1) clamp (the clamp binds only on the center tap). The
-// squared-domain scans below use these as compile-time constants.
-// MUST MATCH kOffsets3x3 (taaShared.h.hlsl).
-static const float kOffsets3x3InvDistSq[9] =
-{
-    1.0, 1.0, 1.0, 1.0, 1.0,
-    0.5, 0.5, 0.5, 0.5
-};
 
 // ============================================================================
 // DILATION-REVOCATION GATE READER (the stored quad at the candidate's landing)
@@ -66,17 +57,12 @@ static const float kOffsets3x3InvDistSq[9] =
 // decides the outcome alone (the support-flag test fires) -- the reader
 // exploits this: the first fetch settles every landing whose center is
 // edge/band-flagged, and the neighbors are fetched only for
-// background-flagged centers. The layer-gated bilinear depth is
-// deliberately absent: its only consumer's condition (centerFlag >= 1.5)
-// already forces the support-flag test true through the same subsumption,
-// so no decision can ever read it.
+// background-flagged centers.
 // ============================================================================
 struct HistoryMotionGate
 {
-    float  centerFlag;       // stored flag of the snapped landing texel
-    float  gateDepth;        // the center tap's stored depth; no decision
-                             // reads it (the support-flag subsumption above)
-    float  supportMaxFlag;   // support max flag (ANY quad tap)
+    float  supportMaxFlag;   // support max flag (ANY quad tap; includes the
+                             // center -- a center edge/band flag decides alone)
     float  supportDepthMax;  // support max depth (ANY quad tap)
 };
 
@@ -91,18 +77,14 @@ HistoryMotionGate SampleHistoryMotionGate(float2 historyUV, ViewportParams vp)
     float4 m00 = tex2Dlod(historyMotionTex, float4(snappedUV, 0.0, 0.0));
 
     // The center tap alone decides whenever it is edge/band-flagged: the
-    // support's flag maximum INCLUDES the center, so centerFlag >= 0.75
+    // support's flag maximum INCLUDES the center, so a center flag >= 0.75
     // forces supportMaxFlag >= 0.75 -> gateViaFlag -> the quad touches
-    // foreground -> no revocation, regardless of the neighbors. The
-    // remaining outputs are dead on this path: supportDepthMax only feeds
-    // the flag test's OR-partner, and gateDepth's consumer condition
-    // (centerFlag >= 1.5) makes the flag test true first. The support
-    // fields are lower bounds, valid because the >= 0.75 test is already
-    // decided.
+    // foreground -> no revocation, regardless of the neighbors.
+    // supportDepthMax only feeds the flag test's OR-partner (dead once the
+    // flag test fires); the support fields are lower bounds, valid because
+    // the >= 0.75 test is already decided.
     if (m00.w >= 0.75)
     {
-        g.centerFlag      = m00.w;
-        g.gateDepth       = m00.z;
         g.supportMaxFlag  = m00.w;
         g.supportDepthMax = m00.z;
         return g;
@@ -119,9 +101,6 @@ HistoryMotionGate SampleHistoryMotionGate(float2 historyUV, ViewportParams vp)
     float4 m10 = tex2Dlod(historyMotionTex, float4(uv10, 0.0, 0.0));
     float4 m01 = tex2Dlod(historyMotionTex, float4(uv01, 0.0, 0.0));
     float4 m11 = tex2Dlod(historyMotionTex, float4(uv11, 0.0, 0.0));
-
-    g.centerFlag = m00.w;
-    g.gateDepth  = m00.z;
 
     // The support: ANY tap of the degenerated 2x2 quad -- flag OR depth, no
     // layer-matching. Dead-center landings degenerate to the center alone

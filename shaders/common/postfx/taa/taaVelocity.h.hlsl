@@ -64,14 +64,18 @@ void MeasureVelocityFieldShape(
     float2 curvV  = (velocityJitteredUV[0] - 0.5 * (velocityJitteredUV[1] + velocityJitteredUV[2])) * sizePixels;
     float2 curvD1 = (velocityJitteredUV[0] - 0.5 * (velocityJitteredUV[5] + velocityJitteredUV[8])) * sizePixels;
     float2 curvD2 = (velocityJitteredUV[0] - 0.5 * (velocityJitteredUV[6] + velocityJitteredUV[7])) * sizePixels;
-    maxCurvaturePx = max(max(length(curvH), length(curvV)),
-                         max(length(curvD1), length(curvD2)));
+    // Squared-domain reductions: the max of lengths is the sqrt of the max
+    // of dots (monotone); the pair grads' constant scale factors fold into
+    // their squared forms ((0.5)^2 = 1/4; (0.25*sqrt2)^2 = 1/8).
+    maxCurvaturePx = sqrt(max(max(dot(curvH, curvH), dot(curvV, curvV)),
+                             max(dot(curvD1, curvD1), dot(curvD2, curvD2))));
 
-    float gradX  = length((velocityJitteredUV[4] - velocityJitteredUV[3]) * sizePixels) * 0.5;
-    float gradY  = length((velocityJitteredUV[2] - velocityJitteredUV[1]) * sizePixels) * 0.5;
-    float gradD1 = length((velocityJitteredUV[8] - velocityJitteredUV[5]) * sizePixels) * (0.25 * kSqrt2);
-    float gradD2 = length((velocityJitteredUV[7] - velocityJitteredUV[6]) * sizePixels) * (0.25 * kSqrt2);
-    maxPairGradPx = max(max(gradX, gradY), max(gradD1, gradD2));
+    float2 dX  = (velocityJitteredUV[4] - velocityJitteredUV[3]) * sizePixels;
+    float2 dY  = (velocityJitteredUV[2] - velocityJitteredUV[1]) * sizePixels;
+    float2 dD1 = (velocityJitteredUV[8] - velocityJitteredUV[5]) * sizePixels;
+    float2 dD2 = (velocityJitteredUV[7] - velocityJitteredUV[6]) * sizePixels;
+    maxPairGradPx = sqrt(max(max(dot(dX, dX) * 0.25, dot(dY, dY) * 0.25),
+                             max(dot(dD1, dD1) * 0.125, dot(dD2, dD2) * 0.125)));
 }
 
 // Continuous (locally linear) velocity field: the smooth-surface correction
@@ -90,22 +94,22 @@ float MeasureVelocityCoherentGradientPx(
     float2 sizePixels,
     float  coherenceRadiusPx)
 {
-    // Squared-domain coherence test; the sqrt is paid only on passing taps
-    // (NaN deltas compare false and are excluded, as before).
+    // Squared-domain coherence test AND reduction: the per-tap gradient is
+    // sqrt(deltaSq) / dist with dist a compile-time stencil constant
+    // (kOffsets3x3InvDistSq, taaShared), and the max over monotone
+    // transforms collapses -- accumulate deltaSq * invDistSq and pay ONE
+    // sqrt at the end. NaN deltas compare false and are excluded.
     float rSq = coherenceRadiusPx * coherenceRadiusPx;
-    float gradientMax = 0.0;
+    float gradientSqMax = 0.0;
     [unroll]
     for (int i = 1; i < 9; ++i)
     {
         float2 deltaPx = (neighborVelocityJitteredUV[i] - anchorVelocityJitteredUV) * sizePixels;
         float  deltaSq = dot(deltaPx, deltaPx);
         if (deltaSq <= rSq)
-        {
-            float distPx = max(length(kOffsets3x3[i]), 1e-3);
-            gradientMax = max(gradientMax, sqrt(deltaSq) / distPx);
-        }
+            gradientSqMax = max(gradientSqMax, deltaSq * kOffsets3x3InvDistSq[i]);
     }
-    return gradientMax;
+    return sqrt(gradientSqMax);
 }
 
 // Field shape with layer-consistent differences.
@@ -113,8 +117,9 @@ void MeasureVelocityFieldShapeCoherent(
     float2 v[9], float2 sizePixels, float coherenceRadiusPx,
     out float maxCurvaturePx, out float maxPairGradPx)
 {
-    // Squared-domain coherence mask (the curvature/gradient magnitudes below
-    // are computed only on surviving pairs and stay unsquared).
+    // Squared-domain coherence mask; the reductions below are squared too
+    // (the max of lengths is the sqrt of the max of dots -- monotone; the
+    // masked terms are zero vectors and contribute nothing).
     float rSq = coherenceRadiusPx * coherenceRadiusPx;
     bool ok[9];
     ok[0] = true;
@@ -129,13 +134,17 @@ void MeasureVelocityFieldShapeCoherent(
     float2 curvV  = (ok[1] && ok[2]) ? (v[0] - 0.5 * (v[1] + v[2])) * sizePixels : float2(0.0, 0.0);
     float2 curvD1 = (ok[5] && ok[8]) ? (v[0] - 0.5 * (v[5] + v[8])) * sizePixels : float2(0.0, 0.0);
     float2 curvD2 = (ok[6] && ok[7]) ? (v[0] - 0.5 * (v[6] + v[7])) * sizePixels : float2(0.0, 0.0);
-    maxCurvaturePx = max(max(length(curvH), length(curvV)), max(length(curvD1), length(curvD2)));
+    maxCurvaturePx = sqrt(max(max(dot(curvH, curvH), dot(curvV, curvV)),
+                             max(dot(curvD1, curvD1), dot(curvD2, curvD2))));
 
-    float gradX  = (ok[3] && ok[4]) ? length((v[4] - v[3]) * sizePixels) * 0.5 : 0.0;
-    float gradY  = (ok[1] && ok[2]) ? length((v[2] - v[1]) * sizePixels) * 0.5 : 0.0;
-    float gradD1 = (ok[5] && ok[8]) ? length((v[8] - v[5]) * sizePixels) * (0.25 * kSqrt2) : 0.0;
-    float gradD2 = (ok[6] && ok[7]) ? length((v[7] - v[6]) * sizePixels) * (0.25 * kSqrt2) : 0.0;
-    maxPairGradPx = max(max(gradX, gradY), max(gradD1, gradD2));
+    // The pair grads' constant scale factors fold into their squared forms
+    // ((0.5)^2 = 1/4; (0.25*sqrt2)^2 = 1/8); masked pairs are zero vectors.
+    float2 dX  = (ok[3] && ok[4]) ? (v[4] - v[3]) * sizePixels : float2(0.0, 0.0);
+    float2 dY  = (ok[1] && ok[2]) ? (v[2] - v[1]) * sizePixels : float2(0.0, 0.0);
+    float2 dD1 = (ok[5] && ok[8]) ? (v[8] - v[5]) * sizePixels : float2(0.0, 0.0);
+    float2 dD2 = (ok[6] && ok[7]) ? (v[7] - v[6]) * sizePixels : float2(0.0, 0.0);
+    maxPairGradPx = sqrt(max(max(dot(dX, dX) * 0.25, dot(dY, dY) * 0.25),
+                             max(dot(dD1, dD1) * 0.125, dot(dD2, dD2) * 0.125)));
 }
 
 // ============================================================================

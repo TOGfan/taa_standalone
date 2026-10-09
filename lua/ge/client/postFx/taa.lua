@@ -851,12 +851,9 @@ M.defaultSettings = {
     velRejection                  = 1.5,
     velGradientScale              = 1.0,
     crossTestStrength             = 0.35,
-    autoSharpen                   = 1.0,
-    -- Auto mode: the parity target fraction. 0.85 default: the raw frame's
-    -- acutance includes above-Nyquist foldover energy at hard edges, so
-    -- strict parity (1.0) over-sharpens them; ~0.85 discounts it. Note this
-    -- is an ENERGY fraction (0.5 ~= 71% amplitude restoration).
-    sharpness                     = 0.85,
+    -- Manual RCAS strength (0 disables; 1 is the maximum lobe RCAS permits
+    -- -- very strong; ~0.3-0.5 is the typical range).
+    sharpness                     = 0.35,
     debugMode                     = 0.0,
     useDepthDilation              = 1.0,
     -- Gates the resolve's stored-field analysis (dilation validation, the
@@ -932,11 +929,7 @@ function M.applySettings(inputs)
         pre:setShaderConst("$taaFeedbackMax",             s.feedbackMax)
         pre:setShaderConst("$taaVarianceGamma",           s.varianceGamma)
         pre:setShaderConst("$taaClipScopedMu",            s.clipScopedMu)
-        -- Gates the resolve's acutance metric + transport EWMA (and, with
-        -- the clip memory off, the entire historyStateTex fetch) on the
-        -- final pass actually consuming the transport.
-        pre:setShaderConst("$taaAcutanceActive",
-            ((tonumber(s.autoSharpen) or 0) > 0.5 and (tonumber(s.sharpness) or 0) > 0.001) and 1 or 0)
+
         -- The camera's forward displacement this frame (units of 1/rawDepth);
         -- 0 = the shader measures T_y locally. The host could provide this
         -- from the camera hook (res.pos delta dotted with the previous
