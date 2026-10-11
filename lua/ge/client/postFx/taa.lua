@@ -316,18 +316,17 @@ end
 -- 12.33) reads the fit with ~1% mid-range error -- immaterial next to the
 -- F-model's own accuracy.
 --
--- v3.9: the gate consumes the fit at its OWN per-pixel estimation dofs
--- (Satterthwaite over the record + spatial components -- the flats' SCOPED
--- mu share at its resid-fit dof n_eff - 3 (~2.6 at the default
--- jitter-centered weights, ~4.1 for plain table weights; the shader
--- computes it from the live invNeff), engaged steps at cusumStepDof ~ 4-6,
--- the transported record at StudentEffectiveDof). The anchors bracket the
--- TYPICAL range, not a hard bound: recordSampleDof can reach ~8 on
--- near-uniform weights (nu_inf ~ 99) and kClipMaxAge caps the aged record
--- at nu ~ 66 -- the rational form extrapolates benignly there (S -> 1).
--- Reads slightly BELOW nu0 = 4 (the flat mu path can land at ~2.6) sit in
--- the rational form's weak zone, where it under-inflates relative to the
--- exact S (fit(2.6) ~ 3.9 vs exact ~4.7): tight-side only, never wide.
+-- v3.11: the hierarchical gate consumes the fit at its OWN per-pixel
+-- Satterthwaite dofs: the record-derived share (varH + w^2*sPer) at the
+-- record's clock, the prior's share (the plane's estimation variance plus
+-- the temporally-stable structural term) at the resid-fit dof n_eff - 3
+-- with tauB2's difference-noise folded into its denominator, and the
+-- engaged steps at cusumStepDof. The anchors still bracket the typical
+-- range (the flat path lands at ~3-8); recordSampleDof can reach ~8 on
+-- near-uniform weights and kClipMaxAge caps the aged record at nu ~ 66 --
+-- the rational form extrapolates benignly there. Reads slightly BELOW
+-- nu0 = 4 sit in the rational form's weak zone, where it under-inflates
+-- relative to the exact S: tight-side only, never wide.
 -- The F(3,nu) law itself formally assumes one shared chi^2 denominator
 -- across the three channels; the per-channel estimates share the same
 -- taps, so the law is exact for gray/near-gray content and mildly
@@ -421,6 +420,84 @@ local function studentFitAB(chi)
     studentFitCacheChi, studentFitCacheA, studentFitCacheB = chi, A, B
     return A, B
 end
+
+-- ============================================================================
+-- THE ARMING CAP FIT (v3.11: exact, nu-aware)
+-- ----------------------------------------------------------------------------
+-- The record-vs-prior arming cap is the honest one-sided bound for a nu-dof
+-- variance estimate against its prior:
+--     cap(nu) = chi^2_nu(0.999) / nu
+-- fit as 1 + A/sqrt(nu) + B/nu, solved exactly at the record's dof
+-- trajectory endpoints (the same anchors the Student fit uses: nu0 = 4 at
+-- age 0, nu_inf ~ 74 converged):
+--     chi^2_4(0.999)  = 18.467  (the closed-form CDF 1 - e^{-x/2}(1+x/2),
+--                               inverted by bisection)  -> 4.6168
+--     chi^2_74(0.999) ~ 117.3    (Wilson-Hilferty; ~0.1% there) -> 1.585
+-- -> A ~ 4.37, B ~ 5.74. The rational form tracks the exact quantiles to
+-- better than 1% across [4, 74] (checked against the exact chi^2_10
+-- quantile: 2.954 vs 2.959). This retires the fixed 5.0 (whose "EMA-lag
+-- headroom" was arbitrary: a RISING variance never binds the cap -- the
+-- record lags below the current prior -- and the falling case is exactly
+-- the band-carryover fiction the cap exists to bound, where the honest
+-- quantile is the right threshold).
+-- MUST MATCH taaClip.h.hlsl's consumption (taaArmingA / taaArmingB).
+-- ============================================================================
+local function normQuantile(p)
+    -- Acklam's rational approximation to the inverse standard normal CDF
+    -- (|eps| < 1.15e-9) -- the one piece of numerics the WH anchor needs.
+    local a = { -3.969683028665376e+01,  2.209460984245205e+02, -2.759285104469687e+02,
+                 1.383577518672690e+02, -3.066479806614716e+01,  2.506628277459239e+00 }
+    local b = { -5.447609879822406e+01,  1.615858368580409e+02, -1.556989798598866e+02,
+                 6.680131188771972e+01, -1.328068155288572e+01 }
+    local c = { -7.784894002430293e-03, -3.223964580411365e-01, -2.400758277161838e+00,
+               -2.549732539343734e+00,  4.374664141464968e+00,  2.938163982698783e+00 }
+    local d = {  7.784695709041462e-03,  3.224671290700398e-01,  2.445134137142996e+00,
+                3.754408661907416e+00 }
+    local pLow, pHigh = 0.02425, 1.0 - 0.02425
+    if p < pLow then
+        local q = math.sqrt(-2.0 * math.log(p))
+        return (((((c[1]*q+c[2])*q+c[3])*q+c[4])*q+c[5])*q+c[6])
+             / ((((d[1]*q+d[2])*q+d[3])*q+d[4])*q+1.0)
+    elseif p <= pHigh then
+        local q = p - 0.5
+        local r = q * q
+        return (((((a[1]*r+a[2])*r+a[3])*r+a[4])*r+a[5])*r+a[6])*q
+             / (((((b[1]*r+b[2])*r+b[3])*r+b[4])*r+b[5])*r+1.0)
+    else
+        local q = math.sqrt(-2.0 * math.log(1.0 - p))
+        return -(((((c[1]*q+c[2])*q+c[3])*q+c[4])*q+c[5])*q+c[6])
+              / ((((d[1]*q+d[2])*q+d[3])*q+d[4])*q+1.0)
+    end
+end
+
+local function chiSq4Quantile(p)
+    -- exact: the nu=4 CDF is 1 - e^{-x/2}(1 + x/2) -- closed-form bisection.
+    -- (Only valid at nu = 4 = STUDENT_NU0, the young-record anchor; the
+    -- nu=4 closed form is why the anchor choice is also the convenient one.)
+    local lo, hi = 0.0, 64.0
+    for _ = 1, 48 do
+        local mid = 0.5 * (lo + hi)
+        local t = 0.5 * mid
+        if (1.0 - math.exp(-t) * (1.0 + t)) < p then lo = mid else hi = mid end
+    end
+    return 0.5 * (lo + hi)
+end
+
+local function studentArmingFit()
+    local nu0, nuInf = STUDENT_NU0, STUDENT_NUINF
+    local c0 = chiSq4Quantile(0.999) / nu0
+    local z = normQuantile(0.999)
+    local c1 = (nuInf + z * math.sqrt(2.0 * nuInf) + (2.0 / 3.0) * (z * z - 1.0)) / nuInf
+    -- solve 1 + A/sqrt(nu) + B/nu = cap at both anchors
+    local i0, i1 = 1.0 / math.sqrt(nu0), 1.0 / math.sqrt(nuInf)
+    local r0, r1 = c0 - 1.0, c1 - 1.0
+    local det = i0 * i1 * i1 - i1 * i0 * i0
+    local A = (r0 * i1 * i1 - r1 * i0 * i0) / det
+    local B = (i0 * r1 - i1 * r0) / det
+    return A, B
+end
+
+local ARMING_A, ARMING_B = studentArmingFit()
 
 -- ============================================================================
 -- JITTER PHASE ENERGY (the exact record seed's phase coefficient)
@@ -752,6 +829,12 @@ local function cusumHostConstants()
     -- rate-dependent constants are computed at the FASTEST configured rate
     -- so the charged responses are conservative upper bounds everywhere: a
     -- wider whitening / flip term can only slow detection, never false-alarm.
+    -- (varhResampleLoss is the one term whose error direction flips: the
+    -- fixed-point read gain D falls as the feedback rate rises, so
+    -- computing it at the fastest rate marginally over-damps slow-rate
+    -- pixels' transported varH -- a second-order effect on varH's small
+    -- gate share, and exact whenever feedbackMin == feedbackMax, the
+    -- default.)
     local a = 1.0 - math.min(tonumber(s.feedbackMin) or 0.97,
                               tonumber(s.feedbackMax) or 0.97)
     a = math.min(math.max(a, 0.001), 0.9)
@@ -863,11 +946,8 @@ M.defaultSettings = {
     -- re-registering it outside the resolve's pass chain).
     useMotionField                = 1.0,
     lumaVariance                  = 0.0,
-    -- C3 (see taaClip.h.hlsl): the gate's mu-share scoping. 1.0 =
-    -- residual-scoped -- the statistically exact mu variance; edge ghosts
-    -- clip at ~0.2x local contrast instead of ~0.5x. 0.0 = the conservative
-    -- full-E payment. Back off toward 0 (or raise the coverage radius) if
-    -- debug mode 11 shows static-content shrinkage (blue) on fine detail.
+    -- v3.11: INERT (the hierarchical gate replaced the mu-share scoping
+    -- entirely; kept so the UI's slider round-trips harmlessly).
     clipScopedMu                  = 1.0,
     useHullClipping               = 1.0,
     colorSpaceOklab               = 0.0,
@@ -928,7 +1008,6 @@ function M.applySettings(inputs)
         pre:setShaderConst("$taaFeedbackMin",             s.feedbackMin)
         pre:setShaderConst("$taaFeedbackMax",             s.feedbackMax)
         pre:setShaderConst("$taaVarianceGamma",           s.varianceGamma)
-        pre:setShaderConst("$taaClipScopedMu",            s.clipScopedMu)
 
         -- The camera's forward displacement this frame (units of 1/rawDepth);
         -- 0 = the shader measures T_y locally. The host could provide this
@@ -944,6 +1023,12 @@ function M.applySettings(inputs)
         local studentA, studentB = studentFitAB(chiEff)
         pre:setShaderConst("$taaStudentA",               studentA)
         pre:setShaderConst("$taaStudentB",               studentB)
+        -- The arming cap's nu-aware fit (see the ARMING CAP FIT block): the
+        -- exact chi^2_nu(0.999)/nu bound at the record's dof trajectory
+        -- endpoints, consumed as 1 + A/sqrt(nu) + B/nu at the live per-pixel
+        -- nu.
+        pre:setShaderConst("$taaArmingA",                ARMING_A)
+        pre:setShaderConst("$taaArmingB",                ARMING_B)
         -- v3.8: the winsor tail factors are gone -- the v3.3 content-scale
         -- cap replaced the W(nu) factor and WinsorTailFactor had no call
         -- site (the host fit was dead weight). The drift predict step's
@@ -975,8 +1060,8 @@ function M.applySettings(inputs)
             cusumConstantsLogged = true
             if log then
                 log("I", "TAA", string.format(
-                    "Accumulator host constants: flipAcc=%.2e noiseAcc=%.5f varhLoss=%.4f whiteLoss=%.4f (kernel: separable per-axis Kaiser, beta %.1f (6-tap) / %.1f (4-tap) by useKaiser6; VarH gains from the spectral fixed point -- MUST MATCH taaResample.h.hlsl)",
-                    flipAcc, noiseAcc, varhLoss, whiteLoss, KAISER6_BETA, KAISER4_BETA))
+                    "Accumulator host constants: flipAcc=%.2e noiseAcc=%.5f varhLoss=%.4f whiteLoss=%.4f armingA=%.4f armingB=%.4f (kernel: separable per-axis Kaiser, beta %.1f (6-tap) / %.1f (4-tap) by useKaiser6; VarH gains from the spectral fixed point -- MUST MATCH taaResample.h.hlsl; the arming pair MUST MATCH taaClip.h.hlsl)",
+                    flipAcc, noiseAcc, varhLoss, whiteLoss, ARMING_A, ARMING_B, KAISER6_BETA, KAISER4_BETA))
             end
         end
         -- The persistence detector's mode: 0 off / 1 armed / 2 telemetry /
