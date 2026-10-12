@@ -29,12 +29,20 @@
 // chi^2/16 (~0.49 mid-gray at the default chi 2.8). Brightness beyond that
 // on static content is the gate running hot, and the EMPIRICAL Student
 // factor is (A's 95th percentile) * 16 / chi^2. B marks engagement
-// (mdd > chi^2) with a blue tint.
+// (mdd > chi^2) with a blue tint. Post-v5.2 (the record dof corrected to
+// chi^2_1 and the third Student anchor), the B duty cycle on static content
+// should sit AT the nominal rate -- it sat below it before (the aged gate
+// was ~15% wide in radius). This is the primary verification view.
 //
-// v3.10: mode 11's B channel, in clipGhostReset=2 telemetry mode on flats,
-// is the persistence statistic |T|/alarm -- dim and stable on static scenes
-// (|T| < ~1), blooming along a real trail then decaying as the unlocked
-// corrector evicts it.
+// v5.2: mode 11's B channel, in clipGhostReset=2 telemetry mode, is the
+// CUSUM statistic lamMax/alarm. CAVEAT: the debug payload's 2 spare bits
+// cannot carry the two 6-bit accumulators, so while ANY debug mode is
+// active the transported accumulators read zero and B shows the per-frame
+// EVIDENCE INCREMENT (clamped at zero) instead of the integral: the null
+// reads black (increments <= 0), a persistent trail reads as a stable dim
+// region at its evidence rate. The accumulated statistic itself is
+// observable only through its actions (the corrector's effect, the blend
+// floor) -- or by the mode-13-style null audit above.
 //
 // FRAGMENT HEADER: compiled only inside taaFinal.fx.hlsl. Requires fragments
 // included before: taaShared.h.hlsl (UnpackDebugAlpha).
@@ -121,13 +129,11 @@ float3 RenderDebugView(uint code, float a, float b, bool revoked,
     // far the gate shrank the history toward the neighborhood mean,
     // post-soft-clip (0 = untouched; static content should sit near black
     // -- that is the tightness win); in clipGhostReset=2 telemetry mode, B
-    // = the fitted coverage on engaged steps and the persistence statistic
-    // |T|/alarm on flats (dim and stable on static scenes, |T| < ~1 against
-    // the 1.22-sigma null; blooming along a real trail, then decaying as
-    // the unlocked corrector evicts it -- THE detector verification view).
-    // A reveal reads as a one-frame reset flash at the departing edge; a
-    // persistent bright-B region on static content means either a trail
-    // being evicted (watch it clear) or a false-accumulating detector
+    // = the CUSUM evidence (the per-frame increment while debugging -- see
+    // the header; black on the null, a stable dim region along a real
+    // trail). A reveal reads as a one-frame reset flash at the departing
+    // edge; a persistent bright-B region on static content means either a
+    // trail being evicted (watch it clear) or a false-accumulating detector
     // (something is wrong).
     case 11: {
         float3 c = resultRGB * 0.1;
@@ -142,7 +148,7 @@ float3 RenderDebugView(uint code, float a, float b, bool revoked,
     case 12:
         return float3(a, a, 0.0);
 
-    // 13: the gate's realized null law (v3.9, the audit's calibration view).
+    // 13: the gate's realized null law (the audit's calibration view).
     // A = saturate(mdd/16) as the histogram channel (grayscale); the nominal
     // 95th percentile sits at chi^2/16 -- mid-gray at the default chi 2.8.
     // Park on a STATIC scene: brightness beyond the nominal point is the

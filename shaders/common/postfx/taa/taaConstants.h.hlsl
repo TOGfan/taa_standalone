@@ -30,12 +30,6 @@ static const float kFXAAMaxDir               = 8.0;
 static const float kFXAABlendKnee            = 0.8;
 static const float kFXAABlendSharpness       = 2.0;
 
-// Luma drift correction
-static const float kLumaDriftLumaFloor       = 0.05;
-static const float kLumaDriftRelThreshold    = 0.30;
-static const float kLumaDriftAbsThreshold    = 0.03;
-static const float kLumaDriftChromaFadeWidth = 2.0;
-
 // Current-frame pursuit confirmation tolerance
 static const float kPursuitVelBaseTolerancePx = 0.30;   // px: base divergence tolerance
 static const float kMinVelCoherenceRadiusPx   = 0.25;   // floor for the velocity-coherence radius
@@ -65,10 +59,6 @@ static const float kCenterLandingFracPx      = 0.1;
 // unmeasurable we assume |T_y|/w below this fraction.
 static const float kMinParallaxInfoPx2       = 2.0;
 static const float kTyUnmeasuredFrac         = 0.02;
-
-
-
-
 
 // Debug views
 static const float kDebugVelocityScale       = 0.1;

@@ -16,11 +16,10 @@
 //   7-10)  exact jitter plumbing, the own-history dilation validation, the
 //          history landing analysis, the depth/velocity disocclusion tests.
 //          [GEOMETRY]
-//   11)    THE FLAT MODEL (taaClip v5.0): the coupled-plane statistics,
-//          the plain record, the level gate (the hierarchical posterior +
-//          the soft clip), the persistence detector on the pixel's OWN
-//          phase-corrected innovation (T / Tc), the confirmed-only
-//          full-strength corrector, the blend, the VarH recursion.
+//   11)    THE FLAT MODEL (taaClip v5.3): the coupled-plane statistics,
+//          the plain record, the structure split's transport, the level
+//          gate (the hierarchical posterior + the soft clip), the blend,
+//          the VarH recursion.
 //
 // OUTPUT: RGB = the resolved color. A = the packed CLIP STATE (tag 101).
 // Debug modes carry tag 001.
@@ -28,9 +27,8 @@
 // DEBUG MODES: 0 off | 1 frame motion | 2 disocclusion breakdown |
 //   3 center velocity | 4 linearized depth | 5 history color | 6 landing
 //   velocity | 7 pursuit divergence | 8 layer state | 9 dilation gate |
-//   10 alignment drop | 11 clip gate state (telemetry: dbgB =
-//   max(|T|,Tc)/alarm -- the detector verification view) | 12 dejittered
-//   residual | 13 gate null law (calibration: dbgA = saturate(mdd/16)).
+//   10 alignment drop | 11 clip gate state | 12 dejittered residual |
+//   13 gate null law (calibration: dbgA = saturate(mdd/16)).
 // ============================================================================
 
 #include "shaders/common/postFx/postFx.h.hlsl"
@@ -60,9 +58,7 @@ cbuffer perDraw
     float  taaVelocityAlignedVariance;      float  taaAlignmentFeedbackDrop;
     float  taaMotionBlendDropSpeed;         float  taaUseKaiser6;
     float  taaFallbackFXAA;
-    float  taaMotionBlendStart;             float  taaClipDistanceRejectionEnabled;
-    float  taaClipDistanceRejectionAmount;  float  taaClipDistanceRejectionMinError;
-    float  taaDebugMode;
+    float  taaMotionBlendStart;             float  taaDebugMode;
     float  taaCurPX;                        float  taaCurPY;
     float  taaCurPZ;                        float  taaCurQX;
     float  taaCurQY;                        float  taaCurQZ;
@@ -72,18 +68,16 @@ cbuffer perDraw
     float  taaPrevQX;                       float  taaPrevQY;
     float  taaPrevQZ;                       float  taaPrevRX;
     float  taaPrevRY;                       float  taaPrevRZ;
-    float  taaHistoryOvershoot;             float  taaLumaDriftStrength;
-    float  taaLumaDriftChromaTol;           float  taaClipOvershoot;
+    float  taaHistoryOvershoot;             float  taaClipOvershoot;
     float  taaVelRejection;                 float  taaVelGradientScale;
     float  taaDepthParallaxStep;            float  taaCrossTestStrength;
     float  taaJitPrev2YawSin;               float  taaJitPrev2YawCos;
-    float  taaJitPrev2PitchSin;            float  taaJitPrev2PitchCos;
+    float  taaJitPrev2PitchSin;             float  taaJitPrev2PitchCos;
     float  taaStudentA;                     float  taaStudentB;
+    float  taaStudentC;
     float  taaArmingA;                      float  taaArmingB;
-    float  taaDriftCompensation;            float  taaDriftMaxGain;
     float  taaJitterPhaseEx;                float  taaJitterPhaseEy;
     float  taaJitterPhaseExy;
-    float  taaClipGhostReset;
     float  taaVarhResampleLoss;             float  taaVarhWhiteLoss;
 
     float2 oneOverTargetSize;
@@ -202,7 +196,7 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
         bool  earlyRevoked = currentLayer.isDilationZone;
         float earlyAlpha  = debugActive
             ? PackDebugAlpha(earlyRevoked, dbgCode, saturate(dbgA), saturate(dbgB), 0.0)
-            : PackClipStateAlpha(earlyRevoked, 0.0, 28.0, 0.0, 32.0, 32.0);
+            : PackClipStateAlpha(earlyRevoked, 0.0, 1820.0, 0.0, 32.0);
 
         if (fxaaEnabled)
         {
@@ -328,29 +322,23 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
     bool disoccluded = depthRejected || velocityRejection.rejected;
 
     // ------------------------------------------------------------------
-    // 11) THE FLAT MODEL: the state, the statistics, the detector, the
+    // 11) THE FLAT MODEL: the state, the statistics, the split, the
     //     record, the gate.
     // ------------------------------------------------------------------
     bool  temporalStateEnabled = (taaUseHullClipping > 0.5);
     float sigmaPrevSq = -1.0;
     float varHPrevSq  = 0.0;
     float agePrev     = 0.0;
-    float ghostTPrev  = 0.0;
-    float ghostTcPrev = 0.0;
+    float splitPrev   = 0.0;
 
     if (temporalStateEnabled)
     {
         float2 stateUV = SnapUVToTexel(repro.sampleUV, vp).snappedUV;
         DecodeClipState(tex2Dlod(historyStateTex, float4(stateUV, 0.0, 0.0)).a,
-                        sigmaPrevSq, varHPrevSq, agePrev, ghostTPrev, ghostTcPrev);
+                        sigmaPrevSq, varHPrevSq, agePrev, splitPrev);
     }
 
     bool hadRecord = (sigmaPrevSq >= 0.0);
-
-    bool ghostModeOn    = (taaClipGhostReset > 0.5);
-    bool ghostSoft      = ((taaClipGhostReset > 0.5) && (taaClipGhostReset < 1.5)) || (taaClipGhostReset > 2.5);
-    bool ghostTelemetry = (taaClipGhostReset > 1.5) && (taaClipGhostReset < 2.5);
-    bool ghostHard      = (taaClipGhostReset > 2.5);
 
     // The uniform-velocity pre-test: the transport floor's cheap gate (a
     // uniform 3x3 provably measures the quantization floor).
@@ -382,14 +370,6 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
         neighborhoodColorSpace, repro.motionDirUnit, repro.motionNormalized,
         pixel.fracPx, transportErrPx);
 
-    // The confirmation weight, from the TRANSPORTED statistics (last
-    // frame's T/Tc): the corrector consumes it before this frame's
-    // detector update -- the predict-then-measure order whose fixed
-    // point is the eviction.
-    float confirmW = ghostSoft
-        ? saturate((max(abs(ghostTPrev), ghostTcPrev) - kGhostConfirmT) / (kGhostAlarmT - kGhostConfirmT))
-        : 0.0;
-
     // ---- the record's split (PRE-update; the model's own composition) ----
     float nuPrev = StudentEffectiveDof(agePrev, kRecordIngestDof);
     RecordVarianceParts partsLive;
@@ -410,73 +390,12 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
     if (!(dot(historyColorSpace, historyColorSpace) < kLargeValue))
         historyColorSpace = colorStats.plane0;
 
-    // ---- the innovation, pre-corrector (the full-strength offset) ----
-    float3 innovCorrPre = (currentColorSpace - historyColorSpace) - colorStats.phaseShift;
-
-    // ---- THE CONFIRMED CORRECTOR (per-pixel, full strength) ----
-    // Confirmed, the action is the full measured magnitude at the full
-    // gain, capped by the content belt; the stored history absorbs it, so
-    // next frame's innovation measures the residual: convergence in
-    // ~1/gain frames. The detector's flip immunity is what makes this
-    // safe at edges: the phase flip is zero-mean over the sequence, so
-    // only persistent offsets (lighting drift, sub-gate trails) confirm.
-    float3 driftCorr = float3(0.0, 0.0, 0.0);
-    if (taaDriftCompensation > 0.5 && confirmW > 0.0)
-    {
-        float3 sigmaC = max(colorStats.sigmaClean, sqrt(partsLive.sPer));
-        float3 driftCap = kDriftCapSigmas * sigmaC;
-        float3 gain = saturate(taaDriftMaxGain) * confirmW;
-        driftCorr = clamp(innovCorrPre * gain, -driftCap, driftCap);
-        historyColorSpace += driftCorr;
-    }
-
     if (taaHistoryOvershoot > 0.001 || taaColorSpaceOklab > 0.5)
         historyColorSpace = CompressGamut(historyColorSpace);
 
-    // ---- the innovation, post-corrector (the stream the accumulator
-    //      actually processes; the record, the spike and the corroboration
-    //      price this one object) ----
+    // ---- the innovation (the stream the record and the spike price) ----
     float3 innov   = currentColorSpace - historyColorSpace;
     float  innovSq = dot(innov, innov);
-
-    // ---- THE PERSISTENCE DETECTOR (T / Tc) ----
-    // The input is the pixel's OWN phase-corrected innovation, integrated
-    // over time. The null: the fresh noise + the read residual + the
-    // transport scatter + the phase correction's own error. ONE guard: a
-    // kept dilation band's stored history legitimately holds the borrowed
-    // layer (the pre-load for re-occlusion) -- geometry, not persistence
-    // evidence. (Revoked bands re-classify as background before this
-    // point and keep the full machinery.)
-    float ghostT  = ghostTPrev;
-    float ghostTc = ghostTcPrev;
-    if (ghostModeOn && hadRecord && !currentLayer.isDilationZone)
-    {
-        float3 varT = partsLive.sPer + partsLive.varHPer + colorStats.transportVar
-                    + colorStats.phaseErrScale * colorStats.residSq;
-        varT = max(varT, float3(kClipSigmaRecordFloorSq, kClipSigmaRecordFloorSq, kClipSigmaRecordFloorSq));
-
-        float tFrame = innovCorrPre.x / sqrt(max(varT.x, 1e-12));
-        tFrame = clamp(tFrame, -6.0, 6.0);
-        ghostT = (1.0 - kGhostEmaRate) * ghostTPrev
-               + (kGhostEmaRate * kGhostEmaNorm) * tFrame;
-        ghostT = clamp(ghostT, -7.75, 7.75);
-
-        float chromaNullMean, chromaNullVar;
-        GhostChromaNullMoments(colorStats, chromaNullMean, chromaNullVar);
-        float chromaScale = sqrt(kGhostNullStdSq / max(chromaNullVar, 0.25));
-        float tCy = innovCorrPre.y / sqrt(max(varT.y, 1e-12));
-        float tCz = innovCorrPre.z / sqrt(max(varT.z, 1e-12));
-        float tC  = max(length(float2(tCy, tCz)) - chromaNullMean, 0.0) * chromaScale;
-        tC = min(tC, 6.0);
-        ghostTc = (1.0 - kGhostEmaRate) * ghostTcPrev
-                + (kGhostEmaRate * kGhostEmaNorm) * tC;
-        ghostTc = clamp(ghostTc, -7.75, 7.75);
-    }
-
-    float evL = (abs(ghostT) > kGhostConfirmT) ? (kGhostEvCoef * ghostT * ghostT - 0.34657) : 0.0;
-    float evC = (ghostTc > kGhostConfirmT)     ? (kGhostEvCoef * ghostTc * ghostTc - 0.34657) : 0.0;
-    float ghostEvNats = ghostSoft ? max(evL, evC) : 0.0;
-    bool  ghostAlarm  = ghostHard && (abs(ghostT) >= kGhostAlarmT || ghostTc >= kGhostAlarmT);
 
     // ---- change-points ----
     float spikeRefSq = max(sigmaPrevSq, colorStats.rangeSq)
@@ -496,6 +415,26 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
     bool  resetRecord = hadRecord
         && (spike || !(innovSq < kLargeValue) || geoCorroborated);
     bool  carryRecord = hadRecord && !resetRecord;
+
+    // ---- THE STRUCTURE SPLIT'S TRANSPORT (v5.3) ----
+    // The signed normalized fraction f = (R - s)/max(R, s): the spatial
+    // residual total against the record's per-sample total. EMA'd, 6-bit
+    // packed; the gate reconstructs tauB2 = max(f,0)*residSq. The clamp
+    // lives on the STABLE side (see taaClip's header). A fresh record
+    // certifies nothing (the seed >= R by construction, so f <= 0 cold);
+    // a disocclusion restarts the split with the new content.
+    float splitFracNext;
+    {
+        float residTotal = dot(colorStats.residSq, float3(1.0, 1.0, 1.0));
+        float sPerTotal  = hadRecord
+            ? max(sigmaPrevSq - varHPrevSq, kClipSigmaRecordFloorSq)
+            : max(SeedRecordTotalSq(colorStats), kClipSigmaRecordFloorSq);
+        float fRaw = clamp((residTotal - sPerTotal)
+                           / max(max(residTotal, sPerTotal), kEpsilon), -1.0, 1.0);
+        splitFracNext = (carryRecord && !disoccluded)
+            ? lerp(splitPrev, fRaw, kSplitEmaRate)
+            : fRaw;
+    }
 
     // ---- the record: the plain single-sample ingest ----
     float winsorCap  = kClipWinsorC * kClipWinsorC
@@ -517,9 +456,9 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
     ClipGateResult clipGate = ClipHistoryToStatisticGate(
         historyColorSpace, currentColorSpace, colorStats, partsLive,
         carryRecord, carryRecord ? agePrev : 0.0,
+        splitPrev,
         repro.motionNormalized,
-        neighborhoodColorSpace,
-        ghostEvNats);
+        neighborhoodColorSpace);
     float3 clippedHistorySpace = clipGate.clippedColorSpace;
 
     // ---- DEBUG PAYLOAD STASH ----------------------------------------------
@@ -595,9 +534,7 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
         {
             dbgCode = 11.0;
             dbgA = carryRecord ? 1.0 : (hadRecord ? 0.35 : 0.15);
-            dbgB = ghostTelemetry
-                ? saturate(max(abs(ghostT), ghostTc) * (1.0 / kGhostAlarmT))
-                : 1.0 - clipGate.tGate;
+            dbgB = 1.0 - clipGate.tGate;
         }
         else if (taaDebugMode > 11.5 && taaDebugMode < 12.5)   // 12: dejittered residual
         {
@@ -614,27 +551,13 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
         }
     }
 
-    float clipDistanceRejection = 0.0;
-    if (taaClipDistanceRejectionEnabled > 0.5)
-        clipDistanceRejection = ComputeClipDistanceRejection(
-            clippedHistorySpace, historyColorSpace, colorStats);
-
-    ApplyLumaDriftCorrection(clippedHistorySpace, currentColorSpace, colorStats);
-
     // ------------------------------------------------------------------
     // 12) Feedback & the temporal blend.
     // ------------------------------------------------------------------
-    float historyFeedback    = ComputeHistoryFeedback(repro, clipDistanceRejection, currentSingleLayer);
+    float historyFeedback    = ComputeHistoryFeedback(repro, currentSingleLayer);
     float currentBlendWeight = 1.0 - historyFeedback;
 
-    // The replacement posterior floors the blend: the CONFIRMED persistence
-    // evidence only.
-    currentBlendWeight = max(currentBlendWeight, clipGate.p1);
-
     if (disoccluded)
-        currentBlendWeight = 1.0;
-
-    if (ghostAlarm)
         currentBlendWeight = 1.0;
 
     float3 currentFrameColorSpace = currentColorSpace;
@@ -657,8 +580,10 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
     blendedColorSpace.x = max(blendedColorSpace.x, 0.0);
     float3 outputRGB = max(FromSpace(blendedColorSpace), 0.0);
 
-    // ---- the VarH recursion (READ semantics; the host-measured gains) ----
-    float varHCodeNext = 12.0;
+    // ---- the VarH recursion (READ semantics; the host-measured gains;
+    //      12-bit transport -- the quantization is no longer an error
+    //      source) ----
+    float varHCodeNext = 1820.0;
     {
         float aBlend = currentBlendWeight;
         float dampGain  = 1.0 - saturate(taaVarhResampleLoss);
@@ -684,12 +609,11 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
         }
     }
 
-    // ---- the persistence statistics' transport (0.25-quanta codes) ----
-    float ghostCodeNext  = clamp(round(ghostT * 4.0) + 32.0, 1.0, 63.0);
-    float ghostCodeCNext = clamp(round(ghostTc * 4.0) + 32.0, 1.0, 63.0);
+    // ---- the packed output ----
+    float splitCodeNext = clamp(round((splitFracNext + 1.0) * 32.0), 0.0, 63.0);
     float outAlpha = debugActive
         ? PackDebugAlpha(dilationRevoked, dbgCode, saturate(dbgA), saturate(dbgB), sqrt(sigmaStatSq))
-        : PackClipStateAlpha(dilationRevoked, sqrt(sigmaStatSq), varHCodeNext, ageNext, ghostCodeCNext, ghostCodeNext);
+        : PackClipStateAlpha(dilationRevoked, sqrt(sigmaStatSq), varHCodeNext, ageNext, splitCodeNext);
     return float4(outputRGB, outAlpha);
 }
 

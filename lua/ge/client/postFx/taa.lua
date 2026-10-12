@@ -302,49 +302,41 @@ end
 -- ----------------------------------------------------------------------------
 -- The gate's sampling law is F(3, nu), nu = the record's effective dof
 -- (Satterthwaite; taaClip.h.hlsl): nu = 1 / [D/nu0 + varFrac(r)(1-D)] with
--- D = (1-rho)^{2t} and varFrac(r) = rho / (r (2-rho)), r = the LIVE
--- per-draw dof (the spatial covariance's effective rank, measured per pixel
--- by the shader; 3 for diverse RGB content, 1 for gray). The variance
--- inflation restoring the NOMINAL chi-coverage is
+-- D = (1-rho)^{2t} and varFrac(r) = rho / (r (2-rho)), r = the ingest's
+-- chi^2 dof. The variance inflation restoring the NOMINAL chi-coverage is
 --     S(nu) = 3 * F^-1_{3,nu}(p) / chi^2,   p = CDF_chi2_3(chi^2),
 -- a function of the slider: S(4) is 1.18 at chi = 1.5 and 2.52 at 2.8 --
 -- a fixed constant cannot serve both. The host fits
---     S(nu) = 1 + A/nu + B/nu^2
--- exactly at the trajectory's two extremes. The pin uses r = 6 (the 9-tap
--- estimator's typical kernel-weighted effective count since v3.8.4:
--- nu_inf = 6 * (2-rho)/rho ~ 74). Gray content (r -> 1, true nu_inf =
--- 12.33) reads the fit with ~1% mid-range error -- immaterial next to the
--- F-model's own accuracy.
+--     S(nu) = 1 + A/nu + B/nu^2 + C/nu^3
+-- exactly at THREE anchors: the Satterthwaite clamp floor (nu = 2 -- the
+-- old two-term form's weak zone, where it under-inflated: tight-side,
+-- flicker-side only), the young record (nu0) and the converged record
+-- (nu_inf). The rational form extrapolates benignly above nu_inf.
 --
--- v3.11: the hierarchical gate consumes the fit at its OWN per-pixel
--- Satterthwaite dofs: the record-derived share (varH + w^2*sPer) at the
--- record's clock, the prior's share (the plane's estimation variance plus
--- the temporally-stable structural term) at the resid-fit dof n_eff - 3
--- with tauB2's difference-noise folded into its denominator, and the
--- engaged steps at cusumStepDof. The anchors still bracket the typical
--- range (the flat path lands at ~3-8); recordSampleDof can reach ~8 on
--- near-uniform weights and kClipMaxAge caps the aged record at nu ~ 66 --
--- the rational form extrapolates benignly there. Reads slightly BELOW
--- nu0 = 4 sit in the rational form's weak zone, where it under-inflates
--- relative to the exact S: tight-side only, never wide.
+-- v5.2 (dof corrected): the record ingests the pixel's own squared
+-- innovation -- a single squared Gaussian, chi^2_1 -- so the honest ingest
+-- dof is r = 1.0 and the converged limit is nu_inf = (2-rho)/rho = 12.33.
+-- v4.1's r = 0.5 was the relative-variance INVERSE (1/2), half the dof:
+-- the varFrac convention's r counts chi^2 dof (a chi^2_r/r-scaled estimate
+-- has relative variance 2/r; the EMA's Satterthwaite reciprocal dof is
+-- rho/(r (2-rho))), so the corrected fit tightens the aged gate ~15% in
+-- radius and the arming cap ~26%, coverage-neutrally (the fit re-solves S
+-- at the exact F quantile). The historical r = 6 (the v3.8.4 spatial
+-- estimator, ~6 quasi-independent taps) was honest in the same convention:
+-- nu_inf = 74 for THAT estimator.
+--
 -- The F(3,nu) law itself formally assumes one shared chi^2 denominator
 -- across the three channels; the per-channel estimates share the same
 -- taps, so the law is exact for gray/near-gray content and mildly
 -- approximate for decorrelated RGB (second-order next to the dof
 -- modeling).
 --
--- MUST MATCH taaClip.h.hlsl: kClipSigmaEmaRate (rho) and
--- kClipStudentPriorDof (nu0).
+-- MUST MATCH taaClip.h.hlsl: kClipSigmaEmaRate (rho), kClipStudentPriorDof
+-- (nu0) and kRecordIngestDof (the ingest dof, 1.0).
 -- ============================================================================
 local STUDENT_RHO   = 0.15                              -- kClipSigmaEmaRate
 local STUDENT_NU0   = 4.0                               -- kClipStudentPriorDof
--- v4.1: the record ingests the pixel's own squared innovation (the
--- spatial estimator is gone). Var(i^2)/E[i^2]^2 = 2 for Gaussian i, and
--- the varFrac convention (per-frame relative variance = 1/r) gives
--- r = 1/2 -> nu_inf ~ 6.2. This is the honest dof of the single-sample
--- EMA; the aged Student factor widens accordingly, and the widened gate's
--- shelter is supervised by the (now undiluted) persistence detector.
-local STUDENT_NUINF = 0.5 * (2.0 - STUDENT_RHO) / STUDENT_RHO -- ~6.17 (r = 0.5)
+local STUDENT_NUINF = 1.0 * (2.0 - STUDENT_RHO) / STUDENT_RHO -- 12.33 (r = kRecordIngestDof = 1)
 
 local function erfApprox(x)  -- Abramowitz & Stegun 7.1.26 (|eps| <= 1.5e-7)
     local sign = 1.0
@@ -397,49 +389,64 @@ local function f3nuQuantile(p, nu)
     return nu * u / (3.0 * (1.0 - u))
 end
 
-local studentFitCacheChi, studentFitCacheA, studentFitCacheB
+local studentFitCacheChi, studentFitCacheA, studentFitCacheB, studentFitCacheC
 
-local function studentFitAB(chi)
+local function studentFitABC(chi)
     chi = tonumber(chi) or 2.8
     if chi < 0.25 then chi = 0.25 end
-    if studentFitCacheChi == chi then return studentFitCacheA, studentFitCacheB end
+    if studentFitCacheChi == chi then return studentFitCacheA, studentFitCacheB, studentFitCacheC end
 
     local c2 = chi * chi
     local p = math.min(math.max(chiSq3Cdf(c2), 1e-6), 1.0 - 1e-6)
 
-    local s0 = 3.0 * f3nuQuantile(p, STUDENT_NU0) / c2    -- age 0
-    local s1 = 3.0 * f3nuQuantile(p, STUDENT_NUINF) / c2  -- converged
+    -- Three exact anchors: nu = 2 (the Satterthwaite clamp floor -- closes
+    -- the old two-term form's under-inflating weak zone), nu0, nu_inf.
+    local s2 = 3.0 * f3nuQuantile(p, 2.0) / c2
+    local s0 = 3.0 * f3nuQuantile(p, STUDENT_NU0) / c2
+    local s1 = 3.0 * f3nuQuantile(p, STUDENT_NUINF) / c2
 
-    -- Solve 1 + A/nu + B/nu^2 = S at both anchors (2x2 in 1/nu).
-    local i0, i1 = 1.0 / STUDENT_NU0, 1.0 / STUDENT_NUINF
-    local r0, r1 = s0 - 1.0, s1 - 1.0
-    local det = i0 * i1 * (i1 - i0)
-    local A = (r0 * i1 * i1 - r1 * i0 * i0) / det
-    local B = (i0 * r1 - i1 * r0) / det
+    -- Solve 1 + A/nu + B/nu^2 + C/nu^3 = S at all three anchors
+    -- (Vandermonde in x = 1/nu; tiny Gaussian elimination, cached per chi).
+    local x = { 0.5, 1.0 / STUDENT_NU0, 1.0 / STUDENT_NUINF }
+    local r = { s2 - 1.0, s0 - 1.0, s1 - 1.0 }
+    local m = {}
+    for i = 1, 3 do
+        m[i] = { x[i], x[i] * x[i], x[i] * x[i] * x[i], r[i] }
+    end
+    for col = 1, 3 do
+        for row = col + 1, 3 do
+            local f = m[row][col] / m[col][col]
+            for k = col, 4 do m[row][k] = m[row][k] - f * m[col][k] end
+        end
+    end
+    local C = m[3][4] / m[3][3]
+    local B = (m[2][4] - m[2][3] * C) / m[2][2]
+    local A = (m[1][4] - m[1][3] * C - m[1][2] * B) / m[1][1]
 
-    studentFitCacheChi, studentFitCacheA, studentFitCacheB = chi, A, B
-    return A, B
+    studentFitCacheChi = chi
+    studentFitCacheA, studentFitCacheB, studentFitCacheC = A, B, C
+    return A, B, C
 end
 
 -- ============================================================================
--- THE ARMING CAP FIT (v3.11: exact, nu-aware)
+-- THE ARMING CAP FIT (exact, nu-aware)
 -- ----------------------------------------------------------------------------
 -- The record-vs-prior arming cap is the honest one-sided bound for a nu-dof
 -- variance estimate against its prior:
 --     cap(nu) = chi^2_nu(0.999) / nu
 -- fit as 1 + A/sqrt(nu) + B/nu, solved exactly at the record's dof
--- trajectory endpoints (the same anchors the Student fit uses: nu0 = 4 at
--- age 0, nu_inf ~ 74 converged):
---     chi^2_4(0.999)  = 18.467  (the closed-form CDF 1 - e^{-x/2}(1+x/2),
---                               inverted by bisection)  -> 4.6168
---     chi^2_74(0.999) ~ 117.3    (Wilson-Hilferty; ~0.1% there) -> 1.585
--- -> A ~ 4.37, B ~ 5.74. The rational form tracks the exact quantiles to
--- better than 1% across [4, 74] (checked against the exact chi^2_10
--- quantile: 2.954 vs 2.959). This retires the fixed 5.0 (whose "EMA-lag
--- headroom" was arbitrary: a RISING variance never binds the cap -- the
+-- trajectory endpoints (nu0 = 4 at age 0, nu_inf = 12.33 converged -- the
+-- v5.2 corrected ingest dof; the aged record at kClipMaxAge sits at
+-- nu ~ 12.1, essentially converged):
+--     chi^2_4(0.999)      = 18.467  (the closed-form CDF 1 - e^{-x/2}(1+x/2),
+--                                    inverted by bisection)  -> 4.6168
+--     chi^2_12.33(0.999) ~ 33.4     (Wilson-Hilferty; ~0.1% there) -> 2.71
+-- -> A ~ 4.35, B ~ 5.77. The rational form tracks the exact quantiles to
+-- better than 1% across [4, 12.33] (checked against the exact chi^2_10
+-- quantile: 2.951 vs 2.959). A rising variance never binds the cap -- the
 -- record lags below the current prior -- and the falling case is exactly
 -- the band-carryover fiction the cap exists to bound, where the honest
--- quantile is the right threshold).
+-- quantile is the right threshold.
 -- MUST MATCH taaClip.h.hlsl's consumption (taaArmingA / taaArmingB).
 -- ============================================================================
 local function normQuantile(p)
@@ -500,27 +507,22 @@ end
 local ARMING_A, ARMING_B = studentArmingFit()
 
 -- ============================================================================
--- JITTER PHASE ENERGY (the exact record seed's phase coefficient)
+-- JITTER PHASE COVARIANCE (v3.8.4: the FULL 2x2, per-axis and cross)
 -- ----------------------------------------------------------------------------
--- E[u_axis^2] of the ACTUAL jitter sequence, in texels^2. The seed models
--- the temporal variance of the innovation's phase bit (-beta * u) as
--- E[u^2] * |beta|^2, and the snap offset u IS the applied jitter in texels
--- (sub-texel jitter: |u| < 0.5, no wrap). Enumerating the exact sequence
--- (the same halton/r2 code, periods, and centering as the camera hook in
--- ge/extensions/taa.lua) makes the coefficient exact for the configured
--- sequence and scale -- for the default R2/32 sequence it lands within a
--- few percent of the uniform 1/12.
--- (v3.8.4: superseded by the CENTERED 2x2 covariance below -- the phase
--- bit is measured against the accumulated phase average, so the
--- coefficient is Var(u), not E[u^2].)
--- The shader applies ONE constant to both axes' gradients; the per-axis
--- energies differ only slightly over full periods, so the axis AVERAGE is
--- the least-squares constant (switch to math.max(ex, ey) for a strictly
--- anti-flicker-biased seed).
--- With jitter disabled the phase energy is exactly ZERO -- return a tiny
--- positive sentinel so the shader's "constant provided" gate engages the
--- exact (noise-only) seed instead of falling back to the legacy spatial
--- prior, which would over-seed a jitterless configuration.
+-- Var[u_x], Var[u_y], Cov[u_x, u_y] of the ACTUAL jitter sequence, in
+-- texels^2 -- CENTERED on the sequence mean. The innovation's phase bit is
+-- -g * (u_t - ubar): the current jitter measured against the ACCUMULATED
+-- phase average, and the accumulator's ~1/a-frame memory (~33 frames at
+-- default feedback ~ the sequence period) makes ubar the sequence mean.
+-- The shader consumes the quadratic form Q(g) = Ex*gx^2 + Ey*gy^2 +
+-- 2*Exy*gx*gy -- the variance of the jitter's projection on ANY direction
+-- (a centered covariance is PSD by construction, so Q >= 0 everywhere).
+-- Enumerating the exact sequence (the same halton/r2 code, periods and
+-- centering as the camera hook) makes the coefficients exact for the
+-- configured sequence and scale.
+-- With jitter disabled the energies are exactly ZERO -- tiny positive
+-- sentinels so the shader's "constant provided" gate engages the exact
+-- (noise-only) seed.
 -- ============================================================================
 local function halton(index, base)
     local f, r, i = 1.0, 0.0, index
@@ -534,27 +536,6 @@ local function r2_sequence(n)
     return (0.5 + a1 * n) % 1.0, (0.5 + a2 * n) % 1.0
 end
 
--- ============================================================================
--- JITTER PHASE COVARIANCE (v3.8.4: the FULL 2x2, per-axis and cross)
--- ----------------------------------------------------------------------------
--- Var[u_x], Var[u_y], Cov[u_x, u_y] of the ACTUAL jitter sequence, in
--- texels^2 -- CENTERED on the sequence mean. The innovation's phase bit is
--- -g * (u_t - ubar): the current jitter measured against the ACCUMULATED
--- phase average, and the accumulator's ~1/a-frame memory (~33 frames at
--- default feedback ~ the sequence period) makes ubar the sequence mean.
--- The UNCENTERED second moments the previous version shipped overstated
--- the energies by ubar^2 (~0.5% on R2/32, ~1-3% on Halton-16) -- a small,
--- strictly ghost-side slack, now removed.
--- The shader consumes the quadratic form Q(g) = Ex*gx^2 + Ey*gy^2 +
--- 2*Exy*gx*gy -- the variance of the jitter's projection on ANY direction
--- (a centered covariance is PSD by construction, so Q >= 0 everywhere).
--- Enumerating the exact sequence (the same halton/r2 code, periods and
--- centering as the camera hook) makes the coefficients exact for the
--- configured sequence and scale.
--- With jitter disabled the energies are exactly ZERO -- tiny positive
--- sentinels so the shader's "constant provided" gate engages the exact
--- (noise-only) seed.
--- ============================================================================
 local function jitterPhaseCovariance()
     local s = M.settings
     local scale = tonumber(s.jitterScale) or 1.0
@@ -660,7 +641,7 @@ end
 -- not the one-step proxy)
 -- ----------------------------------------------------------------------------
 -- varH means Var(READ) -- the Kaiser-resampled history that the gate and the
--- CUSUM actually test. Three constants, all measured on the ACTUAL per-tier
+-- detector actually test. Three constants, all measured on the ACTUAL per-tier
 -- kernel:
 --   * w (whiteGain)  = (E_f[sum_n k(n,f)^2])^2: the read gain against WHITE
 --     input. The fresh current-frame content enters the accumulator white
@@ -678,20 +659,9 @@ end
 --     so the 2D integrals reduce to the 1D moments m_k = mean(Kbar^{2k}):
 --         Vs (stored) = a^2 sum_k b^k m_k^2
 --         Vr (read)   = a^2 sum_k b^k m_{k+1}^2
---     and D = Vr/Vs. (The old one-step gbar measured a SINGLE resample of
---     white noise; the fixed-point stored field is far more correlated, and
---     the sign of that error is not guessable -- hence the exact spectrum.)
---     NOTE: the phase average sits INSIDE the power (Kbar^{2k}), which is
---     EXACT here: the k kernel factors in the unrolled spectrum belong to
---     k DIFFERENT frames, and the per-frame phases are iid -- the product's
---     expectation factorizes into k copies of E[K^2]. The per-phase power
---     E[(K^2)^k] would only be the FIXED-phase (jitter-off) regime.
+--     and D = Vr/Vs.
 --   * noiseAcc      = Vr / Var(x): the exact steady-state accumulated-noise
 --     share.
--- The scalar TRANSPORT recursion in the shader (dampGain*(1-a)^2*varH +
--- freshGain*a^2*Var(x)) is the best scalar approximation of this spectral
--- truth; its own fixed point differs from Vr only by the scalar-collapse
--- error, well beneath the 6-bit transport quantization.
 -- ============================================================================
 local kernelChainCache = {}
 local kernelChainCacheCount = 0
@@ -720,8 +690,6 @@ local function kernelChainConstants(beta, radius, a)
     end
 
     -- The phase-averaged kernel autocorrelation (Wiener-Khinchin's source).
-    -- Exact truncation: |d| > hi - lo has no overlapping taps, so ac = 0
-    -- there by construction.
     local maxD = hi - lo
     local ac = {}
     for d = -maxD, maxD do
@@ -746,16 +714,12 @@ local function kernelChainConstants(beta, radius, a)
         local omega = 2.0 * math.pi * j / N
         local v = ac[0]
         for d = 1, maxD do v = v + 2.0 * ac[d] * math.cos(omega * d) end
-        -- DC-normalized kernels give Kbar^2(0) = 1 exactly and |Khat| <= 1
-        -- up to float error; the clamp only guards the fixed-point's
-        -- denominator against float noise.
         kbar2[j + 1] = math.min(v, 1.0)
     end
 
-    -- The moment series: m_k = mean(Kbar^{2k}) (non-increasing in k), Vs =
-    -- a^2 sum_k b^k m_k^2, Vr = a^2 sum_k b^k m_{k+1}^2. Iterated with a
-    -- frozen-moment geometric tail (an over-estimate bounded by m_last^2,
-    -- since m continues to decay past the loop).
+    -- The moment series: m_k = mean(Kbar^{2k}), Vs = a^2 sum_k b^k m_k^2,
+    -- Vr = a^2 sum_k b^k m_{k+1}^2. Iterated with a frozen-moment geometric
+    -- tail (an over-estimate bounded by m_last^2).
     local b = (1.0 - a) * (1.0 - a)
     local pow = {}
     for j = 1, N do pow[j] = 1.0 end
@@ -785,11 +749,9 @@ local function kernelChainConstants(beta, radius, a)
 
     local vs = a * a * vsSum
     local vr = a * a * vrSum
-    -- Parseval: the per-axis white gain IS ac[0] (the frequency-mean of
-    -- Kbar^2); the 2D white gain is its square (independent axes/phases).
     local whiteGain = ac[0] * ac[0]
     local readGain  = vr / math.max(vs, 1e-12)
-    local noiseAcc  = vr        -- Var(x) = 1 in the series: Vr IS varH/Var(x)
+    local noiseAcc  = vr
 
     if kernelChainCacheCount > 32 then
         kernelChainCache = {}
@@ -827,23 +789,13 @@ local function cusumHostConstants()
     local s = M.settings
     -- v3.3: the accumulator rate varies per pixel (motion feedback). All
     -- rate-dependent constants are computed at the FASTEST configured rate
-    -- so the charged responses are conservative upper bounds everywhere: a
-    -- wider whitening / flip term can only slow detection, never false-alarm.
-    -- (varhResampleLoss is the one term whose error direction flips: the
-    -- fixed-point read gain D falls as the feedback rate rises, so
-    -- computing it at the fastest rate marginally over-damps slow-rate
-    -- pixels' transported varH -- a second-order effect on varH's small
-    -- gate share, and exact whenever feedbackMin == feedbackMax, the
-    -- default.)
+    -- so the charged responses are conservative upper bounds everywhere.
     local a = 1.0 - math.min(tonumber(s.feedbackMin) or 0.97,
                               tonumber(s.feedbackMax) or 0.97)
     a = math.min(math.max(a, 0.001), 0.9)
 
     -- flipAcc: the worst coverage bin of the accumulator's flip-response
-    -- gain. The 1D projection is the isotropic stand-in for the per-pixel
-    -- edge normal (the R2/Halton projections are all bounded-discrepancy
-    -- Kronecker sequences, so the spectra -- and hence the gains -- agree
-    -- to the precision that matters here).
+    -- gain.
     local flipAcc = 0.0
     local scale = tonumber(s.jitterScale) or 1.0
     if s.useJitter and scale > 0.0 then
@@ -892,6 +844,10 @@ local cusumConstantsLogged = false
 -- file's version changes, ge/extensions/taa.lua calls M.resetSettings() to
 -- rebuild this copy -- merging would keep stale keys from settings that were
 -- renamed or removed in newer versions.
+-- v5.2: lumaDrift* and clipDistanceRejection* are RETIRED -- every surviving
+-- action is now either the posterior mean (the gate / the soft clip) or the
+-- confirmed corrector; slow luma drift is a persistent offset and is the
+-- corrector's business.
 M.defaultSettings = {
     useJitter                     = true,
     useR2Jitter                   = true,
@@ -903,13 +859,12 @@ M.defaultSettings = {
     -- noise-aware shrinkage, capped at the content scale). Requires the
     -- same-layer mask (Depth-Dilated Motion Search).
     driftCompensation             = 1.0,
-    -- v3.8.4: the drift tracker's gain cap -- THE speed/noise dial. A
-    -- correction applied at gain g injects ~g*Var/2 of noise power into the
-    -- history vs the accumulator's own (a/2)Var -- so g = 0.2 tracks a
-    -- confirmed shift in ~5 frames with a bounded, brief noise bump.
+    -- The drift tracker's gain cap -- THE speed/noise dial. A correction
+    -- applied at gain g injects ~g*Var/2 of noise power into the history
+    -- vs the accumulator's own (a/2)Var -- so g = 0.2 evicts a confirmed
+    -- shift in ~5 frames with a bounded, brief noise bump. The eviction
+    -- floor itself is kGhostD0/2 (taaClip): the residual settles there.
     driftMaxGain                   = 0.2,
-    lumaDriftStrength             = 0.0,
-    lumaDriftChromaTol            = 0.1,
     -- chi: the gate's coverage radius (3-dof, PER-CHANNEL normalized -- the
     -- coverages below are actually true now). Below ~2.2 legit sub-texel
     -- content is under-covered. 2.2 = 82%, 2.8 = 95%.
@@ -958,18 +913,13 @@ M.defaultSettings = {
     useKaiser6                    = 1.0,
     historyOvershoot              = 1.0,
     clipOvershoot                 = 0.0,
-    clipDistanceRejectionEnabled  = 0.0,
-    clipDistanceRejectionAmount   = 0.0,
-    clipDistanceRejectionMinError = 0.15,
     motionBlendStart               = 1.0,
     fallbackFXAA                  = 1.0,
-    -- The GHOST TRAIL DETECTOR (v3.10: the persistence statistic -- the
-    -- EMA-normalized spatial t of the drift estimator's luma common mode;
-    -- replaced the matched LLR pair, whose fallback half was statistically
-    -- inverted in the sub-gate range). Consumers: the drift-corrector UNLOCK
-    -- (confirmed trails track below the per-frame noise gate), the confirmed
-    -- blend floor, and the alarm. 0 = off, 1 = soft (default), 2 = telemetry
-    -- only (debug mode 11), 3 = soft + hard alarm.
+    -- THE GHOST TRAIL DETECTOR (v5.2: the renewed two-sided CUSUM on the
+    -- phase-corrected luma innovation -- calibrated nats, renewal drain).
+    -- Consumers: the corrector's confirmation ramp, the blend floor's
+    -- posterior, and the hard alarm. 0 = off, 1 = soft (default),
+    -- 2 = telemetry only (debug mode 11), 3 = soft + hard alarm.
     clipGhostReset                = 1.0
 }
 
@@ -1016,23 +966,22 @@ function M.applySettings(inputs)
         pre:setShaderConst("$taaDepthParallaxStep",       0.0)
         -- The Studentization EXACTLY tracks the slider: the fit consumes
         -- the EFFECTIVE radius (chi * (1 + clipOvershoot)) -- the same
-        -- threshold the gate tests. Pin points: nu0 = 4 and
-        -- nu_inf(r=6) ~ 74 (STUDENT_NUINF above).
+        -- threshold the gate tests. Pin points: nu = 2 (the Satterthwaite
+        -- clamp floor), nu0 = 4 and nu_inf = 12.33 (STUDENT_NUINF above).
         local chiEff = (tonumber(s.varianceGamma) or 2.8)
                      * (1.0 + math.max(tonumber(s.clipOvershoot) or 0.0, 0.0))
-        local studentA, studentB = studentFitAB(chiEff)
+        local studentA, studentB, studentC = studentFitABC(chiEff)
         pre:setShaderConst("$taaStudentA",               studentA)
         pre:setShaderConst("$taaStudentB",               studentB)
+        pre:setShaderConst("$taaStudentC",               studentC)
         -- The arming cap's nu-aware fit (see the ARMING CAP FIT block): the
         -- exact chi^2_nu(0.999)/nu bound at the record's dof trajectory
         -- endpoints, consumed as 1 + A/sqrt(nu) + B/nu at the live per-pixel
         -- nu.
         pre:setShaderConst("$taaArmingA",                ARMING_A)
         pre:setShaderConst("$taaArmingB",                ARMING_B)
-        -- v3.8: the winsor tail factors are gone -- the v3.3 content-scale
-        -- cap replaced the W(nu) factor and WinsorTailFactor had no call
-        -- site (the host fit was dead weight). The drift predict step's
-        -- enable takes the slot.
+        -- v3.8: the drift predict step's enable (the winsor tail factors
+        -- are gone -- the v3.3 content-scale cap replaced the W(nu) factor).
         pre:setShaderConst("$taaDriftCompensation",      s.driftCompensation)
         pre:setShaderConst("$taaDriftMaxGain",          s.driftMaxGain)
         -- The exact-seed phase covariance (v3.8.4: the full quadratic form,
@@ -1045,12 +994,9 @@ function M.applySettings(inputs)
         -- THE ACCUMULATOR'S HOST CONSTANTS (see cusumHostConstants): the
         -- accumulator's exact flip-response gain (the variance models' step
         -- charge), the exact accumulated-noise share, and the VarH
-        -- transport's two read gains (the fixed-point gain for the history
-        -- term, the white-input gain for the fresh-x term). They track
+        -- transport's two read gains. They track
         -- useJitter / useR2Jitter / jitterScale / feedbackMax / useKaiser6,
-        -- so every apply recomputes them. Both gains are encoded as LOSSes
-        -- so an unset constant (0) degrades to the legacy undamped
-        -- transport.
+        -- so every apply recomputes them.
         local flipAcc, noiseAcc, varhLoss, whiteLoss = cusumHostConstants()
         pre:setShaderConst("$taaCusumFlipAcc",           flipAcc)
         pre:setShaderConst("$taaCusumNoiseAcc",          noiseAcc)
@@ -1060,8 +1006,8 @@ function M.applySettings(inputs)
             cusumConstantsLogged = true
             if log then
                 log("I", "TAA", string.format(
-                    "Accumulator host constants: flipAcc=%.2e noiseAcc=%.5f varhLoss=%.4f whiteLoss=%.4f armingA=%.4f armingB=%.4f (kernel: separable per-axis Kaiser, beta %.1f (6-tap) / %.1f (4-tap) by useKaiser6; VarH gains from the spectral fixed point -- MUST MATCH taaResample.h.hlsl; the arming pair MUST MATCH taaClip.h.hlsl)",
-                    flipAcc, noiseAcc, varhLoss, whiteLoss, ARMING_A, ARMING_B, KAISER6_BETA, KAISER4_BETA))
+                    "Accumulator host constants: flipAcc=%.2e noiseAcc=%.5f varhLoss=%.4f whiteLoss=%.4f armingA=%.4f armingB=%.4f studentA=%.4f studentB=%.4f studentC=%.4f (kernel: separable per-axis Kaiser, beta %.1f (6-tap) / %.1f (4-tap) by useKaiser6; VarH gains from the spectral fixed point -- MUST MATCH taaResample.h.hlsl; the arming and Student triples MUST MATCH taaClip.h.hlsl; ingest dof = 1.0, nu_inf = 12.33)",
+                    flipAcc, noiseAcc, varhLoss, whiteLoss, ARMING_A, ARMING_B, studentA, studentB, studentC, KAISER6_BETA, KAISER4_BETA))
             end
         end
         -- The persistence detector's mode: 0 off / 1 armed / 2 telemetry /
@@ -1089,11 +1035,6 @@ function M.applySettings(inputs)
         pre:setShaderConst("$taaUseKaiser6",              s.useKaiser6)
         pre:setShaderConst("$taaHistoryOvershoot",        s.historyOvershoot)
         pre:setShaderConst("$taaClipOvershoot",           s.clipOvershoot)
-        pre:setShaderConst("$taaLumaDriftStrength",       s.lumaDriftStrength)
-        pre:setShaderConst("$taaLumaDriftChromaTol",      s.lumaDriftChromaTol)
-        pre:setShaderConst("$taaClipDistanceRejectionEnabled",  s.clipDistanceRejectionEnabled)
-        pre:setShaderConst("$taaClipDistanceRejectionAmount",   s.clipDistanceRejectionAmount)
-        pre:setShaderConst("$taaClipDistanceRejectionMinError", s.clipDistanceRejectionMinError)
         pre:setShaderConst("$taaMotionBlendStart",        s.motionBlendStart)
         pre:setShaderConst("$taaFallbackFXAA",            s.fallbackFXAA)
         -- Debug modes no longer rebind the history source: the resolve's RGB
