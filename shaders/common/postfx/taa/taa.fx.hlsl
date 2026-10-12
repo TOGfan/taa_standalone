@@ -16,10 +16,11 @@
 //   7-10)  exact jitter plumbing, the own-history dilation validation, the
 //          history landing analysis, the depth/velocity disocclusion tests.
 //          [GEOMETRY]
-//   11)    THE FLAT MODEL (taaClip v5.3): the coupled-plane statistics,
-//          the plain record, the structure split's transport, the level
-//          gate (the hierarchical posterior + the soft clip), the blend,
-//          the VarH recursion.
+//   11)    THE FLAT MODEL (taaClip v5.6): the robust coupled-plane
+//          statistics with the exact hat-matrix bookkeeping, the H-free
+//          record, the structure split's transport, the level gate (the
+//          hierarchical posterior + the measured-miss soft clip), the
+//          blend, the VarH recursion.
 //
 // OUTPUT: RGB = the resolved color. A = the packed CLIP STATE (tag 101).
 // Debug modes carry tag 001.
@@ -365,7 +366,24 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
         transportErrPx.y = max(abs(repro.jitterResidualPx.y) * motionShare, transportFloorPx);
     }
 
-    // ---- the statistics (the coupled 2x2 plane; no masks, no flags) ----
+    // THE LANDING-MISS MODEL'S SCALE (v5.6): the soft clip's H1 is priced
+    // by the measured miss distribution. sigma^2 = the gated transport
+    // scatter (the known residual -- the same quantity the null's variance
+    // charges; it is per-frame noise-like, wandering with the jitter, so
+    // it is SPREAD, not offset: the mixture stays centered on the target
+    // and there is no sign convention to get wrong) + the velocity
+    // field's measured noise scale. Where the quant-step scan was skipped
+    // (high motion), the uniform-field floor stands in -- at high motion
+    // the miss scale is dominated by the measured residual anyway.
+    float2 missSigmaPx;
+    {
+        float velNoisePx = (transportFloorPx > 0.0) ? transportFloorPx : kVelQuantFloorPx;
+        missSigmaPx.x = sqrt(transportErrPx.x * transportErrPx.x + velNoisePx * velNoisePx);
+        missSigmaPx.y = sqrt(transportErrPx.y * transportErrPx.y + velNoisePx * velNoisePx);
+    }
+
+    // ---- the statistics (the robust coupled 2x2 plane, the exact
+    //      hat-matrix bookkeeping; no masks, no flags) ----
     ColorNeighborhoodStats colorStats = ComputeColorNeighborhoodStats(
         neighborhoodColorSpace, repro.motionDirUnit, repro.motionNormalized,
         pixel.fracPx, transportErrPx);
@@ -393,15 +411,25 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
     if (taaHistoryOvershoot > 0.001 || taaColorSpaceOklab > 0.5)
         historyColorSpace = CompressGamut(historyColorSpace);
 
-    // ---- the innovation (the stream the record and the spike price) ----
+    // ---- the innovation (the stream the spike and the corroboration
+    //      price) ----
     float3 innov   = currentColorSpace - historyColorSpace;
     float  innovSq = dot(innov, innov);
 
     // ---- change-points ----
-    float spikeRefSq = max(sigmaPrevSq, colorStats.rangeSq)
+    // The spike: two branches, both explicit. The record branch is a
+    // priced chi^2_3 test at ~1e-6 per frame (the innovation is a
+    // 3-channel SUM: its null scale is (record + varH)/3 per chi^2 unit
+    // -- the /3 matters; composing the level as 4x * 16.27 was dead code,
+    // colder than the branch it was meant to dominate). The range branch
+    // is the distribution-free garbage backstop (16x the observed AABB
+    // range -- effectively never on the null by design: the H-free
+    // ingest absorbed the level-change job, geoCorroboration owns
+    // reveals, and the NaN guard is separate).
+    float spikeRefSq = max(kChiSq3_1e6 * (1.0 / 3.0) * max(sigmaPrevSq + varHPrevSq, kEpsilon),
+                           16.0 * colorStats.rangeSq)
                      + dot(colorStats.transportVar, float3(1.0, 1.0, 1.0));
-    bool  spike   = hadRecord
-        && (innovSq > kClipSpikeRatio * spikeRefSq);
+    bool  spike = hadRecord && (innovSq > spikeRefSq);
 
     bool geoCorroborated = false;
     if (hadRecord && disoccluded)
@@ -409,25 +437,25 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
         float rXYg, rXZg, rYZg;
         ShrunkenCorrelations(colorStats, rXYg, rXZg, rYZg);
         geoCorroborated = (WhitenedInnovSq(innov, partsLive, colorStats.transportVar, rXYg, rXZg, rYZg)
-                           > kGeoCorroborateChiSq);
+                           > kChiSq3_95);
     }
 
     bool  resetRecord = hadRecord
         && (spike || !(innovSq < kLargeValue) || geoCorroborated);
     bool  carryRecord = hadRecord && !resetRecord;
 
-    // ---- THE STRUCTURE SPLIT'S TRANSPORT (v5.3) ----
+    // ---- THE STRUCTURE SPLIT'S TRANSPORT ----
     // The signed normalized fraction f = (R - s)/max(R, s): the spatial
-    // residual total against the record's per-sample total. EMA'd, 6-bit
-    // packed; the gate reconstructs tauB2 = max(f,0)*residSq. The clamp
-    // lives on the STABLE side (see taaClip's header). A fresh record
-    // certifies nothing (the seed >= R by construction, so f <= 0 cold);
-    // a disocclusion restarts the split with the new content.
+    // residual total against the record (which IS s). With the exact
+    // residual dof this anchor is unbiased -- the v5.5 ingest's fixed
+    // point is e = 0. A fresh record certifies nothing (the seed >= R by
+    // construction); a disocclusion restarts the split with the new
+    // content.
     float splitFracNext;
     {
         float residTotal = dot(colorStats.residSq, float3(1.0, 1.0, 1.0));
         float sPerTotal  = hadRecord
-            ? max(sigmaPrevSq - varHPrevSq, kClipSigmaRecordFloorSq)
+            ? max(sigmaPrevSq, kClipSigmaRecordFloorSq)
             : max(SeedRecordTotalSq(colorStats), kClipSigmaRecordFloorSq);
         float fRaw = clamp((residTotal - sPerTotal)
                            / max(max(residTotal, sPerTotal), kEpsilon), -1.0, 1.0);
@@ -436,20 +464,36 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
             : fRaw;
     }
 
-    // ---- the record: the plain single-sample ingest ----
-    float winsorCap  = kClipWinsorC * kClipWinsorC
-                     * max(partsLive.spatialPriorSq, kClipSigmaRecordFloorSq);
-
+    // ---- THE RECORD: THE H-FREE INGEST ----
+    // Noise lives in dev = x0c - plane0 (H does not appear); change lives
+    // in dCorr (it does not appear here). The de-bias is the exact
+    // identity E[dev^2] = sPer + vPrior - 2*cPT. The winsor caps the
+    // chi^2_3-scaled ingest at 0.1%: the null bias is ~0.6% and a
+    // center-tap firefly's record impact is half the old 9x cap's. The
+    // circularity (record -> split -> tauB2 -> vPrior -> ingest -> record)
+    // has loop gain (1 - q) < 1: convergent, honest fixed point e = 0 on
+    // the R > s branch -- the exact residual dof is that statement's
+    // stability condition.
     float sigmaStatSq, ageNext;
-    if (carryRecord)
     {
-        sigmaStatSq = max(lerp(sigmaPrevSq, min(innovSq, winsorCap), kClipSigmaEmaRate), kClipSigmaRecordFloorSq);
-        ageNext     = min(agePrev + 1.0, kClipMaxAge);
-    }
-    else
-    {
-        sigmaStatSq = max(SeedRecordTotalSq(colorStats), kClipSigmaRecordFloorSq);
-        ageNext     = 0.0;
+        float winsorCap = (kChiSq3_999 / 3.0)
+                        * max(partsLive.spatialPriorSq, kClipSigmaRecordFloorSq);
+        if (carryRecord)
+        {
+            float3 devIng    = (currentColorSpace - colorStats.phaseShift) - colorStats.plane0;
+            float3 tauB2Ing  = max(splitPrev, 0.0) * colorStats.residSq;
+            float3 vPriorIng = tauB2Ing + partsLive.sPer * colorStats.evalVar;
+            float3 sIngestPer = devIng * devIng - vPriorIng + 2.0 * colorStats.priorTapCov;
+            float  sIngest    = max(dot(sIngestPer, float3(1.0, 1.0, 1.0)), 0.0);
+            sigmaStatSq = max(lerp(sigmaPrevSq, min(sIngest, winsorCap), kClipSigmaEmaRate),
+                              kClipSigmaRecordFloorSq);
+            ageNext     = min(agePrev + 1.0, kClipMaxAge);
+        }
+        else
+        {
+            sigmaStatSq = max(SeedRecordTotalSq(colorStats), kClipSigmaRecordFloorSq);
+            ageNext     = 0.0;
+        }
     }
 
     // ---- THE LEVEL GATE ----
@@ -457,7 +501,7 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
         historyColorSpace, currentColorSpace, colorStats, partsLive,
         carryRecord, carryRecord ? agePrev : 0.0,
         splitPrev,
-        repro.motionNormalized,
+        missSigmaPx,
         neighborhoodColorSpace);
     float3 clippedHistorySpace = clipGate.clippedColorSpace;
 
@@ -581,8 +625,8 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
     float3 outputRGB = max(FromSpace(blendedColorSpace), 0.0);
 
     // ---- the VarH recursion (READ semantics; the host-measured gains;
-    //      12-bit transport -- the quantization is no longer an error
-    //      source) ----
+    //      12-bit transport). sigmaStatSq IS sPer: the fresh-x term
+    //      injects it directly. ----
     float varHCodeNext = 1820.0;
     {
         float aBlend = currentBlendWeight;
@@ -591,9 +635,8 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
         if (carryRecord)
         {
             float varHPrevCapped = dot(partsLive.varHPer, float3(1.0, 1.0, 1.0));
-            float vxFresh  = max(sigmaStatSq - varHPrevCapped, 0.0);
             float varHNext = (1.0 - aBlend) * (1.0 - aBlend) * dampGain * varHPrevCapped
-                           + aBlend * aBlend * freshGain * vxFresh;
+                           + aBlend * aBlend * freshGain * max(sigmaStatSq, 0.0);
             varHCodeNext = EncodeVarHRatio(varHNext, max(sigmaStatSq, kEpsilon));
         }
         else
@@ -602,9 +645,8 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
             float  tC = clipGate.tGate;
             float3 varH0Per = clipGate.rawGateVar + (1.0 - tC) * (1.0 - tC) * (dCorrSeed * dCorrSeed);
             float  varH0 = varH0Per.x + varH0Per.y + varH0Per.z;
-            float  s0 = max(sigmaStatSq - varH0, 0.0);
             float  varHNext = (1.0 - aBlend) * (1.0 - aBlend) * dampGain * varH0
-                            + aBlend * aBlend * freshGain * s0;
+                            + aBlend * aBlend * freshGain * max(sigmaStatSq, 0.0);
             varHCodeNext = EncodeVarHRatio(varHNext, max(sigmaStatSq, kEpsilon));
         }
     }

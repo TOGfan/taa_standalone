@@ -1,102 +1,70 @@
 // ============================================================================
-// TAA history clipping v5.3: THE FLAT MODEL -- exact prior, transported split
+// TAA history clipping v5.6: THE FLAT MODEL -- exact least-squares bookkeeping
 // ----------------------------------------------------------------------------
-// The hierarchical gate (v3.11 lineage, F-series exactness fixes) + the plain
-// single-sample record. No layer masks, no stored flags, no step model, no
-// coverage machinery, no detector: every action is the posterior mean.
+// v5.3: exact prior variance (the normal-equation identity) + the
+//       transported structure split.
+// v5.4: the robust plane (one t-IRLS step, drop-one trimmed scale).
+// v5.5: the H-free record (noise lives in dev, change in dCorr; the ingest
+//       is the de-biased dev^2 identity) + the sandwich information count.
+// v5.6: the HAT MATRIX. The weighted-least-squares bookkeeping no longer
+//       pretends the weights aren't there:
+//         * residSq's dof: E[Sum w r^2] = sigma^2 * Sum w(1-h), h_i =
+//           (w_i/W)(1 + mahal_i), Sum h_i = 3 exactly (the trace identity
+//           -- the built-in sanity check). The uniform-weight dofCorr was
+//           biasing residSq ~1.3x high in the default config, which in
+//           v5.5 was an UNSTABLE loop (the ingest's de-bias over-
+//           subtracted, the record sagged without a fixed point); exact
+//           now by construction.
+//         * the IRLS studentization: q_i = r_i^2/((1-h_i)s^2) has E = 1
+//           per tap (the classical internally-studentized residual), so
+//           clean taps keep weight exactly 1 and a contaminated CENTER
+//           tap -- the highest-hat, previously the most under-tested --
+//           is downweighted at its true deviation.
+//         * the evaluation variance: vFit = sPer * Sum c_k^2 with c_k the
+//           EXACT evaluation functional coefficients; Sum c^2 reproduces
+//           the classical (1/n)(1+mahal) on uniform weights. The v5.5
+//           form overcharged the mahal term by ~W when jitter-aware
+//           weighting was off.
+//         * the shared chi^2_3 levels: the corroboration reset (5%), the
+//           winsor (0.1%), the spike's record branch (~1e-6) -- one law,
+//           three tests, each through the /3 of the 3-channel sum.
+//       THE MEASURED MISS MODEL (the soft clip): H1 is now EXACTLY the
+//       landing-miss hypothesis, priced by one Gaussian miss distribution
+//       whose scatter the transport machinery already measures. It
+//       generates the prior odds P(|miss| > r0), the neighbor masses
+//       P(miss in texel j) and the tail P(|miss| > r1) coherently --
+//       replacing four hand-set stand-ins (the 1/512 base, the 64x motion
+//       odds, the 0.1 tail weight, the kernel-shaped mixture). On clean
+//       static content the prior collapses (~e^-32) and the soft clip
+//       switches itself OFF -- correctly: no miss is possible, and
+//       change-class deviations are the hard clamp's business since the
+//       v5.5 unsheltered record (clamp-rate eviction ~3 frames at 3 sigma
+//       instead of the tail's ~1.5; raise kTailChangeFloor if field
+//       testing misses the fast response). On noisy-velocity content it
+//       runs HOTTER than the old fixed prior ever did -- also correctly:
+//       a measured ~1-texel landing scatter means the history really is
+//       miss-contaminated. The principled dial is kMissRadiusOdds, never
+//       an odds cap.
 //
 // THE GATE: the history's accumulation target is the phase-swept CENTER
 // TEXEL; the gate tests the history against the posterior of that target
-// given the current frame.
-//   PRIOR (v5.3, EXACT): plane0, variance vPrior = tauB2 + sPer*(invNeff
-//   + lever). The evaluation functional's residual projection is annihilated
-//   by the LS normal equations (Sum w r = 0, Sum w(k-cen) r = 0), so
-//       plane0 - T = Sum c_k eps_k - r(0)      (exact to linear order):
-//   the noise enters at sPer scale through the leverage quadratic, the
-//   structure ONCE as r(0). The v5.2 form residSq*(invNeff+lever) billed
-//   the structure twice (tauB2 + (tauB2+sPer)*q vs tauB2 + sPer*q) --
-//   ~q ~ 25-45% of the structural charge as ghost-side slack.
-//   tauB2 = the STABLE structural share, from the TRANSPORTED split
-//   fraction (below).
-//   LIKELIHOOD: the phase-corrected center tap, variance sPer = the
-//   record's implied per-sample variance (E[i^2] - varH). The identity
-//   that makes the form self-calibrating: sPer absorbs the sweep delta
-//   (the flip charge at edges) AND the phase correction's own error,
-//   and wherever the neighborhood carries no certifiable structure
-//   (tauB2 large) the posterior degenerates EXACTLY to the innovation
-//   test, whose null the record measures directly.
-//   The tap is t-robustified (one IRLS step at the record's dof; the
-//   exact (nu+q)/(nu+1) weight).
-//   F1: the prior/tap shared-sample covariance is charged (both are
-//   linear functionals of the same nine taps).
-//   At edges the plane residual carries the step, so the gate is
-//   step-wide there -- the flip REQUIRES that width.
+// given the current frame. PRIOR: plane0, variance tauB2 + sPer*evalVar.
+// LIKELIHOOD: the phase-corrected center tap, variance sPer (the record),
+// t-robustified at the record's dof with the exact Var(dev) quadratic
+// form. F1: the shared-sample covariance charged. At edges the plane
+// residual carries the step -- the flip REQUIRES that width.
 //
-// THE STRUCTURE SPLIT (v5.3): tauB2 is certified TEMPORALLY. The per-frame
-// split D = Sum(residSq) - sPer carries ~100% noise (a 3x3 variance
-// estimate has dof ~2-4), so clamping it per frame charges E[max(D,0)] =
-// sigma*phi(0) ~ 0.4*sigma_D of spurious structure on smooth content --
-// roughly DOUBLING vPrior exactly where ghosting is most visible. The
-// fix transports the split: EMA the signed normalized fraction
-//     f = (R - s) / max(R, s)   in [-1, 1],  rate 0.2,  6 bits,
-// and reconstruct tauB2 = max(f, 0) * residSq -- the clamp acts on the
-// STABLE side (f +- 0.3 post-EMA), the same trick the record itself uses
-// to beat the 9-tap noise. Regimes:
-//   * smooth: E[f] <= 0 (Jensen-negative at R = s); residual spurious
-//     charge ~0.12*residSq (3-4x down from ~0.4).
-//   * texel-aligned patterns (chessboard): sPer ~ 0, f -> ~0.9, full
-//     charge, magnitude from the live residSq. A per-frame threshold
-//     CANNOT separate this from the smooth noise case (D/sigma ~ 1 in
-//     both) -- only temporal stability can.
-//   * sub-texel-rough texture: D = tauB2 - E[delta^2] < 0 -> reads as
-//     noise -> the innovation test, which is CORRECT there (the history
-//     holds the sweep average; the innovation measures exactly the
-//     delta).
-//   * edges: the step's f ~ 0.67, stable, full charge.
-//   * cold: the seed >= Sum(residSq) by construction, so a fresh record
-//     certifies nothing (f <= 0) -- the cold path below is the no-record
-//     LIMIT of this model, not a separate policy.
+// THE RECORD: the transported sigma^2 MEANS sPer, ingested H-free
+// (dev^2 - vPrior + 2*cPT). The winsor caps the chi^2_3-scaled ingest at
+// 0.1%: the null bias is ~0.6% and a center-tap firefly's record impact
+// is half the old 9x cap's. The spike's record branch is a priced ~1e-6
+// chi^2_3 test; the range branch (16x the observed AABB range) is the
+// distribution-free garbage backstop -- effectively never on the null by
+// design, the level-change job having moved to the H-free ingest and the
+// reveal job to geoCorroboration.
 //
-// THE SOFT CLIP: beyond the gate radius the action is the exact posterior
-// mean. H0: the hierarchical null at its honest un-inflated predictive
-// variance, on the same shrunk full metric as the hard test (F6) with the
-// exact relative log-det normalizer. H1: a PROPER mixture of the 8
-// NEIGHBOR TEXELS' accumulated content plus one temporal tail -- every
-// component a full log-density carrying its own scale normalizer inside
-// the logsumexp; the null's +0.5*logDetNull is charged once, outside.
-// THE CENTER TAP IS NOT A COMPONENT (it IS the null's likelihood). The
-// prior odds are the per-pixel base plus the motion term (the one
-// hand-set prior); the sequential detector is retired -- the soft clip's
-// own pull (wPull per frame at the frame-LLR's posterior) is the
-// eviction mechanism, and the empirical verdict was that it suffices.
-//
-// ---------------------------------------------------------------------------
-// POST-MORTEM: THE COVERAGE MODEL (v4.0-v4.4), REMOVED
-// ---------------------------------------------------------------------------
-// C(p) = L(p) + c(p)*D, coverage measured from color, one 3x3 solve --
-// mathematically sound, and removed on empirical verdict: with its
-// actions disabled the system measured near-perfect AND the trail
-// problem it was built for was already solved elsewhere.
-//   1. A void initializer (the LS residual regressed on the design --
-//      identically zero) left the whole model dead for two versions.
-//   2. The collinear overfit: soft content makes u ~ linear in position;
-//      the (plane, step) split goes ill-conditioned and LS finds a
-//      CANCELING solution (huge D, zero residual) that fits the nine
-//      taps and explodes off them -- conf measures explanation, not
-//      identifiability. Through Untonemap's pole at luma 1: white pixels.
-//   3. The tap-grid quantization: hard edges give BINARY point samples,
-//      so the staircase's stable-position estimate sawtooths +-0.5
-//      texel at the jitter frequency.
-// THE LESSONS FOR ANY SUCCESSOR (do not relearn these):
-//   (a) the fit's legitimate resolution is the TAP GRID; the sub-texel
-//       structure lives in the ACCUMULATION and must be read from time;
-//   (b) identifiability and explanation are different statistics;
-//   (c) bound every fitted magnitude against a CANCELLATION-FREE
-//       measurement of the same quantity.
-//
-// TRANSPORT (tag 101, v5.3): [31] sign, [30:28] tag, [27:22] sigma
-// (6-bit), [21:10] VarH ratio (12-bit, 0.15% steps -- quantization
-// retired as an error source), [9:6] age (4-bit), [5:0] structure split
+// TRANSPORT (tag 101): [31] sign, [30:28] tag, [27:22] sigma (6-bit,
+// = sPer), [21:10] VarH ratio (12-bit), [9:6] age (4-bit), [5:0] split
 // fraction (6-bit, 1/32 steps over [-1, 0.97]).
 //
 // FRAGMENT HEADER: compiled only inside taa.fx.hlsl. Requires host
@@ -111,7 +79,7 @@
 #define TAA_CLIP_H_HLSL
 
 // ============================================================================
-// THE COLOR-FIELD STATISTICS (moments -> the coupled 2x2 plane)
+// THE COLOR-FIELD STATISTICS (moments -> the robust coupled 2x2 plane)
 // ============================================================================
 struct ColorNeighborhoodStats
 {
@@ -119,22 +87,26 @@ struct ColorNeighborhoodStats
     float3 aabbMax;
     float3 sigmaClean;          // the post-plane residual scale, per channel
                                 // (the soft clip's temporal tail)
-    float  invNeff;             // the fit's effective count inverse
+    float  invNeff;             // the SANDWICH information count (dof side:
+                                // Sum w*psi' mass, information-positive only)
+    float  evalVar;             // Sum c_k^2: the EXACT evaluation variance
+                                // (the vFit multiplier -- the plain w2
+                                // concentration plus the exact lever terms)
+    float  residDof;            // Sum w(1-h) on the robust weights: residSq's
+                                // own dof (the Satterthwaite denominator)
     float3 phaseShift;          // -(gradLS * j): the innovation's phase
                                 // correction, the tap's, the soft clip's
-    float3 gradLSx;             // the LS plane gradient
+    float3 gradLSx;             // the robust LS plane gradient
     float3 gradLSy;
     float3 plane0;              // the plane at the target (the prior center)
-    float  lever;               // the fitted-value lever at the target
     float3 covCross;            // the taps' cross-channel covariances
                                 // (the metric's shape)
-    float3 residSq;             // the post-plane residual (dof-corr)
+    float3 residSq;             // the post-plane residual (exact dof)
     float  rangeSq;             // full-set squared AABB range (the spike
-                                // reference)
+                                // reference's garbage branch)
     float3 priorTapCov;         // F1: Cov(fitted value, center tap)
     float3 transportVar;        // the gated landing error projected on the
                                 // working gradient (MOTION-GATED)
-    float  mixWeights[9];       // the plain kernel weights
 };
 
 // ============================================================================
@@ -142,49 +114,59 @@ struct ColorNeighborhoodStats
 // ============================================================================
 static const float kClipSigmaEmaRate         = 0.15;
 static const float kClipSigmaRecordFloorSq   = (1.0 / 255.0) * (1.0 / 255.0);
-// The record's outlier guard: max(record, AABB range) + the measured
-// transport scatter. r = 4 against a reference DOMINATED by the 3x3's
-// observed range (~20 sigma^2 on Gaussian content): the spike is a
-// "beyond everything the neighborhood saw" test -- the honest role for a
-// hard reset.
-static const float kClipSpikeRatio           = 4.0;
-static const float kClipWinsorC              = 3.0;
-static const float kGeoCorroborateChiSq      = 7.815;         // chi^2_3(0.95)
+// ---- the shared chi^2_3 levels (one law, three tests) ----
+// The 3-dof null's quantiles. The innovation-scale consumers (the winsor,
+// the spike) go through the /3: a 3-channel SUM whose null mean is the
+// total scale is (total/3) * chi^2_3.
+static const float kChiSq3_95   = 7.815;     // the corroboration reset: 5%
+static const float kChiSq3_999  = 16.266;    // the winsor: 0.1% censoring
+static const float kChiSq3_1e6  = 31.0;      // the spike's record branch
+                                             // (exact tail 8.5e-7 via the
+                                             // erfc form)
+// The degenerate-spread guard for the exact evaluation variance (the
+// un-clamped value is unbounded along an unobserved direction; the
+// decoupled-fit branch drops that direction and this bounds the charge).
+static const float kMaxEvalVar  = 4.0;
+// ---- the record ----
 static const float kClipStudentPriorDof      = 4.0;
 static const float kClipStudentDecay         = -0.4689303;    // 2*log2(1-rho)
 static const float kClipMaxAge               = 15.0;          // 4-bit age
-static const float kMaxLever                 = 4.0;
-// ---- the posterior-mean soft clip ----
-static const float kGhostLogOddsBase         = -6.2383;       // ln(1/512)
-static const float kGhostMotionOdds          = 64.0;          // the one hand-set prior
-static const float kGhostPriorSigma          = 1.0;
-static const float kCusumTailWeight          = 0.1;
-// ---- the structure split's transport ----
-// The EMA rate for the split fraction. Steady-state noise = the per-frame
-// fraction's std (~1, it is the split's own noise normalized by itself)
-// times sqrt(rate/(2-rate)) ~ 0.31 at 0.2. Convergence ~5 frames after a
-// reset -- the record's own timescale.
-static const float kSplitEmaRate             = 0.2;
-// The record ingest's effective chi^2 dof: the ingest is the pixel's own
-// squared innovation, a single squared Gaussian = chi^2_1. (v5.2: v4.1's
-// 0.5 was the relative-variance INVERSE -- half the dof.) MUST MATCH
-// client/postFx/taa.lua's STUDENT_NUINF.
+// The record ingest's effective chi^2 dof: the de-biased squared dev of a
+// single tap, chi^2_1. MUST MATCH client/postFx/taa.lua's STUDENT_NUINF.
 static const float kRecordIngestDof = 1.0;
-// ---- the transport scatter's motion gate ----
-static const float kTransportGatePx = 2.0;
-// ---- the plane's one-step t-IRLS (v5.4) ----
+// ---- the soft clip's measured miss model ----
+// The miss distribution is N(0, diag(sx^2, sy^2)) in texel units, sx/sy
+// measured by the transport machinery. r0 = the "holds another texel"
+// radius (the prior odds' threshold -- the principled dial if the hot
+// regime over-pulls: raise to 1.25 to cool the prior at every sigma).
+// r1 = beyond the neighbor ring (the tail). kTailChangeFloor: optional
+// mass for the change-class ghost (old content absent for reasons other
+// than a miss, e.g. lighting steps) -- 0 = the pure miss model; raise to
+// ~0.02-0.1 if static-scene lighting transitions evict too slowly.
+static const float kMinMissSigma    = 0.125;  // texels: the floor (underflow
+                                              // safety; below it "no miss")
+static const float kMissRadiusOdds  = 1.0;
+static const float kMissRadiusTail  = 1.5;
+static const float kTailChangeFloor = 0.0;
+// The tail component's content-scale prior (the unknown old content's
+// spread around the neighborhood mean, in content sigmas).
+static const float kGhostPriorSigma = 1.0;
+// ---- the plane's one-step t-IRLS ----
 // The fit's robustification dof. The drop-one trimmed scale makes the
 // step self-discriminating: a surface or color step through the center
-// texel leaves >= 3 coherent far-side taps in the scale (q ~ 2-3, ~15-20%
+// texel leaves >= 3 coherent far-side taps in the scale (mild
 // reweighting -- the gate stays step-wide), while an isolated sparkle is
-// 1-2 texels (excluded from the scale, q >> 1, strong downweighting).
-// 4.5 keeps a coherent group at >= 80% weight and drops a 7-sigma
-// isolated tap below 15%. Raise it if edges over-engage; lower it for
-// harsher sparkle suppression.
+// 1-2 texels (excluded from the scale, strong downweighting).
 static const float kPlaneIrlsDof = 4.5;
+// ---- the structure split's transport ----
+// The EMA rate for the split fraction. Steady-state noise ~0.31; ~5-frame
+// convergence after a reset.
+static const float kSplitEmaRate = 0.2;
+// ---- the transport scatter's motion gate ----
+static const float kTransportGatePx = 2.0;
 
 // ============================================================================
-// THE STATISTICS
+// THE MOMENT ACCUMULATOR (both IRLS passes share it)
 // ============================================================================
 struct ColorMomentAccum
 {
@@ -201,6 +183,10 @@ struct ColorMomentAccum
     float  wXY;
     float  wXZ;
     float  wYZ;
+    float2 offSumW2;   // Sum w^2 o       (the exact evaluation variance)
+    float  offXSqW2;   // Sum w^2 ox^2
+    float  offYYSqW2;  // Sum w^2 oy^2
+    float  offXYW2;    // Sum w^2 ox oy
 };
 
 void AccumulateColorMoments(float3 taps[9], float w[9], out ColorMomentAccum a)
@@ -218,18 +204,23 @@ void AccumulateColorMoments(float3 taps[9], float w[9], out ColorMomentAccum a)
     a.wXY = 0.0;
     a.wXZ = 0.0;
     a.wYZ = 0.0;
+    a.offSumW2 = float2(0.0, 0.0);
+    a.offXSqW2 = 0.0;
+    a.offYYSqW2 = 0.0;
+    a.offXYW2 = 0.0;
 
     [unroll]
     for (int i = 0; i < 9; ++i)
     {
-        float3 c  = taps[i];
-        float2 o  = kOffsets3x3[i];
-        float  wi = w[i];
+        float3 c   = taps[i];
+        float2 o   = kOffsets3x3[i];
+        float  wi  = w[i];
+        float  wi2 = wi * wi;
 
         a.sum3     += c * wi;
         a.sumSq3   += c * c * wi;
         a.totalW   += wi;
-        a.totalWSq += wi * wi;
+        a.totalWSq += wi2;
         a.offSum   += o * wi;
         a.offXSq   += o.x * o.x * wi;
         a.offYSq   += o.y * o.y * wi;
@@ -239,6 +230,10 @@ void AccumulateColorMoments(float3 taps[9], float w[9], out ColorMomentAccum a)
         a.wXY += wi * c.x * c.y;
         a.wXZ += wi * c.x * c.z;
         a.wYZ += wi * c.y * c.z;
+        a.offSumW2 += o * wi2;
+        a.offXSqW2 += o.x * o.x * wi2;
+        a.offYYSqW2 += o.y * o.y * wi2;
+        a.offXYW2  += o.x * o.y * wi2;
     }
 }
 
@@ -305,8 +300,8 @@ ColorNeighborhoodStats ComputeColorNeighborhoodStats(
         }
     }
 
-    // ---- the design weights: the plain kernel (stored unmodified as the
-    //      soft clip's spatial prior) times the weighting modifiers -------
+    // ---- the design weights: the plain kernel times the weighting
+    //      modifiers -------------------------------------------------------
     float motionFactor = saturate(motionNormalized);
     float w9[9];
     [unroll]
@@ -323,7 +318,6 @@ ColorNeighborhoodStats ComputeColorNeighborhoodStats(
             w = wAxisX[(int)kOffsets3x3[i].x + 1] * wAxisY[(int)kOffsets3x3[i].y + 1];
         else
             w = kStdWeights[i];
-        stats.mixWeights[i] = w;
 
         if (taaLumaVariance > 0.5) { w *= (1.0 / (1.0 + max(tapColorSpace.x, 0.0))); }
         if (taaVelocityAlignedVariance > 0.5 && i > 0)
@@ -341,41 +335,72 @@ ColorNeighborhoodStats ComputeColorNeighborhoodStats(
     float2 cen1  = acc1.offSum * invW1;
     ColorPlaneFit fit1 = SolveColorPlane(acc1, mean1, cen1, invW1);
 
-    // ---- the per-tap residuals and the DROP-ONE trimmed scale ----------
-    // Dropping only the largest weighted residual makes the scale
-    // group-aware: a coherent step keeps its group in the scale (the
-    // far side's q stays moderate, the gate keeps its step width); an
-    // isolated sparkle is excluded (its q explodes, its design weight
-    // collapses). No classifier gating needed -- the geometry
-    // self-discriminates.
-    float3 res9[9];
-    float  sumWr2 = 0.0;
-    float  maxWr2 = 0.0;
+    // ---- the PASS-1 HAT DIAGONALS and the studentized residuals -------
+    // h_i = (w_i/W)(1 + mahal_i);  Var(r_i) = sigma^2 (1 - h_i);  Sum h_i
+    // = 3 exactly (the trace identity). The studentized residual has
+    // E[q] = 1 per tap, so the IRLS sees a calibrated chi^2_1: clean taps
+    // keep weight exactly 1 and a contaminated CENTER tap (the highest
+    // hat, previously the most under-tested) is downweighted at its true
+    // deviation.
+    float2 vInv1_0 = float2(0.0, 0.0);
+    float2 vInv1_1 = float2(0.0, 0.0);
+    if (fit1.detV > 1e-6)
+    {
+        vInv1_0 = float2( fit1.vYY, -fit1.vXY) / fit1.detV;
+        vInv1_1 = float2(-fit1.vXY,  fit1.vXX) / fit1.detV;
+    }
+    float  rStdSq[9];
+    float  sumWrStd2 = 0.0;
+    float  maxWrStd2 = 0.0;
+    float  wAtMax = 0.0;
     [unroll]
     for (int r = 0; r < 9; ++r)
     {
-        float2 o = kOffsets3x3[r];
-        res9[r] = neighborhoodColorSpace[r]
-                - (mean1 + fit1.gradX * (o.x - cen1.x) + fit1.gradY * (o.y - cen1.y));
-        float wr2 = w9[r] * dot(res9[r], res9[r]);
-        sumWr2 += wr2;
-        maxWr2  = max(maxWr2, wr2);
+        float2 d1 = kOffsets3x3[r] - cen1;
+        float3 res = neighborhoodColorSpace[r]
+                   - (mean1 + fit1.gradX * d1.x + fit1.gradY * d1.y);
+        float mahal = (fit1.detV > 1e-6)
+            ? (d1.x * dot(vInv1_0, d1) + d1.y * dot(vInv1_1, d1))
+            : 0.0;
+        float oneMinusH = max(1.0 - w9[r] * (1.0 + mahal) * invW1, 0.1);
+        rStdSq[r] = dot(res, res) / oneMinusH;
+        float wr = w9[r] * rStdSq[r];
+        sumWrStd2 += wr;
+        if (wr > maxWrStd2) { maxWrStd2 = wr; wAtMax = w9[r]; }
     }
-    float dofCorr1    = 1.0 / max(1.0 - 3.0 * saturate(acc1.totalWSq * invW1 * invW1), 1.0 / 3.0);
-    float sigmaTrimSq = max((sumWr2 - maxWr2) * invW1 * dofCorr1, kMinSigma * kMinSigma);
+    // The drop-one trimmed scale on the STUDENTIZED residuals (E = sigma^2
+    // per tap; dropping the largest biases low -> q high -> conservative).
+    // No dof correction: the studentization already makes the scale exact.
+    float sigmaTrimSq = max((sumWrStd2 - maxWrStd2)
+                            / max(acc1.totalW - wAtMax, 0.5),
+                            kMinSigma * kMinSigma);
 
-    // ---- the t-IRLS multipliers (the same Lange form as the tap's F5) --
-    // w_k / v_k with v_k = sPer * (nu + q_k)/(nu + 1): the heteroscedastic
-    // one-step refit. Clean taps are mildly up-weighted (q < 1), the
-    // isolated outlier collapses. One step from the LS start is the
-    // canonical point: full efficiency at the Gaussian, bounded influence
-    // at the contamination.
+    // ---- the t-IRLS multipliers and the SANDWICH count -----------------
+    // w2: the Lange refit weights (w_k * (nu+1)/(nu+q)). One step from
+    //     the LS start: full efficiency at the Gaussian, bounded influence
+    //     at the contamination.
+    // w3: the INFORMATION-POSITIVE mass (the Godambe/sandwich count). The
+    //     true information of an M-estimate is Sum w*psi'(u), and psi' for
+    //     the Student weight goes NEGATIVE past q = nu: a tap pushed past
+    //     the redescend threshold is anti-informative, not weakly
+    //     informative. The count saturates its factor at zero; on clean
+    //     content the factor is a near-constant that cancels in the
+    //     concentration ratio (~6% dof inflation -- conservative), and at
+    //     a firefly the tap leaves the count entirely, dropping the dof
+    //     and widening the Student factor exactly when the plane was
+    //     contaminated.
     float w2[9];
+    float w3[9];
+    float sumW3 = 0.0;
+    float sumW3Sq = 0.0;
     [unroll]
     for (int t = 0; t < 9; ++t)
     {
-        float q = dot(res9[t], res9[t]) / sigmaTrimSq;
+        float q = rStdSq[t] / sigmaTrimSq;
         w2[t] = w9[t] * ((kPlaneIrlsDof + 1.0) / (kPlaneIrlsDof + q));
+        w3[t] = w2[t] * saturate((kPlaneIrlsDof - q) / (kPlaneIrlsDof + q));
+        sumW3   += w3[t];
+        sumW3Sq += w3[t] * w3[t];
     }
 
     // ---- PASS 2: the reweighted moments -- everything downstream -------
@@ -384,7 +409,7 @@ ColorNeighborhoodStats ComputeColorNeighborhoodStats(
 
     float invTotalWeight = 1.0 / max(acc.totalW, kEpsilon);
     float3 mean3         = acc.sum3 * invTotalWeight;
-    stats.invNeff        = saturate(acc.totalWSq * invTotalWeight * invTotalWeight);
+    stats.invNeff        = saturate(sumW3Sq / max(sumW3 * sumW3, 1e-12));
     float2 cenPx         = acc.offSum * invTotalWeight;
 
     {
@@ -393,22 +418,77 @@ ColorNeighborhoodStats ComputeColorNeighborhoodStats(
         stats.gradLSy = fit.gradY;
         stats.phaseShift = -(fit.gradX * jitterPx.x + fit.gradY * jitterPx.y);
 
-        // The fitted value at the history's target (content position 0):
-        // plane(0) = mean + g*(j - cen); variance sPer*(invNeff + lever)
-        // (the v5.3 exact form), lever = the Mahalanobis quadratic of the
-        // eval offset.
         float2 dEval = jitterPx - cenPx;
-        float  leverFull = (fit.vYY * dEval.x * dEval.x - 2.0 * fit.vXY * dEval.x * dEval.y + fit.vXX * dEval.y * dEval.y)
-                         / max(fit.detV, 1e-6);
-        stats.lever  = min(max(leverFull, 0.0), kMaxLever);
+        float plainInvNeff = acc.totalWSq / max(acc.totalW * acc.totalW, 1e-6);
+
+        // THE EXACT EVALUATION VARIANCE: plane0 = Sum c_k tap_k with
+        //   c_k = (w_k/W)(1 + dEval' S^-1 (o_k - cen)),  vFit = sPer*Sum c_k^2
+        //   Sum c^2 = (Sum w^2 + 2*cross + quad) / W^2
+        //     cross = dEval' S^-1 (Sum w^2 (o - cen))
+        //     quad  = dEval' S^-1 (Sum w^2 (o-cen)(o-cen)') S^-1 dEval
+        // Reproduces the classical (1/n)(1 + mahal) on uniform weights
+        // exactly (cross vanishes by centering). The PLAIN w2
+        // concentration -- NOT the sandwich count: w3 is the information
+        // (a dof-side quantity); mixing it here would double-count the
+        // psi' factor into the variance. Degenerate spread: the unobserved
+        // direction is dropped by the decoupled fit; the charge is guarded.
+        float evalVar;
+        if (fit.detV > 1e-6)
+        {
+            float2 vInv0 = float2( fit.vYY, -fit.vXY) / fit.detV;
+            float2 vInv1 = float2(-fit.vXY,  fit.vXX) / fit.detV;
+            float2 uEval = float2(dot(vInv0, dEval), dot(vInv1, dEval));
+            float2 sumW2offCen = acc.offSumW2 - cenPx * acc.totalWSq;
+            float  sXX = acc.offXSqW2 - 2.0 * cenPx.x * acc.offSumW2.x
+                       + acc.totalWSq * cenPx.x * cenPx.x;
+            float  sYY = acc.offYYSqW2 - 2.0 * cenPx.y * acc.offSumW2.y
+                       + acc.totalWSq * cenPx.y * cenPx.y;
+            float  sXY = acc.offXYW2 - cenPx.x * acc.offSumW2.y
+                       - cenPx.y * acc.offSumW2.x
+                       + acc.totalWSq * cenPx.x * cenPx.y;
+            float cross = dot(uEval, sumW2offCen);
+            float quad  = uEval.x * uEval.x * sXX + uEval.y * uEval.y * sYY
+                        + 2.0 * uEval.x * uEval.y * sXY;
+            evalVar = (acc.totalWSq + 2.0 * cross + quad)
+                    / max(acc.totalW * acc.totalW, 1e-6);
+            evalVar = clamp(evalVar, 1.0 / 9.0, plainInvNeff + kMaxEvalVar);
+        }
+        else
+        {
+            evalVar = plainInvNeff + kMaxEvalVar;
+        }
+        stats.evalVar = evalVar;
         stats.plane0 = mean3 + fit.gradX * dEval.x + fit.gradY * dEval.y;
+
+        // THE EXACT RESIDUAL DOF: E[Sum w r^2] = sigma^2 * Sum w(1-h).
+        // This is the stability condition of the H-free ingest (with the
+        // dof biased high, the split anchor R exceeded sPer, the de-bias
+        // over-subtracted, and the record sagged without a fixed point).
+        float sumW2OnePlusMahal = 0.0;
+        if (fit.detV > 1e-6)
+        {
+            float2 vInv0 = float2( fit.vYY, -fit.vXY) / fit.detV;
+            float2 vInv1 = float2(-fit.vXY,  fit.vXX) / fit.detV;
+            [unroll]
+            for (int hh = 0; hh < 9; ++hh)
+            {
+                float2 d2 = kOffsets3x3[hh] - cenPx;
+                sumW2OnePlusMahal += w2[hh] * w2[hh]
+                    * (1.0 + d2.x * dot(vInv0, d2) + d2.y * dot(vInv1, d2));
+            }
+        }
+        else
+        {
+            sumW2OnePlusMahal = acc.totalWSq;
+        }
+        float dofSSR = max(acc.totalW - sumW2OnePlusMahal * invTotalWeight, 0.25);
+        stats.residDof = dofSSR;
 
         float3 scc = acc.sumSq3 * invTotalWeight - mean3 * mean3;
         float3 ssr = scc
                    - 2.0 * (fit.gradX * fit.covX + fit.gradY * fit.covY)
                    + (fit.gradX * fit.gradX * fit.vXX + fit.gradY * fit.gradY * fit.vYY + 2.0 * fit.gradX * fit.gradY * fit.vXY);
-        float dofCorr = 1.0 / max(1.0 - 3.0 * stats.invNeff, 1.0 / 3.0);
-        stats.residSq = max(ssr * dofCorr, 0.0);
+        stats.residSq = max(ssr * acc.totalW / dofSSR, 0.0);
 
         // F1: the prior/tap shared-sample covariance, on the robust
         // weights. The residSq basis models the structure as sharing
@@ -467,7 +547,7 @@ void ShrunkenCorrelations(ColorNeighborhoodStats stats, out float rXY, out float
 }
 
 // ============================================================================
-// CLIP-STATE TRANSPORT (tag 101, v5.3 layout)
+// CLIP-STATE TRANSPORT (tag 101)
 // ============================================================================
 static const float kVarHCodeLogMin  = -6.0;
 static const float kVarHCodeLogSpan = 9.0;
@@ -518,8 +598,7 @@ void DecodeClipState(float alphaValue, out float sigmaSq, out float varHSq,
     else if (tag == 0x1u)
     {
         // The debug payload carries the sigma only: the split reads neutral
-        // (0.0) while a debug mode is active and re-converges in ~5 frames
-        // after. The RECORD chain survives (sigma rides the payload).
+        // while a debug mode is active and re-converges in ~5 frames.
         code = u & 0x3Fu;
     }
     else
@@ -534,9 +613,9 @@ void DecodeClipState(float alphaValue, out float sigmaSq, out float varHSq,
 }
 
 // ============================================================================
-// THE RECORD SEED (the model's per-channel E[i^2] -- ONE formula feeding
-// the seed AND the split's share). The full quadratic form on the working
-// LS gradient; with jitter off the phase term is naturally 0.
+// THE RECORD SEED (the model's per-channel E[i^2] -- the COLD estimate.
+// The transported record means sPer; the seed models sPer + varH, and the
+// varH share (~2%) is absorbed by the EMA within a few frames.)
 // ============================================================================
 float3 SeedRecordVarX(ColorNeighborhoodStats stats)
 {
@@ -552,19 +631,19 @@ float SeedRecordTotalSq(ColorNeighborhoodStats stats)
 }
 
 // ============================================================================
-// THE RECORD'S PER-CHANNEL SPLIT
+// THE RECORD'S PER-CHANNEL SPLIT (the transported record IS sPer)
 // ============================================================================
 struct RecordVarianceParts
 {
-    float3 ePer;           // per-channel PRE-update E[i_k^2] (arming-capped)
+    float3 ePer;           // per-channel PRE-update E[i_k^2] = sPer + varH
     float3 varHPer;        // per-channel accumulator variance (READ semantics)
-    float3 sPer;           // implied per-sample variance: the tap likelihood's
+    float3 sPer;           // the tap likelihood's variance (the record itself)
     float  spatialPriorSq; // the content-scale reference (the winsor anchor)
 };
 
 RecordVarianceParts SplitRecordVariance(
     ColorNeighborhoodStats stats,
-    float recordSqTotal, float varHTotal, float nuRecord)
+    float sPerSqTotal, float varHTotal, float nuRecord)
 {
     RecordVarianceParts p;
 
@@ -577,21 +656,21 @@ RecordVarianceParts SplitRecordVariance(
     float spatialPriorSq = max(SeedRecordTotalSq(stats), kClipSigmaRecordFloorSq);
 
     // THE ARMING CAP at the record's LIVE dof (the exact chi^2_nu(0.999)/nu
-    // bound, host-fit) -- binds the record AND the transported VarH share.
+    // bound, host-fit) -- binds sPer AND the transported VarH share.
     float nuCap = max(nuRecord, 2.0);
     float armingCap = 1.0 + taaArmingA / sqrt(nuCap) + taaArmingB / nuCap;
 
-    float recordSq = min(max(recordSqTotal, 0.0), armingCap * spatialPriorSq);
-    float varHSq   = min(max(varHTotal, 0.0), armingCap * spatialPriorSq);
-    p.ePer    = max(share * recordSq, float3(kClipSigmaRecordFloorSq, kClipSigmaRecordFloorSq, kClipSigmaRecordFloorSq));
-    p.spatialPriorSq = spatialPriorSq;
+    float sPerSq = min(max(sPerSqTotal, 0.0), armingCap * spatialPriorSq);
+    float varHSq = min(max(varHTotal,  0.0), armingCap * spatialPriorSq);
+    p.sPer    = max(share * sPerSq, float3(kClipSigmaRecordFloorSq, kClipSigmaRecordFloorSq, kClipSigmaRecordFloorSq));
     p.varHPer = share * varHSq;
-    p.sPer    = max(p.ePer - p.varHPer, 0.0);
+    p.ePer    = p.sPer + p.varHPer;
+    p.spatialPriorSq = spatialPriorSq;
     return p;
 }
 
 // The whitened innovation on the READ-side denominators + the shrunk full
-// metric (the geometric corroboration test's form).
+// metric (the geometric corroboration test's form -- the shared 95% level).
 float WhitenedInnovSq(float3 innov, RecordVarianceParts p, float3 transportVar,
                       float rXY, float rXZ, float rYZ)
 {
@@ -637,7 +716,7 @@ ClipGateResult ClipHistoryToStatisticGate(
     bool   recordLive,
     float  recordAge,
     float  splitFrac,
-    float  motionNormalized,
+    float2 missSigmaPx,
     float3 neighborhoodTaps[9])
 {
     ClipGateResult r;
@@ -661,19 +740,26 @@ ClipGateResult ClipHistoryToStatisticGate(
         float3 sPer    = parts.sPer;
         float3 varHPer = parts.varHPer;
 
-        // THE STRUCTURE SPLIT (v5.3): the transported, temporally
-        // stabilized fraction times the live spatial residual. The clamp
-        // acts on the stable side (see the file header).
+        // THE STRUCTURE SPLIT: the transported, temporally stabilized
+        // fraction times the live spatial residual. The clamp acts on the
+        // stable side.
         float3 tauB2 = max(splitFrac, 0.0) * stats.residSq;
 
-        // THE FIT'S NOISE TERM (v5.3, exact): sPer-scaled through the
-        // leverage quadratic; the structure is charged once, as tauB2.
-        float3 vFit   = sPer * (stats.invNeff + stats.lever);
+        // THE FIT'S NOISE TERM (exact): sPer * Sum c_k^2 -- the evaluation
+        // functional's exact variance; the structure is charged once.
+        float3 vFit   = sPer * stats.evalVar;
         float3 vPrior = tauB2 + vFit;
 
         float3 x0c = currentColorSpace - stats.phaseShift;
         float3 dev = x0c - stats.plane0;
-        float3 qTap = (dev * dev) / max(vPrior + sPer, float3(1e-10, 1e-10, 1e-10));
+        // The exact quadratic form of dev: Var(dev) = sPer + vPrior - 2*cPT
+        // (the same identity the ingest de-biases with). The prior form
+        // (vPrior + sPer) understated q exactly at the phase-near taps,
+        // where fireflies land. The floor guards the perfect-correlation
+        // limit (the CS bound guarantees only >= 0).
+        float3 qTapDen = max(vPrior + sPer - 2.0 * stats.priorTapCov,
+                             0.25 * (vPrior + sPer));
+        float3 qTap = (dev * dev) / max(qTapDen, float3(1e-10, 1e-10, 1e-10));
         // F5: the exact one-step t weight (Lange-Little-Taylor).
         float3 sPerEff = sPer * (nuRecordSafe + qTap) / (nuRecordSafe + 1.0);
 
@@ -691,14 +777,15 @@ ClipGateResult ClipHistoryToStatisticGate(
 
         // ---- the Satterthwaite dof ----
         // tauB2's per-frame noise is the live residSq's (f^2-scaled through
-        // the reconstruction), charged at nuResid. The EMA'd fraction's own
-        // residual noise is NOT charged here: it manifests as the clamp's
-        // positive-part mean, already carried in vPrior, and charging it
-        // again would double-count. (If mode 13 shows over-engagement on
-        // static smooth content, add tauB2^2 * kSplitEmaRate/(2-rate) /
-        // max(splitFrac,0.04)^2 -- the documented revert.)
-        float  nuResid = max(1.0 / max(stats.invNeff, 1e-3) - 3.0, 2.0);
-        float3 denomTau = tauB2 * tauB2 / nuResid;
+        // the reconstruction), charged at residSq's OWN exact dof
+        // (Sum w(1-h) on the robust weights -- the sandwich count's
+        // variance-side twin). The EMA'd fraction's residual noise is NOT
+        // charged: it manifests as the clamp's positive-part mean, already
+        // carried in vPrior, and charging it again would double-count. (If
+        // mode 13 shows over-engagement on static smooth content, add
+        // tauB2^2 * kSplitEmaRate/(2-kSplitEmaRate) / max(splitFrac,0.04)^2
+        // -- the documented revert.)
+        float3 denomTau = tauB2 * tauB2 / max(stats.residDof, 1.0);
         float3 nuPrior = vPrior * vPrior
                        / max(denomTau + vFit * vFit / nuRecordSafe, float3(1e-10, 1e-10, 1e-10));
         nuPrior = max(nuPrior, float3(2.0, 2.0, 2.0));
@@ -721,14 +808,13 @@ ClipGateResult ClipHistoryToStatisticGate(
         // ---- the cold path: the no-record LIMIT of the same model, not a
         // separate policy. With no record, stability cannot be certified:
         // all residual is per-sample noise (tauB2 = 0, sPer = the seed's
-        // full E[i^2] model), so vPrior = seed * (invNeff + lever) with the
-        // phase folded in -- the form below. At straddled pixels the step
-        // sits in residSq, so the cold width is step-inflated there (the
-        // flat machinery's honest edge acceptance). ----
+        // full E[i^2] model), so vPrior = seed * Sum c_k^2 with the phase
+        // folded in -- the form below. At straddled pixels the step sits
+        // in residSq, so the cold width is step-inflated there. ----
         float3 phase = taaJitterPhaseEx  * (stats.gradLSx * stats.gradLSx)
                      + taaJitterPhaseEy  * (stats.gradLSy * stats.gradLSy)
                      + 2.0 * taaJitterPhaseExy * (stats.gradLSx * stats.gradLSy);
-        gateVarBase = stats.invNeff * (phase + stats.residSq);
+        gateVarBase = stats.evalVar * (phase + stats.residSq);
         gateVar = gateVarBase;
         center = stats.plane0;
         nuPost = max(1.0 / max(stats.invNeff, 1e-3) - 3.0, 2.0);
@@ -789,16 +875,20 @@ ClipGateResult ClipHistoryToStatisticGate(
     bool posteriorPath = (taaSoftClip > 0.001) && (mdd > chi * chi);
     if (posteriorPath)
     {
-        // ============ THE GHOST POSTERIOR ============
+        // ============ THE GHOST POSTERIOR (the measured miss model) =====
         // H0: the hierarchical null at its honest UN-INFLATED predictive
         // variance, on the SAME shrunk full metric as the hard test (F6)
-        // with the exact relative log-det normalizer. H1: a PROPER mixture
-        // -- the 8 NEIGHBOR TEXELS' accumulated content (what a
-        // landing-miss ghost holds) plus one temporal tail. THE CENTER TAP
-        // IS NOT A COMPONENT -- it IS the null's likelihood. Every
-        // component is a full log-density: its own scale normalizer sits
-        // INSIDE the logsumexp, and the null's +0.5*logDetNull is charged
-        // once, outside.
+        // with the exact relative log-det normalizer. H1: the landing-miss
+        // hypothesis -- a PROPER mixture of the 8 NEIGHBOR TEXELS'
+        // accumulated content (what a landing-miss ghost holds) plus one
+        // temporal tail (the old content absent from the 9-tap sample).
+        // THE CENTER TAP IS NOT A COMPONENT -- it IS the null's likelihood.
+        // Every weight is generated by ONE Gaussian miss distribution
+        // N(0, diag(sx^2, sy^2)) in texel units, measured by the transport
+        // machinery (see the call site): the prior odds from its Rayleigh
+        // tail at r0, the neighbor masses from its density at the texel
+        // offsets, the tail mass from its tail at r1 -- all renormalized
+        // to the conditional distribution of the miss GIVEN a ghost.
         float3 nullScale = max((gateVarBase + transportTerm) * (chromaScale * chromaScale), float3(minGateVar, minGateVar, minGateVar));
         float3 vCompRaw = recordLive
             ? parts.varHPer + max(parts.sPer, float3(1e-8, 1e-8, 1e-8)) + transportTerm
@@ -841,14 +931,49 @@ ClipGateResult ClipHistoryToStatisticGate(
             }
         }
 
-        // The tap log-weights: the jitter-centered spatial prior
-        // renormalized over the 8 neighbor components -- a PROPER mixture.
-        float wSum8 = 0.0;
-        [unroll]
-        for (int w8 = 0; w8 < 9; ++w8)
-            wSum8 += stats.mixWeights[w8];
-        wSum8 = max(wSum8 - stats.mixWeights[0], 1e-4);
-        float logTapW = log(1.0 - kCusumTailWeight) - log(wSum8);
+        // ---- the miss model ----
+        float sx = max(missSigmaPx.x, kMinMissSigma);
+        float sy = max(missSigmaPx.y, kMinMissSigma);
+        float sEffSq = 0.5 * (sx * sx + sy * sy);
+        float inv2Sx = 0.5 / (sx * sx);
+        float inv2Sy = 0.5 / (sy * sy);
+        float logNormC = -log(6.2831853 * sx * sy);
+
+        // The prior odds: P(|miss| > r0) / P(|miss| <= r0), the Rayleigh
+        // tail. Collapses on clean content (the soft clip switches itself
+        // off); runs hot on large measured scatter (the history really is
+        // miss-contaminated). The dial is kMissRadiusOdds, never a cap.
+        float pH1 = exp(-0.5 * kMissRadiusOdds * kMissRadiusOdds / sEffSq);
+        float logPriorOdds = log(max(pH1, 1e-30)) - log(max(1.0 - pH1, 1e-6));
+
+        // The component masses: P(miss in texel j) = the Gaussian density
+        // at offset j (texel area 1 -- the density-times-area form is
+        // within ~4% of the exact integral for all sigma); the tail:
+        // P(|miss| > r1) + the optional change-class floor. logSumM
+        // renormalizes the 9 into the conditional distribution GIVEN a
+        // ghost.
+        float lMass[8];
+        float lMassTail;
+        float logSumM;
+        {
+            float lmMax = -1e30;
+            [unroll]
+            for (int j = 1; j < 9; ++j)
+            {
+                float2 o = kOffsets3x3[j];
+                lMass[j - 1] = logNormC - (o.x * o.x) * inv2Sx - (o.y * o.y) * inv2Sy;
+                lmMax = max(lmMax, lMass[j - 1]);
+            }
+            lMassTail = log(exp(-0.5 * kMissRadiusTail * kMissRadiusTail / sEffSq)
+                            + kTailChangeFloor);
+            lmMax = max(lmMax, lMassTail);
+            float mSum = 0.0;
+            [unroll]
+            for (int j1 = 0; j1 < 8; ++j1)
+                mSum += exp(lMass[j1] - lmMax);
+            mSum += exp(lMassTail - lmMax);
+            logSumM = lmMax + log(max(mSum, 1e-10));
+        }
 
         float lComp[8];
         float lMax = -1e30;
@@ -859,7 +984,7 @@ ClipGateResult ClipHistoryToStatisticGate(
             // footprint-average estimate is tap_j + g*j).
             float3 dd = dCorr + (center - neighborhoodTaps[j]) + stats.phaseShift;
             float  qj = dot(dd * dd, invComp);
-            lComp[j - 1] = log(max(stats.mixWeights[j], 1e-4)) + logTapW
+            lComp[j - 1] = lMass[j - 1]
                          - kT * log(1.0 + qj / nu)
                          - 0.5 * (log(vComp.x) + log(vComp.y) + log(vComp.z));
             lMax = max(lMax, lComp[j - 1]);
@@ -871,7 +996,7 @@ ClipGateResult ClipHistoryToStatisticGate(
         float3 invTail = float3(1.0, 1.0, 1.0) / tailScale;
         float qTail = dot(dCorr * dCorr, invTail);
 
-        float lTail = log(kCusumTailWeight)
+        float lTail = lMassTail
                     - kT * log(1.0 + qTail / nu)
                     - 0.5 * (log(tailScale.x) + log(tailScale.y) + log(tailScale.z));
         lMax = max(lMax, lTail);
@@ -882,23 +1007,19 @@ ClipGateResult ClipHistoryToStatisticGate(
             wSum += exp(lComp[j2] - lMax);
         wSum += exp(lTail - lMax);
 
-        // llr = log p1 - log p0: the mixture's logsumexp, plus the null's
-        // full -log p0 (the t-core and its log-det normalizer).
-        float llrFrame = (lMax + log(max(wSum, 1e-10)))
+        // llr = log p1 - log p0: the conditional mixture's logsumexp
+        // (renormalized through -logSumM), plus the null's full -log p0
+        // (the t-core and its log-det normalizer).
+        float llrFrame = (lMax + log(max(wSum, 1e-10))) - logSumM
                        + kT * log(1.0 + q0Comp / nu)
                        + 0.5 * logDetNull;
 
-        // The prior odds: the per-pixel base plus the motion term (the one
-        // hand-set prior -- a landing miss is likely at full motion).
-        float logOdds = kGhostLogOddsBase
-                      + log(1.0 + kGhostMotionOdds * saturate(motionNormalized))
-                      + llrFrame;
+        float logOdds = logPriorOdds + llrFrame;
         float p1 = 1.0 / (1.0 + exp(-logOdds));
 
         // The scalar pull -- the posterior-mean action, floored by the
-        // hard ray clamp. The pull IS the eviction mechanism: the stored
-        // history moves toward the best-explaining content at wPull per
-        // frame, and the next frame reads the moved history.
+        // hard ray clamp. The pull IS the eviction mechanism for the miss
+        // class; the change class is the hard clamp's (v5.5).
         float wPull = saturate(p1);
         wPull = max(wPull, 1.0 - tHard);
 
