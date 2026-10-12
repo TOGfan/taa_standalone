@@ -338,13 +338,13 @@ end
 -- ============================================================================
 local STUDENT_RHO   = 0.15                              -- kClipSigmaEmaRate
 local STUDENT_NU0   = 4.0                               -- kClipStudentPriorDof
--- v3.8.4: the estimator consumes the FULL 3x3 (9 taps). The typical
--- effective count of the kernel-weighted 3x3 is ~7 -> dof ~6, which this
--- anchor must track (the shader computes the actual per-pixel value from
--- the same weights). If kStdWeights differs materially from the
--- [1 2 1]-outer-product family, remeasure as 1/sum(w^2) - 1 and set this
--- to that value.
-local STUDENT_NUINF = 6.0 * (2.0 - STUDENT_RHO) / STUDENT_RHO -- ~74 (r = 6)
+-- v4.1: the record ingests the pixel's own squared innovation (the
+-- spatial estimator is gone). Var(i^2)/E[i^2]^2 = 2 for Gaussian i, and
+-- the varFrac convention (per-frame relative variance = 1/r) gives
+-- r = 1/2 -> nu_inf ~ 6.2. This is the honest dof of the single-sample
+-- EMA; the aged Student factor widens accordingly, and the widened gate's
+-- shelter is supervised by the (now undiluted) persistence detector.
+local STUDENT_NUINF = 0.5 * (2.0 - STUDENT_RHO) / STUDENT_RHO -- ~6.17 (r = 0.5)
 
 local function erfApprox(x)  -- Abramowitz & Stegun 7.1.26 (|eps| <= 1.5e-7)
     local sign = 1.0
