@@ -20,8 +20,8 @@
 
     <!-- Main Scrollable List -->
     <div class="options-list-scroll" :class="{ 'is-disabled': !isActive }">
-      <details 
-        v-for="(category, catIndex) in settingsSchema" 
+      <details
+        v-for="(category, catIndex) in settingsSchema"
         :key="category.name"
         class="category-block"
         :open="catIndex === 0"
@@ -29,37 +29,35 @@
         <summary class="category-title">{{ category.name }}</summary>
 
         <div class="category-items">
-          <div 
-            v-for="item in category.items" 
-            :key="item.id" 
+          <div
+            v-for="item in category.items"
+            :key="item.id"
             class="options-item-row"
             @mouseenter="hoveredItem = item"
             @mouseleave="hoveredItem = null"
           >
-            <!-- Top Half: Label & Switches -->
+            <!-- Header: label, switch (bools), and the ONE reset button -->
             <div class="row-header">
               <div class="option-label">{{ item.name }}</div>
-
-              <div v-if="item.type === 'bool' || item.type === 'numBool'" class="inline-controls">
-                <BngSwitch 
+              <div class="header-controls">
+                <BngSwitch
+                  v-if="item.type === 'bool' || item.type === 'numBool'"
                   :modelValue="config[item.id] === 1 || config[item.id] === true"
                   @update:modelValue="val => onSwitchChange(item, val)"
                   :disabled="!isActive"
                 />
-                <div class="option-reset">
-                  <BngButton 
-                    :icon="icons.undo"
-                    :accent="ACCENTS.outlined"
-                    @click="resetSetting(item)"
-                    class="bng-reset-btn"
-                    :style="{ visibility: config[item.id] !== item.default ? 'visible' : 'hidden' }"
-                    title="Reset to default"
-                  />
-                </div>
+                <BngButton
+                  :icon="icons.undo"
+                  :accent="ACCENTS.outlined"
+                  @click="resetSetting(item)"
+                  class="bng-reset-btn"
+                  :style="{ visibility: isModified(item) ? 'visible' : 'hidden' }"
+                  title="Reset to default"
+                />
               </div>
             </div>
 
-            <!-- Bottom Half: Native BngSlider -->
+            <!-- Float slider -->
             <div v-if="item.type === 'float'" class="stacked-controls">
               <BngSlider
                 class="native-slider"
@@ -71,19 +69,9 @@
                 :with-input="true"
                 :disabled="!isActive"
               />
-              <div class="option-reset">
-                <BngButton 
-                  :icon="icons.undo"
-                  :accent="ACCENTS.outlined"
-                  @click="resetSetting(item)"
-                  class="bng-reset-btn"
-                  :style="{ visibility: sliderModified(item) ? 'visible' : 'hidden' }"
-                  title="Reset to default"
-                />
-              </div>
             </div>
 
-            <!-- Bottom Half: Custom Dropdown Select -->
+            <!-- Dropdown select -->
             <div v-if="item.type === 'select'" class="stacked-controls select-control">
               <div v-if="openDropdown === item.id" class="dropdown-backdrop" @click="openDropdown = null"></div>
 
@@ -92,7 +80,7 @@
                   <span>{{ getOptionLabel(item, config[item.id]) }}</span>
                   <span class="dropdown-arrow">▼</span>
                 </div>
-                
+
                 <div class="dropdown-list" v-if="openDropdown === item.id">
                   <div
                     v-for="opt in item.options"
@@ -104,17 +92,6 @@
                     {{ opt.label }}
                   </div>
                 </div>
-              </div>
-
-              <div class="option-reset">
-                <BngButton 
-                  :icon="icons.undo"
-                  :accent="ACCENTS.outlined"
-                  @click="resetSetting(item)"
-                  class="bng-reset-btn"
-                  :style="{ visibility: config[item.id] !== item.default ? 'visible' : 'hidden' }"
-                  title="Reset to default"
-                />
               </div>
             </div>
 
@@ -153,6 +130,8 @@ const openDropdown = ref(null)
 // stored setting (varianceGamma) stays the chi radius so the shader
 // contract, the settings file and the Lua Student-fit plumbing are
 // untouched. acceptance = CDF_chi2_3(chiEff^2), chiEff = chi * (1 + clipOvershoot).
+// The host's Student fit is constructed to restore this nominal coverage at
+// every record age, so the slider's meaning is age-independent.
 function erf(x) { // Abramowitz & Stegun 7.1.26 (|eps| <= 1.5e-7)
   const sign = x < 0 ? -1 : 1
   x = Math.abs(x)
@@ -179,8 +158,6 @@ function coverageToChi(pct) {
   return (lo + hi) / 2
 }
 
-
-
 const settingsSchema = [
 {
   name: "General & Sharpening",
@@ -190,19 +167,19 @@ const settingsSchema = [
     { id: 'fallbackFXAA', type: 'numBool', default: 1.0, name: "Fallback Spatial AA (FXAA)", desc: "Applies FXAA edge smoothing to pixels whose temporal history was rejected, so disoccluded areas don't alias while the history rebuilds." }
   ]
 },
-  {
-    name: "History & Blending",
-    items: [
-      { id: 'feedbackMax', type: 'float', min: 0.0, max: 0.99, step: 0.01, default: 0.97, name: "History Blend (Static Scenes)", desc: "How much of the previous frame is reused for stationary pixels. Higher = smoother and cleaner but slower to react to changes; lower = more responsive but noisier. 0.97 corresponds to roughly a 33-frame accumulation window." },
-      { id: 'feedbackMin', type: 'float', min: 0.0, max: 0.99, step: 0.01, default: 0.97, name: "History Blend (Moving Pixels)", desc: "History reuse once pixel velocity exceeds the motion transition range below. Typically set at or below the static value so motion receives less smoothing. While the two weights are equal the motion reduction is inert (the shader clamps it into this range); the Sub-Pixel Alignment Drop below is exempt -- it applies outside the clamp, on planar surfaces only." },
-      { id: 'driftCompensation', type: 'numBool', default: 1.0, name: "Lighting Drift Compensation", desc: "Accepts temporally persistent, spatially common level shifts (lighting changes, exposure, moving shadows) directly into the history instead of clipping them frame by frame. Each frame measures the local common-mode innovation against the same-depth-layer neighborhood (the same 9-tap spatial estimator the clip record uses) and applies it to the history with a noise-aware shrinkage: large clean shifts track in about one frame, slow crawls track proportionally to their measured certainty, so the temporal smoothing survives. Requires Depth-Dilated Motion Search (the same-layer mask). Ghost protection is unaffected: the correction is capped at the local content's own variability (a larger common shift is a reveal/disocclusion event and stays with the rejection paths), and a spatially common ghost is simply replaced by the current content -- which is the eviction action anyway. Off = the previous behavior (lighting steps ramp through the clip at a spatially varying rate)." },
-      { id: 'driftMaxGain', type: 'float', min: 0.0, max: 0.9, step: 0.01, default: 0.2, name: "Lighting Tracking Speed", desc: "How fast the drift tracker accepts a confirmed lighting shift once it clears the estimator's 2-sigma noise threshold (which drops to 0.75 sigma once the Ghost Trail Detector confirms a persistent offset). The relationship to noise is structural, not tunable elsewhere: a correction applied at gain g injects about g times the estimator's noise into the history each tracking frame, versus the normal accumulation path's much smaller share -- speed and noise are the same dial. 0.2 (default) tracks in roughly 5 frames with a brief, mild noise bump; 0.5+ tracks in ~2 frames at a visibly noisier transient; 0 disables the correction (lighting then ramps through the normal blend). Large steps are unaffected -- they snap through the spike/reset path regardless." },
-      { id: 'lumaDriftStrength', type: 'float', min: 0.0, max: 0.3, step: 0.01, default: 0.0, name: "Luma Drift Correction", desc: "Pulls history brightness toward the current image to clear ghost trails from moving shadows, exposure changes and vehicle lights, without reducing temporal smoothing. 0 = off. Only engages on large brightness mismatches on the same surface (see the chroma gate below), so it does not chase noise, jitter or ghosts. Higher values clear trails faster. (Legacy: superseded by Lighting Drift Compensation above -- leave off unless you need the old manual behavior.)" },
-      { id: 'lumaDriftChromaTol', type: 'float', min: 0.0, max: 0.5, step: 0.01, default: 0.1, name: "Drift Same-Surface Tolerance", desc: "Color-match tolerance for the luma drift correction, comparing color-per-brightness so that pure lighting changes (shadows, exposure) pass while a different surface does not. History from a differently-colored object (ghosts, reveal edges) fails this test and is left to the normal rejection paths -- drift only ever corrects brightness, never disguises color mismatches. Raise if legitimate shadows aren't being corrected; lower if colored ghosts linger. 0 requires an exact match (drift effectively off)." },
-      { id: 'motionBlendStart', type: 'float', min: 0.0, max: 5.0, step: 0.01, default: 1.0, name: "Motion Transition Start", desc: "Pixel velocity (in pixels per frame) at which blending starts transitioning from the static to the motion weight. No effect while the two History Blend weights are equal." },
-      { id: 'motionBlendDropSpeed', type: 'float', min: 1.0, max: 20.0, step: 0.1, default: 1.0, name: "Motion Transition Width", desc: "Width, in pixels per frame, of the transition between the two History Blend weights: the motion weight is fully reached at (Motion Transition Start + this value). 1.0 = an abrupt 1 px/frame transition. No effect while the two History Blend weights are equal." },
-      { id: 'alignmentFeedbackDrop', type: 'float', min: 0.0, max: 1.0, step: 0.01, default: 0.25, name: "Sub-Pixel Alignment Drop", desc: "Lowers history weight when the reprojected history sample lands between texels, where the resampling kernel is least accurate -- preserving texture sharpness in motion. Active only on planar surface interiors (the bilinear-motion path); edges and dilation zones are exempt because their current samples are aliased and dropping history there makes them flicker. Works independently of the History Blend weights. 0 disables. At 0.5, badly-phased pixels drop from a 33-frame to a ~2-frame accumulation window; the cost is a fixed texel-scale noise pattern on smooth noisy surfaces (sky gradients, shadow noise) in static scenes. Verify with debug mode 10 (red = applied drop, green = eligible); note that the Kaiser-6 resampler already preserves most sub-texel detail, so the effect is most visible with Kaiser-6 off or sharpening at 0." }
-    ]
+{
+  name: "History & Blending",
+  items: [
+    { id: 'feedbackMax', type: 'float', min: 0.0, max: 0.99, step: 0.01, default: 0.97, name: "History Blend (Static Scenes)", desc: "How much of the previous frame is reused for stationary pixels. Higher = smoother and cleaner but slower to react to changes; lower = more responsive but noisier. 0.97 corresponds to roughly a 33-frame accumulation window." },
+    { id: 'feedbackMin', type: 'float', min: 0.0, max: 0.99, step: 0.01, default: 0.97, name: "History Blend (Moving Pixels)", desc: "History reuse once pixel velocity exceeds the motion transition range below. Typically set at or below the static value so motion receives less smoothing. While the two weights are equal the motion reduction is inert (the shader clamps it into this range); the Sub-Pixel Alignment Drop below is exempt -- it applies outside the clamp, on planar surfaces only." },
+    { id: 'driftCompensation', type: 'numBool', default: 1.0, name: "Confirmed Drift Correction", desc: "Accepts temporally persistent offsets directly into the history instead of clipping them frame by frame -- both lighting shifts (exposure, moving shadows) and confirmed ghost trails. Each frame measures THIS pixel's jitter-corrected innovation (current render minus accumulated history); the correction engages only once the Ghost Trail Detector confirms the offset is persistent -- roughly 5-15 frames depending on the shift's size relative to its noise (random noise and the jitter's phase flip never confirm). Once confirmed, the full measured offset is applied at the Correction Speed gain below, capped at three times the local content's own variability -- a larger shift is a reveal/disocclusion event and stays with the rejection paths. No configuration dependencies. Off = confirmed shifts ramp through the normal blend (about 33 frames at the default history weight). For large brightness-only steps, the legacy Luma Drift Correction below can be enabled as a faster, cruder path (its own thresholds, no confirmation wait)." },
+    { id: 'driftMaxGain', type: 'float', min: 0.0, max: 0.9, step: 0.01, default: 0.2, name: "Drift Correction Speed", desc: "How fast the confirmed correction converges: the gain applied to the measured offset each frame, so convergence takes roughly 1/gain frames. The relationship to noise is structural, not tunable elsewhere: a correction applied at gain g injects about g times the innovation's noise into the history each tracking frame, versus the normal accumulation path's much smaller share -- speed and noise are the same dial. 0.2 (default) clears a confirmed offset in roughly 5 frames with a brief, mild noise bump; 0.5+ clears it in ~2 frames at a visibly noisier transient; 0 disables the correction entirely (persistent offsets then ramp through the normal blend)." },
+    { id: 'lumaDriftStrength', type: 'float', min: 0.0, max: 0.3, step: 0.01, default: 0.0, name: "Luma Drift Correction", desc: "Pulls history brightness toward the current image to clear ghost trails from moving shadows, exposure changes and vehicle lights, without reducing temporal smoothing. 0 = off. Only engages on large brightness mismatches on the same surface (see the chroma gate below), so it does not chase noise, jitter or ghosts. Higher values clear trails faster. (Legacy manual path: engages immediately on its own thresholds with no confirmation wait -- with the confirmed-only drift correction above, this is the faster tool for large brightness-only steps, at the cost of cruder gating. Leave off unless you need that.)" },
+    { id: 'lumaDriftChromaTol', type: 'float', min: 0.0, max: 0.5, step: 0.01, default: 0.1, name: "Drift Same-Surface Tolerance", desc: "Color-match tolerance for the luma drift correction, comparing color-per-brightness so that pure lighting changes (shadows, exposure) pass while a different surface does not. History from a differently-colored object (ghosts, reveal edges) fails this test and is left to the normal rejection paths -- drift only ever corrects brightness, never disguises color mismatches. Raise if legitimate shadows aren't being corrected; lower if colored ghosts linger. 0 requires an exact match (drift effectively off)." },
+    { id: 'motionBlendStart', type: 'float', min: 0.0, max: 5.0, step: 0.01, default: 1.0, name: "Motion Transition Start", desc: "Pixel velocity (in pixels per frame) at which blending starts transitioning from the static to the motion weight. No effect while the two History Blend weights are equal." },
+    { id: 'motionBlendDropSpeed', type: 'float', min: 1.0, max: 20.0, step: 0.1, default: 1.0, name: "Motion Transition Width", desc: "Width, in pixels per frame, of the transition between the two History Blend weights: the motion weight is fully reached at (Motion Transition Start + this value). 1.0 = an abrupt 1 px/frame transition. No effect while the two History Blend weights are equal." },
+    { id: 'alignmentFeedbackDrop', type: 'float', min: 0.0, max: 1.0, step: 0.01, default: 0.25, name: "Sub-Pixel Alignment Drop", desc: "Lowers history weight when the reprojected history sample lands between texels, where the resampling kernel is least accurate -- preserving texture sharpness in motion. Active only on planar surface interiors (the bilinear-motion path); edges and dilation zones are exempt because their current samples are aliased and dropping history there makes them flicker. Works independently of the History Blend weights. 0 disables. At 0.5, badly-phased pixels drop from a 33-frame to a ~2-frame accumulation window; the cost is a fixed texel-scale noise pattern on smooth noisy surfaces (sky gradients, shadow noise) in static scenes. Verify with debug mode 10 (red = applied drop, green = eligible); note that the Kaiser-6 resampler already preserves most sub-texel detail, so the effect is most visible with Kaiser-6 off or sharpening at 0." }
+  ]
 },
 {
   name: "Jitter & Sampling",
@@ -217,7 +194,7 @@ const settingsSchema = [
 {
   name: "History Clipping",
   items: [
-    { id: 'useHullClipping', type: 'numBool', default: 1.0, name: "Temporal Clip Memory", desc: "Gives the history clip a per-pixel memory: an exponential record of how much the resolved image has actually been changing at this texel (the frame-to-frame innovation), stored in the output's alpha channel and transported with the content through reprojection. The clip gate's size is driven by this record instead of the current frame's neighborhood spread alone -- which is what lets fine sub-pixel detail (specular sparkle, thin highlights, dense textures) accumulate its true anti-aliased value instead of being clipped away every frame (the classic fine-detail shimmer). The record also learns the history resampler's own blur, so no extra clip margin is needed to compensate for the resampling kernel. Resets on disocclusion and re-warms within about 7 frames; costs one extra history-buffer read. Off: the gate sizes itself from the current neighborhood's statistics only (classic variance-clipping behavior -- fine detail shimmers again)." },
+    { id: 'useHullClipping', type: 'numBool', default: 1.0, name: "Temporal Clip Memory", desc: "Gives the history clip a per-pixel memory, transported through the output's alpha channel: an exponential record of the frame-to-frame innovation (how much the resolved image has actually been changing at this texel), plus the Ghost Trail Detector's two persistence statistics -- they ride the same transport. The clip gate's size is driven by this record instead of the current frame's neighborhood spread alone -- which is what lets fine sub-pixel detail (specular sparkle, thin highlights, dense textures) accumulate its true anti-aliased value instead of being clipped away every frame (the classic fine-detail shimmer). The record also learns the history resampler's own blur, so no extra clip margin is needed to compensate for the resampling kernel. Resets on disocclusion and re-warms within about 7 frames; costs one extra history-buffer read. Off: the gate sizes itself from the current neighborhood's statistics only (classic variance-clipping behavior -- fine detail shimmers again), AND the Ghost Trail Detector goes blind." },
     { id: 'varianceGamma', type: 'float', unit: 'coverage', min: 20.0, max: 99.99, step: 0.01,
       // default is in STORED units (chi), matching the Lua defaultSettings:
       // defaultSettings feeds applyPreset() raw, so a display-unit default
@@ -226,74 +203,70 @@ const settingsSchema = [
       // the helpers below.
       default: 2.8,
       name: "Clip Coverage (Accepted History)",
-      desc: "The percentage of statistically valid history the clip gate accepts untouched each frame (the coverage of the 3-degree-of-freedom confidence region). 95% is the principled default. The false clips that remain at any setting are marginal -- a one-frame few-percent pull toward the neighborhood mean, invisible -- so the reason to go higher is heavy-tailed content (specular sparkle, noise) rather than shimmer: 99.9% is a ~4.0-sigma gate, 99.99% is ~4.6 (the pre-normalization-fix gate at the old default behaved like 99.997%). Lower = tighter: sharper and less ghosting, but below ~82% legitimate sub-pixel detail starts getting clipped and shimmers. This is the EFFECTIVE coverage: the Clip Radius Margin below widens it beyond what this slider alone shows. Calibrate with debug mode 13: on a static scene the brightness histogram's 95th percentile should sit at mid-gray." },
-    { id: 'colorSpaceOklab', type: 'numBool', default: 0.0, name: "Perceptual Working Color Space (Oklab)", desc: "Runs the history clipping statistics in Oklab, a perceptually uniform color space: the clip gate's error budget then weights color differences roughly the way human vision does, so clipping decisions favor what you'd actually notice. Off switches to the cheaper YCoCg space -- the resolve's single biggest ALU block is the nine-tap Oklab conversion (three cube roots per tap), so off is a measurable GPU saving, and is what the Performance and Balanced presets select. The cost: chroma error gets weighted like luma error, so colored-edge clipping decisions are slightly less perceptual; expect subtly different chroma-shimmer / colored-ghost behavior at equal slider values." },
+      desc: "The percentage of statistically valid history the clip gate accepts untouched each frame (the coverage of the 3-degree-of-freedom confidence region). 95% is the principled default. The false clips that remain at any setting are marginal -- a one-frame few-percent pull toward the neighborhood mean, invisible -- so the reason to go higher is heavy-tailed content (specular sparkle, noise) rather than shimmer: 99.9% is a ~4.0-sigma gate, 99.99% is ~4.6. Lower = tighter: sharper and less ghosting, but below ~82% legitimate sub-pixel detail starts getting clipped and shimmers. This is the EFFECTIVE coverage: the Clip Radius Margin below widens it beyond what this slider alone shows. Calibrate with debug mode 13: on a static scene the brightness histogram's 95th percentile should sit at mid-gray." },
+    { id: 'colorSpaceOklab', type: 'numBool', default: 0.0, name: "Perceptual Working Color Space (Oklab)", desc: "Runs the history clipping statistics in Oklab, a perceptually uniform color space: the clip gate's error budget then weights color differences roughly the way human vision does, so clipping decisions favor what you'd actually notice. Off switches to the cheaper YCoCg space -- the resolve's single biggest ALU block is the nine-tap Oklab conversion (three cube roots per tap), so off is a measurable GPU saving, and is what the Performance preset selects. The cost: chroma error gets weighted like luma error, so colored-edge clipping decisions are slightly less perceptual; expect subtly different chroma-shimmer / colored-ghost behavior at equal slider values." },
     { id: 'chromaVarianceMod', type: 'float', min: 0.5, max: 2.0, step: 0.01, default: 1.0, name: "Chroma Bounds Scale", desc: "Independent multiplier for the color (non-brightness) axes of the clip gate. Above 1 gives chroma more room than brightness (helps colored fine detail accumulate); below 1 clamps chroma harder (tighter control of colored-edge ghosting at the cost of chroma shimmer)." },
-        { id: 'softClip', type: 'numBool', default: 1.0, name: "Bayesian Soft Clip", desc: "Beyond the clip gate's boundary, replaces the hard snap to the ellipsoid surface with the exact posterior-mean action: the ghost alternative is the empirical spatial mixture of the nine neighborhood taps (not a fitted Gaussian), and the prior odds carry the accumulated sequential evidence from the ghost detector -- so a pixel with a long clean record barely shrinks while a pixel the detector is already suspicious of pulls decisively. Mild overshoots get a gentle correction graded by ghost probability; confirmed ghosts pull fully to the best-explaining content. The ghost posterior ALSO floors the temporal blend weight (so persistent low-contrast ghosts are evicted even below the clip gate's radius, by detector evidence rather than a gate excursion). Motion raises the ghost prior. The contrast limiter (the backstop) still guarantees the result stays within the gate's containment. Off = the pure hard ellipsoid (the A/B baseline)." },
+    { id: 'softClip', type: 'numBool', default: 1.0, name: "Bayesian Soft Clip", desc: "Beyond the clip gate's boundary, replaces the hard snap to the ellipsoid surface with the exact posterior-mean action: the ghost alternative is the empirical spatial mixture of the nine neighborhood taps (not a fitted Gaussian), and the prior odds carry the accumulated sequential evidence from the ghost detector -- so a pixel with a long clean record barely shrinks while a pixel the detector is already suspicious of pulls decisively. Mild overshoots get a gentle correction graded by ghost probability; confirmed ghosts pull fully to the best-explaining content. The ghost posterior ALSO floors the temporal blend weight (so persistent low-contrast ghosts are evicted even below the clip gate's radius, by detector evidence rather than a gate excursion). Motion raises the ghost prior. The contrast limiter (the backstop) still guarantees the result stays within the gate's containment. Off = the pure hard ellipsoid (the A/B baseline)." },
     { id: 'clipOvershoot', type: 'float', min: 0.0, max: 0.5, step: 0.01, default: 0.0, name: "Clip Radius Margin", desc: "Multiplies the clip gate's radius by (1 + this) -- a pure comfort margin, included in the EFFECTIVE coverage shown in the Clip Coverage slider above (raising it widens the coverage). With Temporal Clip Memory on, the record learns the resampling footprint by itself, so 0 is correct; use a small value (0.05-0.1) only with the memory off if legitimate edge detail looks clipped." },
-    { id: 'clipScopedMu', type: 'float', min: 0.0, max: 1.0, step: 0.05, default: 1.0, name: "Clip Variance Scoping (Advanced)", desc: "How exactly the clip gate models the neighborhood mean's own variance. 1.0 (default) = residual-scoped, the statistically exact form: edge ghosts get clipped from roughly 0.2x the local contrast upward. 0 = the conservative full payment (~0.5x, the pre-fix behavior apart from the per-channel normalization). Back this off toward 0, or raise the coverage, if debug mode 11 shows static fine detail taking visible shrinkage (blue). Intermediate values blend continuously." },    
     { id: 'clipGhostReset', type: 'select', default: 1.0, name: "Ghost Trail Detector",
-      desc: "Fights ghost trails on background pixels next to foreground edges -- the class of ghost that lives AT the clip gate's own neighborhood mean and is therefore invisible to mean-based rejection. The detector transports one scalar per pixel: T, a smoothed average of the signed frame-to-frame difference between the current render and the accumulated history, normalized by its own measured noise (so variance-model errors cancel between numerator and denominator). Random noise flips sign and averages out; only a persistent one-sided offset -- a ghost trail -- grows |T|. On confirmation (|T| over ~4, roughly a 1-in-1000 false rate on healthy pixels) two things unlock: the drift corrector's acceptance threshold drops from 2.0 to 0.75 estimator sigmas so the trail is actively tracked out of the history (the main eviction engine), and the temporal blend weight is floored by the confirmed evidence so sub-gate ghosts clear as well. Deep confirmation (|T| over ~6.5) pushes the blend toward full replacement; the Soft + Hard Reset mode additionally forces a one-frame full re-anchor there. Valid edges are safe by construction: their jitter-corrected innovation averages to zero, so T stays near zero. Telemetry mode: debug mode 11's blue channel shows |T| scaled to the alarm level -- near black on a static scene is the HEALTHY signature; blooming along a real trail then decaying as the corrector evicts it is the detector working; sustained brightness on static content means false accumulation (something is wrong). Requires Depth-Dilated Motion Search for the layer statistics. Chroma-only trails are not detected (the scalar is luma-weighted; the per-channel clip gate handles those).",
+      desc: "Fights persistent ghosts -- trails behind moving objects, lingering shadows, stale reflections -- including the class that lives AT the clip gate's own neighborhood mean and is therefore invisible to mean-based rejection. Transports two statistics per pixel: T (a signed, noise-normalized running average of the luma innovation) and Tc (the same construction on the chroma vector magnitude, catching saturated colored trails -- lights, emissives on neutral backgrounds -- that carry little luma delta). The input is the pixel's OWN jitter-corrected innovation at full strength: random noise flips sign and averages out, and the jitter's phase flip is zero-mean over the sample sequence, so only a persistent one-sided offset grows the statistics. On confirmation (|T| or Tc over ~4, roughly a 1-in-1000 false rate per channel on healthy pixels) two things engage: the drift corrector evicts the offset at full gain, and the temporal blend weight is floored by the confirmed evidence so sub-gate ghosts clear as well. Deep confirmation (over ~6.5) pushes the blend toward full replacement; Soft + Hard Reset additionally forces a one-frame full re-anchor there. Valid edges are safe by construction (their jitter-corrected innovation averages to zero); kept dilation bands are exempt (their stored history legitimately holds the foreground's pre-load). Telemetry mode takes no action -- it only paints the statistic. Requires Temporal Clip Memory (the statistics ride the same alpha transport). Telemetry: debug mode 11's blue channel shows max(|T|, Tc) scaled to the alarm level -- near black on a static scene is the HEALTHY signature; blooming along a real trail then decaying as the corrector evicts it is the detector working; sustained brightness on static content means false accumulation (something is wrong).",
       options: [
         { label: 'Off', value: 0.0 },
         { label: 'Soft (default)', value: 1.0 },
         { label: 'Telemetry Only (check mode 11)', value: 2.0 },
         { label: 'Soft + Hard Reset', value: 3.0 }
-      ] },
-]
-  },
-  {
-    name: "Motion & Anti-flicker",
-    items: [
-      { id: 'jitterFlickerPadding', type: 'float', min: 0.0, max: 1.0, step: 0.01, default: 0.0, name: "Jitter Anti-Flicker Padding", desc: "Legacy comfort knob: inflates the clip gate's spatial floor by the color shift the current sub-pixel jitter is expected to cause. With Temporal Clip Memory on, the record measures the real phase variation directly and this only adds slack -- keep it at 0. Useful only with the memory off, as a manual stand-in for it (then raise until fine detail stops shimmering)." },
-      { id: 'directionalVariance', type: 'numBool', default: 1.0, name: "Directional Padding", desc: "Expands the padding along the color direction of the expected jitter shift rather than uniformly. Only active when Jitter Anti-Flicker Padding is above zero (legacy path)." },
-      { id: 'jitterFlickerFade', type: 'numBool', default: 0.0, name: "Fade Padding in Motion", desc: "Disables the jitter anti-flicker padding as pixel velocity rises, since reprojection error dominates jitter error in motion." },
-      { id: 'lumaVariance', type: 'numBool', default: 0.0, name: "Luma-Weighted Statistics", desc: "Downweights bright samples when computing neighborhood statistics (Karas-style), keeping the gate's spatial floor from being stretched by specular fireflies." },
-      { id: 'jitterAwareVariance', type: 'numBool', default: 1.0, name: "Jitter-Aware Statistics", desc: "Weights neighborhood samples by their distance from the jittered sampling position instead of the pixel center, placing the clip statistics on the current phase's mixture. Since the gate's test-vector correction (the kernel-centroid fix), either position is statistically sound -- the correction removes the phase wander from every test -- but On remains the default: it centers the statistics on the anti-aliased value by construction rather than by correction. Off is slightly cheaper (plain table weights) and is a reasonable Performance-mode selection." },
-      { id: 'velocityAlignedVariance', type: 'numBool', default: 0.0, name: "Velocity-Aligned Statistics", desc: "Downweights neighborhood samples that lie behind the direction of motion, tightening the gate's spatial floor along motion trails." }
-    ]
-  },
-  {
-    name: "Advanced Rejection",
-    items: [
-      { id: 'useMotionField', type: 'numBool', default: 1.0, name: "Motion-Field Validation", desc: "Runs the extra motion-field pass (a fullscreen write storing each texel's resolved motion, depth and layer state) and uses last frame's field in the resolve to validate depth-dilated motion, gate history ownership, and run the depth and velocity disocclusion tests below. Disabling reduces the writer to a minimal two-fetch fullscreen write (the pass must keep running for chain stability) and skips all landing-side analysis in the resolve -- a large fraction of the total TAA cost -- at the price of disocclusion being detected only through color clipping (more ghosting behind moving objects and at reveals). The Performance preset disables this." },
-      { id: 'depthRejection', type: 'float', min: 0.0, max: 1.0, step: 0.001, default: 0.05, name: "Disocclusion Sensitivity (Depth)", desc: "Threshold of the geometry-based depth disocclusion test: how much closer than the current surface transported one frame forward (exact under camera rotation; the layer's forward motion is fitted per surface from the neighborhood's measured parallax) the history depth must be before it is rejected as stale. Lower = more sensitive. 0 disables the depth test (the velocity test then runs standalone). Requires Motion-Field Validation." },
-      { id: 'velRejection', type: 'float', min: 0.0, max: 10.0, step: 0.1, default: 1.5, name: "Disocclusion Threshold (Velocity)", desc: "Pixel threshold of the velocity disocclusion test. History whose recorded surface motion no longer matches the current pixel is flagged, then confirmed by pursuing that surface into the current frame -- only a confirmed divergence rejects, so motion-vector noise alone cannot. 0 disables. Lower catches subtler ghosts behind accelerating occluders; too low speckles static scenes. The comparison is exactly de-jittered and the landing-side velocity is the exact stored effective velocity, so the default 1.5 is already conservative -- values down to ~0.5 are viable. Tune with debug modes 2 (green should appear only on true reveals) and 7. Known limitation: on fast-moving or rotating foregrounds, pixels in the object's edge dilation zone can trigger occasional random rejections (point-sampled motion of a fast layer); if that bothers you, raise Velocity Noise Allowance or lower Pursuit Confirmation Strength. Requires Motion-Field Validation." },
-      { id: 'velGradientScale', type: 'float', min: 0.0, max: 4.0, step: 0.05, default: 1.0, name: "Velocity Noise Allowance", desc: "Scales the velocity-coherent noise allowance of the disocclusion alert (how much neighboring motion-vector variation is treated as noise rather than signal). Raise if noisy velocity content -- vegetation, particles, alpha-tested edges, or fast-foreground edge dilation zones -- causes speckled alerts in debug mode 2; lower for a stricter alert." },
-      { id: 'crossTestStrength', type: 'float', min: 0.0, max: 1.0, step: 0.05, default: 0.35, name: "Pursuit Confirmation Strength", desc: "How strongly the current-frame pursuit must confirm a flagged velocity mismatch before history is actually rejected (scales the measured divergence against its tolerance). Higher = more velocity rejections; lower makes the pursuit stricter about confirming, which also suppresses the dilation-zone false positives on fast foregrounds. 0.35 is conservative; 0.6-1.0 is reasonable once verified against debug modes 2 and 7." },
-      { id: 'clipDistanceRejectionEnabled', type: 'numBool', default: 0.0, name: "Smear Rejection", desc: "Drops history weight where the clip gate had to shrink the history a long way (measured in units of the gate's own sigma, so sub-pixel detail does not trigger it) -- a ghosting indicator for content without motion vectors (animated textures, particles)." },
-      { id: 'clipDistanceRejectionAmount', type: 'float', min: 0.0, max: 1.0, step: 0.001, default: 0.0, name: "Smear Rejection Strength", desc: "How quickly history weight falls once the clip distance exceeds the minimum error below -- the ramp width is 1/this: at 1.0 rejection is complete one sigma past the knee, at 0.25 it ramps over four sigma. Higher = rejects sooner." },
-      { id: 'clipDistanceRejectionMinError', type: 'float', min: 0.001, max: 0.5, step: 0.001, default: 0.15, name: "Smear Rejection Min Error", desc: "Minimum clip distance before smear rejection begins to engage." }
-    ]
-  },
-  {
-    name: "Debug & Diagnostics",
-    items: [
-      { 
-        id: 'debugMode', 
-        type: 'select', 
-        default: 0.0, 
-        name: "Debug View Mode", 
-        desc: "Visualizes internal buffers and rejection masks (the final sharpen pass is bypassed in every mode except 0).\n\n1: Frame Motion -- reprojection motion per pixel.\n2: Disocclusion Breakdown -- red = depth rejection, green = velocity rejection, yellow = both, faint blue = velocity error flagged but pursuit did NOT confirm (suppressed alert).\n3: Center Velocity -- current-frame motion vector magnitude.\n4: Linearized Depth -- normalized 0-100 m.\n5: History Color -- resampled history before clipping.\n6: History-Side Velocity -- effective previous-frame velocity at the history landing.\n7: Pursuit Divergence -- red intensity = divergence magnitude, green = confirmed rejection.\n8: Layer State -- orange = revoked dilation candidate, red = kept dilation zone, cyan = crest, magenta = depth-flat but velocity-straddled.\n9: Dilation Gate -- red = revoked candidate, green = kept (full = flag branch, half = depth branch), blue = depth-rejected.\n10: Alignment Drop -- red intensity = the sub-pixel feedback drop actually applied, green tint = planar (eligible) pixels, blue tint = edges / dilation zones (exempt).\n11: Clip Gate State -- bright green = temporal clip memory carried, mid green = record reset this frame, red = no record. Blue = how far the gate shrank the history toward the neighborhood mean (static content should sit near black -- that is the tightness win), or with the Ghost Trail Detector in Telemetry mode the persistence statistic |T| scaled to the alarm level: near black on a static scene is the HEALTHY signature; blooming along a real trail then decaying as the corrector evicts it is the detector working; sustained brightness on static content means false accumulation and something is wrong.\n12: Dejittered Residual -- jitter-cancel verification; must be near black on static scenes.\n13: Gate Null Law (calibration) -- brightness encodes the realized clip-gate statistic; the nominal 95th percentile sits at mid-gray at the default 95% coverage. Park on a static scene: systematically brighter than nominal = the gate runs hot (over-clipping, flicker-side); dimmer = conservative (ghost-side). Blue tint marks pixels engaging the gate this frame.",
-        options: [
-          { label: 'Off (Normal Rendering)', value: 0.0 },
-          { label: '1 - Frame Motion', value: 1.0 },
-          { label: '2 - Disocclusion Breakdown (R:depth G:velocity B:unconfirmed)', value: 2.0 },
-          { label: '3 - Center Velocity', value: 3.0 },
-          { label: '4 - Linearized Depth', value: 4.0 },
-          { label: '5 - History Color', value: 5.0 },
-          { label: '6 - History-Side Velocity', value: 6.0 },
-          { label: '7 - Pursuit Divergence', value: 7.0 },
-          { label: '8 - Layer State', value: 8.0 },
-          { label: '9 - Dilation Gate', value: 9.0 },
-          { label: '10 - Alignment Drop', value: 10.0 },
-          { label: '11 - Clip Gate State', value: 11.0 },
-          { label: '12 - Dejittered Residual', value: 12.0 },
-          { label: '13 - Gate Null Law (calibration)', value: 13.0 }
-        ]
-      }
-    ]
-  }
+      ] }
+  ]
+},
+{
+  name: "Statistics Weighting",
+  items: [
+    { id: 'lumaVariance', type: 'numBool', default: 0.0, name: "Luma-Weighted Statistics", desc: "Downweights bright samples when computing neighborhood statistics (Karas-style), keeping the plane fit and the gate's spatial floor from being stretched by specular fireflies." },
+    { id: 'jitterAwareVariance', type: 'numBool', default: 1.0, name: "Jitter-Aware Statistics", desc: "Weights neighborhood samples by their distance from the jittered sampling position instead of the pixel center, placing the clip statistics on the current phase's mixture. Since the gate's test-vector correction (the kernel-centroid fix), either position is statistically sound -- the correction removes the phase wander from every test -- but On remains the default: it centers the statistics on the anti-aliased value by construction rather than by correction. Off is slightly cheaper (plain table weights) and is a reasonable Performance-mode selection." },
+    { id: 'velocityAlignedVariance', type: 'numBool', default: 0.0, name: "Velocity-Aligned Statistics", desc: "Downweights neighborhood samples that lie behind the direction of motion, tightening the gate's spatial floor along motion trails." }
+  ]
+},
+{
+  name: "Advanced Rejection",
+  items: [
+    { id: 'useMotionField', type: 'numBool', default: 1.0, name: "Motion-Field Validation", desc: "Runs the extra motion-field pass (a fullscreen write storing each texel's resolved motion, depth and layer state) and uses last frame's field in the resolve to validate depth-dilated motion, gate history ownership, and run the depth and velocity disocclusion tests below. Disabling reduces the writer to a minimal two-fetch fullscreen write (the pass must keep running for chain stability) and skips all landing-side analysis in the resolve -- a large fraction of the total TAA cost -- at the price of disocclusion being detected only through color clipping (more ghosting behind moving objects and at reveals). The Performance preset disables this." },
+    { id: 'depthRejection', type: 'float', min: 0.0, max: 1.0, step: 0.001, default: 0.05, name: "Disocclusion Sensitivity (Depth)", desc: "Threshold of the geometry-based depth disocclusion test: how much closer than the current surface transported one frame forward (exact under camera rotation; the layer's forward motion is fitted per surface from the neighborhood's measured parallax) the history depth must be before it is rejected as stale. Lower = more sensitive. 0 disables the depth test (the velocity test then runs standalone). Requires Motion-Field Validation." },
+    { id: 'velRejection', type: 'float', min: 0.0, max: 10.0, step: 0.1, default: 1.5, name: "Disocclusion Threshold (Velocity)", desc: "Pixel threshold of the velocity disocclusion test. History whose recorded surface motion no longer matches the current pixel is flagged, then confirmed by pursuing that surface into the current frame -- only a confirmed divergence rejects, so motion-vector noise alone cannot. 0 disables. Lower catches subtler ghosts behind accelerating occluders; too low speckles static scenes. The comparison is exactly de-jittered and the landing-side velocity is the exact stored effective velocity, so the default 1.5 is already conservative -- values down to ~0.5 are viable. Tune with debug modes 2 (green should appear only on true reveals) and 7. Known limitation: on fast-moving or rotating foregrounds, pixels in the object's edge dilation zone can trigger occasional random rejections (point-sampled motion of a fast layer); if that bothers you, raise Velocity Noise Allowance or lower Pursuit Confirmation Strength. Requires Motion-Field Validation." },
+    { id: 'velGradientScale', type: 'float', min: 0.0, max: 4.0, step: 0.05, default: 1.0, name: "Velocity Noise Allowance", desc: "Scales the velocity-coherent noise allowance of the disocclusion alert (how much neighboring motion-vector variation is treated as noise rather than signal). Raise if noisy velocity content -- vegetation, particles, alpha-tested edges, or fast-foreground edge dilation zones -- causes speckled alerts in debug mode 2; lower for a stricter alert." },
+    { id: 'crossTestStrength', type: 'float', min: 0.0, max: 1.0, step: 0.05, default: 0.35, name: "Pursuit Confirmation Strength", desc: "How strongly the current-frame pursuit must confirm a flagged velocity mismatch before history is actually rejected (scales the measured divergence against its tolerance). Higher = more velocity rejections; lower makes the pursuit stricter about confirming, which also suppresses the dilation-zone false positives on fast foregrounds. 0.35 is conservative; 0.6-1.0 is reasonable once verified against debug modes 2 and 7." },
+    { id: 'clipDistanceRejectionEnabled', type: 'numBool', default: 0.0, name: "Smear Rejection", desc: "Drops history weight where the clip gate had to shrink the history a long way (measured in units of the gate's own sigma, so sub-pixel detail does not trigger it) -- a ghosting indicator for content without motion vectors (animated textures, particles). Note: on straddled edge pixels the gate's sigma includes the layer step, so the normalization reads coarser there -- if edge smears persist, lower the Min Error below." },
+    { id: 'clipDistanceRejectionAmount', type: 'float', min: 0.0, max: 1.0, step: 0.001, default: 0.0, name: "Smear Rejection Strength", desc: "How quickly history weight falls once the clip distance exceeds the minimum error below -- the ramp width is 1/this: at 1.0 rejection is complete one sigma past the knee, at 0.25 it ramps over four sigma. Higher = rejects sooner." },
+    { id: 'clipDistanceRejectionMinError', type: 'float', min: 0.001, max: 0.5, step: 0.001, default: 0.15, name: "Smear Rejection Min Error", desc: "Minimum clip distance before smear rejection begins to engage." }
+  ]
+},
+{
+  name: "Debug & Diagnostics",
+  items: [
+    {
+      id: 'debugMode',
+      type: 'select',
+      default: 0.0,
+      name: "Debug View Mode",
+      desc: "Visualizes internal buffers and rejection masks (the final sharpen pass is bypassed in every mode except 0).\n\n1: Frame Motion -- reprojection motion per pixel.\n2: Disocclusion Breakdown -- red = depth rejection, green = velocity rejection, yellow = both, faint blue = velocity error flagged but pursuit did NOT confirm (suppressed alert).\n3: Center Velocity -- current-frame motion vector magnitude.\n4: Linearized Depth -- normalized 0-100 m.\n5: History Color -- resampled history before clipping.\n6: History-Side Velocity -- effective previous-frame velocity at the history landing.\n7: Pursuit Divergence -- red intensity = divergence magnitude, green = confirmed rejection.\n8: Layer State -- orange = revoked dilation candidate, red = kept dilation zone, cyan = crest, magenta = depth-flat but velocity-straddled.\n9: Dilation Gate -- red = revoked candidate, green = kept (full = flag branch, half = depth branch), blue = depth-rejected.\n10: Alignment Drop -- red intensity = the sub-pixel feedback drop actually applied, green tint = planar (eligible) pixels, blue tint = edges / dilation zones (exempt).\n11: Clip Gate State -- bright green = temporal clip memory carried, mid green = record reset this frame, red = no record. Blue = how far the gate shrank the history toward the neighborhood mean (static content should sit near black -- that is the tightness win), or with the Ghost Trail Detector in Telemetry mode the persistence statistic max(|T|, Tc) scaled to the alarm level: near black on a static scene is the HEALTHY signature; blooming along a real trail then decaying as the corrector evicts it is the detector working; sustained brightness on static content means false accumulation and something is wrong.\n12: Dejittered Residual -- jitter-cancel verification; must be near black on static scenes.\n13: Gate Null Law (calibration) -- brightness encodes the realized clip-gate statistic; the nominal 95th percentile sits at mid-gray at the default 95% coverage. Park on a static scene: systematically brighter than nominal = the gate runs hot (over-clipping, flicker-side); dimmer = conservative (ghost-side). Blue tint marks pixels engaging the gate this frame.",
+      options: [
+        { label: 'Off (Normal Rendering)', value: 0.0 },
+        { label: '1 - Frame Motion', value: 1.0 },
+        { label: '2 - Disocclusion Breakdown (R:depth G:velocity B:unconfirmed)', value: 2.0 },
+        { label: '3 - Center Velocity', value: 3.0 },
+        { label: '4 - Linearized Depth', value: 4.0 },
+        { label: '5 - History Color', value: 5.0 },
+        { label: '6 - History-Side Velocity', value: 6.0 },
+        { label: '7 - Pursuit Divergence', value: 7.0 },
+        { label: '8 - Layer State', value: 8.0 },
+        { label: '9 - Dilation Gate', value: 9.0 },
+        { label: '10 - Alignment Drop', value: 10.0 },
+        { label: '11 - Clip Gate State', value: 11.0 },
+        { label: '12 - Dejittered Residual', value: 12.0 },
+        { label: '13 - Gate Null Law (calibration)', value: 13.0 }
+      ]
+    }
+  ]
+}
 ]
 
 const defaultSettings = {}
@@ -305,21 +278,17 @@ const presets = {
   Performance: {
     feedbackMax: 0.95, feedbackMin: 0.95,
     useKaiser6: 0, colorSpaceOklab: 0, useMotionField: 0,
-    clipScopedMu: 0,
-    // --- aggressive tier: uncomment for max performance (each has a visible
-    // --- cost; see the preset-notes discussion):
-    // useDepthDilation: 0,            // -16 fetches/px: the biggest gate; silhouettes lose dilated motion
-    // sharpness: 0,                  // the RCAS pass becomes free
-    // useHullClipping: 0,             // fine-detail shimmer; the state fetch only vanishes if sharpening is off too
-    // jitterAwareVariance: 0,         // ~50 ops/px; statistically sound since the C2 test-vector fix
-    // fallbackFXAA: 0,                // 4 fetches on transient pixels; aliased reveals
+    // --- aggressive tier (each has a visible cost):
+    // useDepthDilation: 0,    // -16 fetches/px, the biggest gate; silhouettes lose dilated motion
+    // sharpness: 0,          // the RCAS pass becomes free
+    // useHullClipping: 0,    // fine-detail shimmer AND the ghost detector goes blind (T/Tc ride the same state)
+    // jitterAwareVariance: 0, // ~50 ops/px; statistically sound since the test-vector phase fix
+    // fallbackFXAA: 0,        // 4 fetches on transient pixels; aliased reveals
   },
-  Balanced: { colorSpaceOklab: 0 },
-  Clarity: { feedbackMax: 0.95, feedbackMin: 0.95, },
-  Smooth: { varianceGamma: 4.594 }
+  Balanced: {},                     // = defaults
+  Clarity: { feedbackMax: 0.95, feedbackMin: 0.95 },
+  Smooth: { varianceGamma: 4.594 }  // stored chi: ~99.99% effective coverage
 }
-
-
 
 function toLuaValue(val) {
   return typeof val === 'boolean' ? (val ? 'true' : 'false') : val
@@ -334,6 +303,16 @@ function formatDefault(item) {
     return opt ? opt.label : item.default
   }
   return item.unit === 'coverage' ? `${chiToCoverage(item.default, 0).toFixed(2)} %` : item.default
+}
+
+// ONE modified test for every control type (the coverage slider compares
+// display against display, margin-independent by design).
+function isModified(item) {
+  if (item.unit === 'coverage') {
+    const defaultDisp = +chiToCoverage(item.default, 0).toFixed(2)
+    return Math.abs(sliderModel(item) - defaultDisp) >= 0.005
+  }
+  return config.value[item.id] !== item.default
 }
 
 function resetSetting(item) {
@@ -352,18 +331,6 @@ function sliderModel(item) {
   if (item.unit === 'coverage')
     return Math.min(99.99, +chiToCoverage(config.value.varianceGamma, config.value.clipOvershoot).toFixed(2))
   return config.value[item.id]
-}
-
-function sliderModified(item) {
-  if (item.unit === 'coverage') {
-    // Compare display against display, rounded identically (both sides call
-    // the same chiToCoverage, so the defaults compare exactly equal at any
-    // erf precision). Semantic: "the EFFECTIVE coverage differs from the
-    // default coverage" -- margin-independent by design.
-    const defaultDisp = +chiToCoverage(item.default, 0).toFixed(2)
-    return Math.abs(sliderModel(item) - defaultDisp) >= 0.005
-  }
-  return config.value[item.id] !== item.default
 }
 
 function onSliderChange(item, val) {
@@ -404,7 +371,7 @@ function applyPreset(presetOverrides) {
   for (const key in defaultSettings) { config.value[key] = defaultSettings[key] }
   for (const key in presetOverrides) {
     if (!(key in defaultSettings)) continue   // guard against stale preset keys
-    config.value[key] = presetOverrides[key]
+  config.value[key] = presetOverrides[key]
   }
 
   if (!window.bngApi || !window.bngApi.engineLua) return
@@ -429,7 +396,14 @@ onMounted(() => {
       if (state) {
         isActive.value = state.active !== false
         if (state.settings && Object.keys(state.settings).length > 0) {
-          config.value = { ...defaultSettings, ...state.settings }
+          // Merge, then STRIP keys the schema no longer knows: settings
+          // retired from the shader (the legacy flicker padding, the
+          // variance scoping) stop round-tripping through the config and
+          // the settings file instead of resurrecting on every load.
+          const merged = { ...defaultSettings, ...state.settings }
+          config.value = Object.fromEntries(
+            Object.entries(merged).filter(([k]) => k in defaultSettings)
+          )
         }
       }
     })
@@ -452,12 +426,19 @@ function toggleTaa(val) {
   flex-direction: column;
   width: 100%;
   height: 100%;
-  min-height: 65vh; 
-  overflow: hidden; 
+  min-height: 65vh;
+  overflow: hidden;
   font-family: 'Overpass', sans-serif;
   color: #fff;
   background-color: var(--bng-off-black, rgba(15, 15, 15, 0.95));
   border-radius: 6px;
+
+  .bng-reset-btn {
+    --bng-button-padding-x: 0.3em;
+    --bng-button-padding-y: 0.15em;
+    opacity: 0.8;
+    &:hover { opacity: 1; }
+  }
 }
 .options-header {
   flex: 0 0 auto;
@@ -480,7 +461,7 @@ function toggleTaa(val) {
   .preset-btn { flex: 1; margin: 0 0.25em; --bng-button-padding-y: 0.3em; font-size: 0.9em; }
 }
 .options-list-scroll {
-  flex: 1 1 0; 
+  flex: 1 1 0;
   overflow-y: auto;
   overflow-x: hidden;
   width: 100%;
@@ -532,10 +513,10 @@ details[open] > summary.category-title {
 .options-item-row {
   display: flex;
   flex-direction: column;
-  background-color: rgba(0, 0, 0, 0.2); 
+  background-color: rgba(0, 0, 0, 0.2);
   margin-bottom: 2px;
   padding: 0.6em 0.8em;
-  width: 100%; 
+  width: 100%;
   &:nth-child(even) { background-color: transparent; }
   .row-header {
     display: flex;
@@ -543,7 +524,7 @@ details[open] > summary.category-title {
     align-items: center;
     width: 100%;
     .option-label { flex: 1 1 auto; font-size: 0.95rem; padding-right: 0.5em; }
-    .inline-controls { flex: 0 0 auto; display: flex; align-items: center; gap: 0.75em; }
+    .header-controls { flex: 0 0 auto; display: flex; align-items: center; gap: 0.75em; }
   }
   .stacked-controls {
     display: flex;
@@ -559,7 +540,7 @@ details[open] > summary.category-title {
   position: relative;
   flex: 1 1 auto;
   font-size: 0.95rem;
-  z-index: 1; 
+  z-index: 1;
   &.is-open { z-index: 9999; }
   &.is-disabled { opacity: 0.4; pointer-events: none; }
 }
@@ -601,16 +582,8 @@ details[open] > summary.category-title {
   &:hover { background: rgba(255, 102, 0, 0.2); color: #fff; }
   &.is-active { background: var(--bng-orange-550, #f60); color: #fff; font-weight: 600; }
 }
-.option-reset {
-  flex: 0 0 2.5em; 
-  width: 2.5em;
-  display: flex;
-  justify-content: flex-end;
-  padding-left: 0.5em;
-  .bng-reset-btn { --bng-button-padding-x: 0.3em; --bng-button-padding-y: 0.15em; opacity: 0.8; &:hover { opacity: 1; } }
-}
 .options-info-panel {
-  flex: 0 0 8.0em; 
+  flex: 0 0 8.0em;
   min-height: 8.0em;
   max-height: 8.0em;
   width: 100%;
