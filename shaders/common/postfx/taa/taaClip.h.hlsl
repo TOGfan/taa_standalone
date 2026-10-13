@@ -45,6 +45,17 @@
 //       a measured ~1-texel landing scatter means the history really is
 //       miss-contaminated. The principled dial is kMissRadiusOdds, never
 //       an odds cap.
+// v5.6.1 (ALU pass -- no numerical policy change): the ghost posterior
+//       now runs in base-2 logs (log2/exp2 are the native opcodes; HLSL
+//       log and exp each carry an extra multiply for the ln(2)/log2(e)
+//       factor, which the base-2 form folds into constants -- exact in
+//       real arithmetic, floating-point differences are rounding-level
+//       only); the pass-2 scatter-matrix inverse is built ONCE instead of
+//       three times from the same fit; pass 1's moment accumulator drops
+//       the fields only pass 2 consumes; the neighborhood AABB collapses
+//       to its squared range at the scan (six fewer registers live across
+//       both IRLS passes). The hoists and collapses are bit-identical:
+//       same operations, same order.
 //
 // THE GATE: the history's accumulation target is the phase-swept CENTER
 // TEXEL; the gate tests the history against the posterior of that target
@@ -83,8 +94,6 @@
 // ============================================================================
 struct ColorNeighborhoodStats
 {
-    float3 aabbMin;             // full set (the spike reference's observed range)
-    float3 aabbMax;
     float3 sigmaClean;          // the post-plane residual scale, per channel
                                 // (the soft clip's temporal tail)
     float  invNeff;             // the SANDWICH information count (dof side:
@@ -103,7 +112,9 @@ struct ColorNeighborhoodStats
                                 // (the metric's shape)
     float3 residSq;             // the post-plane residual (exact dof)
     float  rangeSq;             // full-set squared AABB range (the spike
-                                // reference's garbage branch)
+                                // reference's garbage branch), collapsed at
+                                // the scan -- the min/max extremes are not
+                                // transported through the IRLS passes
     float3 priorTapCov;         // F1: Cov(fitted value, center tap)
     float3 transportVar;        // the gated landing error projected on the
                                 // working gradient (MOTION-GATED)
@@ -166,8 +177,55 @@ static const float kSplitEmaRate = 0.2;
 static const float kTransportGatePx = 2.0;
 
 // ============================================================================
-// THE MOMENT ACCUMULATOR (both IRLS passes share it)
+// THE MOMENT ACCUMULATORS (lean for pass 1, full for pass 2)
 // ============================================================================
+// Pass 1 (the plain weighted LS plane) consumes only the first moments and
+// the plane system; the second-moment / w^2-squared fields of the full
+// accumulator are dead until pass 2. The lean variant keeps ~15 floats
+// live instead of the full ~27 -- source-level translation paths that do
+// not DCE struct fields through out-params were carrying all of them
+// through pass 1 (~108 dead MADs per pixel).
+struct ColorMomentAccumLean
+{
+    float3 sum3;
+    float3 covXSum;
+    float3 covYSum;
+    float  totalW;
+    float2 offSum;
+    float  offXSq;
+    float  offYSq;
+    float  offXY;
+};
+
+void AccumulateColorMomentsLean(float3 taps[9], float w[9], out ColorMomentAccumLean a)
+{
+    a.sum3    = float3(0.0, 0.0, 0.0);
+    a.covXSum = float3(0.0, 0.0, 0.0);
+    a.covYSum = float3(0.0, 0.0, 0.0);
+    a.totalW  = 0.0;
+    a.offSum  = float2(0.0, 0.0);
+    a.offXSq  = 0.0;
+    a.offYSq  = 0.0;
+    a.offXY   = 0.0;
+
+    [unroll]
+    for (int i = 0; i < 9; ++i)
+    {
+        float3 c  = taps[i];
+        float2 o  = kOffsets3x3[i];
+        float  wi = w[i];
+
+        a.sum3    += c * wi;
+        a.covXSum += o.x * c * wi;
+        a.covYSum += o.y * c * wi;
+        a.totalW  += wi;
+        a.offSum  += o * wi;
+        a.offXSq  += o.x * o.x * wi;
+        a.offYSq  += o.y * o.y * wi;
+        a.offXY   += o.x * o.y * wi;
+    }
+}
+
 struct ColorMomentAccum
 {
     float3 sum3;
@@ -249,14 +307,17 @@ struct ColorPlaneFit
     float3 covY;
 };
 
-ColorPlaneFit SolveColorPlane(ColorMomentAccum a, float3 mean3, float2 cenPx, float invTotalWeight)
+ColorPlaneFit SolveColorPlaneCore(
+    float offXSq, float offYSq, float offXY,
+    float3 covXSum, float3 covYSum,
+    float3 mean3, float2 cenPx, float invTotalWeight)
 {
     ColorPlaneFit p;
-    p.vXX  = max(a.offXSq * invTotalWeight - cenPx.x * cenPx.x, 1e-6);
-    p.vYY  = max(a.offYSq * invTotalWeight - cenPx.y * cenPx.y, 1e-6);
-    p.vXY  = a.offXY * invTotalWeight - cenPx.x * cenPx.y;
-    p.covX = a.covXSum * invTotalWeight - cenPx.x * mean3;
-    p.covY = a.covYSum * invTotalWeight - cenPx.y * mean3;
+    p.vXX  = max(offXSq * invTotalWeight - cenPx.x * cenPx.x, 1e-6);
+    p.vYY  = max(offYSq * invTotalWeight - cenPx.y * cenPx.y, 1e-6);
+    p.vXY  = offXY * invTotalWeight - cenPx.x * cenPx.y;
+    p.covX = covXSum * invTotalWeight - cenPx.x * mean3;
+    p.covY = covYSum * invTotalWeight - cenPx.y * mean3;
     p.detV = p.vXX * p.vYY - p.vXY * p.vXY;
     if (p.detV > 1e-6)
     {
@@ -272,13 +333,21 @@ ColorPlaneFit SolveColorPlane(ColorMomentAccum a, float3 mean3, float2 cenPx, fl
     return p;
 }
 
+ColorPlaneFit SolveColorPlane(ColorMomentAccum a, float3 mean3, float2 cenPx, float invTotalWeight)
+{
+    return SolveColorPlaneCore(a.offXSq, a.offYSq, a.offXY, a.covXSum, a.covYSum, mean3, cenPx, invTotalWeight);
+}
+
+ColorPlaneFit SolveColorPlane(ColorMomentAccumLean a, float3 mean3, float2 cenPx, float invTotalWeight)
+{
+    return SolveColorPlaneCore(a.offXSq, a.offYSq, a.offXY, a.covXSum, a.covYSum, mean3, cenPx, invTotalWeight);
+}
+
 ColorNeighborhoodStats ComputeColorNeighborhoodStats(
     float3 neighborhoodColorSpace[9], float2 motionDirUnit, float motionNormalized,
     float2 jitterPx, float2 transportErrPx)
 {
     ColorNeighborhoodStats stats;
-    stats.aabbMin = float3(kLargeValue, kLargeValue, kLargeValue);
-    stats.aabbMax = float3(-kLargeValue, -kLargeValue, -kLargeValue);
     stats.priorTapCov = float3(0.0, 0.0, 0.0);
     stats.transportVar = float3(0.0, 0.0, 0.0);
 
@@ -303,6 +372,8 @@ ColorNeighborhoodStats ComputeColorNeighborhoodStats(
     // ---- the design weights: the plain kernel times the weighting
     //      modifiers -------------------------------------------------------
     float motionFactor = saturate(motionNormalized);
+    float3 aabbMin = float3(kLargeValue, kLargeValue, kLargeValue);
+    float3 aabbMax = float3(-kLargeValue, -kLargeValue, -kLargeValue);
     float w9[9];
     [unroll]
     for (int i = 0; i < 9; ++i)
@@ -310,8 +381,8 @@ ColorNeighborhoodStats ComputeColorNeighborhoodStats(
         float2 tapOffsetPx   = kOffsets3x3[i];
         float3 tapColorSpace = neighborhoodColorSpace[i];
 
-        stats.aabbMin = min(stats.aabbMin, tapColorSpace);
-        stats.aabbMax = max(stats.aabbMax, tapColorSpace);
+        aabbMin = min(aabbMin, tapColorSpace);
+        aabbMax = max(aabbMax, tapColorSpace);
 
         float w;
         if (jitterCenteredWeights)
@@ -327,9 +398,14 @@ ColorNeighborhoodStats ComputeColorNeighborhoodStats(
         w9[i] = w;
     }
 
+    // The AABB's only consumer is the spike reference's garbage branch, and
+    // it consumes just the squared range: collapse the extremes HERE so six
+    // min/max registers do not stay live across both IRLS passes.
+    stats.rangeSq = dot(aabbMax - aabbMin, aabbMax - aabbMin);
+
     // ---- PASS 1: the plain weighted LS plane ---------------------------
-    ColorMomentAccum acc1;
-    AccumulateColorMoments(neighborhoodColorSpace, w9, acc1);
+    ColorMomentAccumLean acc1;
+    AccumulateColorMomentsLean(neighborhoodColorSpace, w9, acc1);
     float  invW1 = 1.0 / max(acc1.totalW, kEpsilon);
     float3 mean1 = acc1.sum3 * invW1;
     float2 cen1  = acc1.offSum * invW1;
@@ -421,6 +497,20 @@ ColorNeighborhoodStats ComputeColorNeighborhoodStats(
         float2 dEval = jitterPx - cenPx;
         float plainInvNeff = acc.totalWSq / max(acc.totalW * acc.totalW, 1e-6);
 
+        // The inverse scatter matrix and its rank flag, built ONCE: the
+        // exact evaluation variance, the exact residual dof and the F1
+        // prior/tap covariance below each rebuilt identical copies of this
+        // from the same pass-2 fit (three conditional inversions collapsed
+        // into one).
+        float2 vInv0 = float2(0.0, 0.0);
+        float2 vInv1 = float2(0.0, 0.0);
+        bool scatterFullRank = (fit.detV > 1e-6);
+        if (scatterFullRank)
+        {
+            vInv0 = float2( fit.vYY, -fit.vXY) / fit.detV;
+            vInv1 = float2(-fit.vXY,  fit.vXX) / fit.detV;
+        }
+
         // THE EXACT EVALUATION VARIANCE: plane0 = Sum c_k tap_k with
         //   c_k = (w_k/W)(1 + dEval' S^-1 (o_k - cen)),  vFit = sPer*Sum c_k^2
         //   Sum c^2 = (Sum w^2 + 2*cross + quad) / W^2
@@ -433,10 +523,8 @@ ColorNeighborhoodStats ComputeColorNeighborhoodStats(
         // psi' factor into the variance. Degenerate spread: the unobserved
         // direction is dropped by the decoupled fit; the charge is guarded.
         float evalVar;
-        if (fit.detV > 1e-6)
+        if (scatterFullRank)
         {
-            float2 vInv0 = float2( fit.vYY, -fit.vXY) / fit.detV;
-            float2 vInv1 = float2(-fit.vXY,  fit.vXX) / fit.detV;
             float2 uEval = float2(dot(vInv0, dEval), dot(vInv1, dEval));
             float2 sumW2offCen = acc.offSumW2 - cenPx * acc.totalWSq;
             float  sXX = acc.offXSqW2 - 2.0 * cenPx.x * acc.offSumW2.x
@@ -465,10 +553,8 @@ ColorNeighborhoodStats ComputeColorNeighborhoodStats(
         // dof biased high, the split anchor R exceeded sPer, the de-bias
         // over-subtracted, and the record sagged without a fixed point).
         float sumW2OnePlusMahal = 0.0;
-        if (fit.detV > 1e-6)
+        if (scatterFullRank)
         {
-            float2 vInv0 = float2( fit.vYY, -fit.vXY) / fit.detV;
-            float2 vInv1 = float2(-fit.vXY,  fit.vXX) / fit.detV;
             [unroll]
             for (int hh = 0; hh < 9; ++hh)
             {
@@ -494,10 +580,8 @@ ColorNeighborhoodStats ComputeColorNeighborhoodStats(
         // weights. The residSq basis models the structure as sharing
         // through the kernel; the Cauchy-Schwarz clamp guards both limits.
         float crossQuad = 0.0;
-        if (fit.detV > 1e-6)
+        if (scatterFullRank)
         {
-            float2 vInv0 = float2( fit.vYY, -fit.vXY) / fit.detV;
-            float2 vInv1 = float2(-fit.vXY,  fit.vXX) / fit.detV;
             float2 cRhs  = jitterPx - w2[0] * cenPx;
             crossQuad = dEval.x * dot(vInv0, cRhs) + dEval.y * dot(vInv1, cRhs);
         }
@@ -513,7 +597,6 @@ ColorNeighborhoodStats ComputeColorNeighborhoodStats(
                                 acc.wYZ * invTotalWeight - mean3.y * mean3.z);
     }
 
-    stats.rangeSq = dot(stats.aabbMax - stats.aabbMin, stats.aabbMax - stats.aabbMin);
     return stats;
 }
 
@@ -647,13 +730,21 @@ RecordVarianceParts SplitRecordVariance(
 {
     RecordVarianceParts p;
 
+    // v5.6.1 (perf, exact): varX is already PSD (the jitter phase covariance
+    // is PSD by construction and residSq >= 0), so the max() clamps nothing
+    // on real input and tot below is EXACTLY SeedRecordTotalSq's inner dot.
+    // Computing it here avoids SeedRecordTotalSq's second evaluation of the
+    // phase quadratic form -- the old code computed it twice (once for the
+    // shares, once inside SeedRecordTotalSq for the winsor anchor), ~15 ops
+    // on every live-record pixel. SeedRecordTotalSq remains for the cold
+    // paths in taa.fx.
     float3 varX = max(SeedRecordVarX(stats), float3(0.0, 0.0, 0.0));
     float  tot  = dot(varX, float3(1.0, 1.0, 1.0));
     float3 share = (tot > 1e-10)
         ? varX / tot
         : stats.sigmaClean * stats.sigmaClean / max(dot(stats.sigmaClean, stats.sigmaClean), kEpsilon);
 
-    float spatialPriorSq = max(SeedRecordTotalSq(stats), kClipSigmaRecordFloorSq);
+    float spatialPriorSq = max(tot, kClipSigmaRecordFloorSq);
 
     // THE ARMING CAP at the record's LIVE dof (the exact chi^2_nu(0.999)/nu
     // bound, host-fit) -- binds sPer AND the transported VarH share.
@@ -889,6 +980,13 @@ ClipGateResult ClipHistoryToStatisticGate(
         // tail at r0, the neighbor masses from its density at the texel
         // offsets, the tail mass from its tail at r1 -- all renormalized
         // to the conditional distribution of the miss GIVEN a ghost.
+        //
+        // THE WHOLE POSTERIOR RUNS IN BASE-2 LOGS (v5.6.1): every term is
+        // homogeneous in the log base, so scaling the entire log-odds by
+        // log2(e) converts every ln to log2 with ALL COEFFICIENTS
+        // UNCHANGED -- and log2/exp2 are the native opcodes (HLSL log/exp
+        // each pay an extra multiply against the ln(2)/log2(e) factor that
+        // this form folds into constants instead).
         float3 nullScale = max((gateVarBase + transportTerm) * (chromaScale * chromaScale), float3(minGateVar, minGateVar, minGateVar));
         float3 vCompRaw = recordLive
             ? parts.varHPer + max(parts.sPer, float3(1e-8, 1e-8, 1e-8)) + transportTerm
@@ -901,7 +999,7 @@ ClipGateResult ClipHistoryToStatisticGate(
         float3 invComp = float3(1.0, 1.0, 1.0) / vComp;
 
         float q0Comp;
-        float logDetNull;
+        float logDetNull2;
         {
             float nX = nullScale.x, nY = nullScale.y, nZ = nullScale.z;
             float nsXY = rXY * sqrt(nX * nY);
@@ -922,12 +1020,12 @@ ClipGateResult ClipHistoryToStatisticGate(
                 float ni22 = (nX * nY - nsXY * nsXY) * nInvDet;
                 q0Comp = ni00 * dCorr.x * dCorr.x + ni11 * dCorr.y * dCorr.y + ni22 * dCorr.z * dCorr.z
                        + 2.0 * (ni01 * dCorr.x * dCorr.y + ni02 * dCorr.x * dCorr.z + ni12 * dCorr.y * dCorr.z);
-                logDetNull = log(ndet);
+                logDetNull2 = log2(ndet);
             }
             else
             {
                 q0Comp = dot(dCorr * dCorr, float3(1.0, 1.0, 1.0) / nullScale);
-                logDetNull = log(nullScale.x) + log(nullScale.y) + log(nullScale.z);
+                logDetNull2 = log2(nullScale.x) + log2(nullScale.y) + log2(nullScale.z);
             }
         }
 
@@ -935,16 +1033,18 @@ ClipGateResult ClipHistoryToStatisticGate(
         float sx = max(missSigmaPx.x, kMinMissSigma);
         float sy = max(missSigmaPx.y, kMinMissSigma);
         float sEffSq = 0.5 * (sx * sx + sy * sy);
-        float inv2Sx = 0.5 / (sx * sx);
-        float inv2Sy = 0.5 / (sy * sy);
-        float logNormC = -log(6.2831853 * sx * sy);
+        // ln-exponents, base-2-scaled: the log2(e) factor folded in so the
+        // Gaussian log-density terms below are straight log2.
+        float inv2Sx2 = (0.5 * kLog2E) / (sx * sx);
+        float inv2Sy2 = (0.5 * kLog2E) / (sy * sy);
+        float logNormC2 = -log2(6.2831853 * sx * sy);
 
         // The prior odds: P(|miss| > r0) / P(|miss| <= r0), the Rayleigh
         // tail. Collapses on clean content (the soft clip switches itself
         // off); runs hot on large measured scatter (the history really is
         // miss-contaminated). The dial is kMissRadiusOdds, never a cap.
-        float pH1 = exp(-0.5 * kMissRadiusOdds * kMissRadiusOdds / sEffSq);
-        float logPriorOdds = log(max(pH1, 1e-30)) - log(max(1.0 - pH1, 1e-6));
+        float pH1 = exp2(-(0.5 * kLog2E) * kMissRadiusOdds * kMissRadiusOdds / sEffSq);
+        float logPriorOdds2 = log2(max(pH1, 1e-30)) - log2(max(1.0 - pH1, 1e-6));
 
         // The component masses: P(miss in texel j) = the Gaussian density
         // at offset j (texel area 1 -- the density-times-area form is
@@ -952,42 +1052,56 @@ ClipGateResult ClipHistoryToStatisticGate(
         // P(|miss| > r1) + the optional change-class floor. logSumM
         // renormalizes the 9 into the conditional distribution GIVEN a
         // ghost.
-        float lMass[8];
-        float lMassTail;
-        float logSumM;
+        float lMass2[8];
+        float lMassTail2;
+        float logSumM2;
         {
             float lmMax = -1e30;
             [unroll]
             for (int j = 1; j < 9; ++j)
             {
                 float2 o = kOffsets3x3[j];
-                lMass[j - 1] = logNormC - (o.x * o.x) * inv2Sx - (o.y * o.y) * inv2Sy;
-                lmMax = max(lmMax, lMass[j - 1]);
+                lMass2[j - 1] = logNormC2 - (o.x * o.x) * inv2Sx2 - (o.y * o.y) * inv2Sy2;
+                lmMax = max(lmMax, lMass2[j - 1]);
             }
-            lMassTail = log(exp(-0.5 * kMissRadiusTail * kMissRadiusTail / sEffSq)
-                            + kTailChangeFloor);
-            lmMax = max(lmMax, lMassTail);
+            // kTailChangeFloor = 0: log(exp(x)) is x. fxc does not fold the
+            // round trip (it is not NaN-safe algebraically) -- but the
+            // floor is a compile-time constant, so the branch collapses and
+            // the default build pays neither the exp2 nor the log2.
+            lMassTail2 = (kTailChangeFloor > 0.0)
+                ? log2(exp2(-(0.5 * kLog2E) * kMissRadiusTail * kMissRadiusTail / sEffSq) + kTailChangeFloor)
+                : -(0.5 * kLog2E) * kMissRadiusTail * kMissRadiusTail / sEffSq;
+            lmMax = max(lmMax, lMassTail2);
             float mSum = 0.0;
             [unroll]
             for (int j1 = 0; j1 < 8; ++j1)
-                mSum += exp(lMass[j1] - lmMax);
-            mSum += exp(lMassTail - lmMax);
-            logSumM = lmMax + log(max(mSum, 1e-10));
+                mSum += exp2(lMass2[j1] - lmMax);
+            mSum += exp2(lMassTail2 - lmMax);
+            logSumM2 = lmMax + log2(max(mSum, 1e-10));
         }
 
-        float lComp[8];
-        float lMax = -1e30;
+        // The component log-dets are j-invariant: hoisted out of the
+        // unrolled mixture loop (the compiler may CSE them; the hoist
+        // guarantees it on every backend).
+        float logDetCompHalf2 = 0.5 * (log2(vComp.x) + log2(vComp.y) + log2(vComp.z));
+
+        float lComp2[8];
+        float lMax2 = -1e30;
         [unroll]
         for (int j = 1; j < 9; ++j)
         {
             // The phase-corrected component residual (the neighbor texel's
-            // footprint-average estimate is tap_j + g*j).
-            float3 dd = dCorr + (center - neighborhoodTaps[j]) + stats.phaseShift;
+            // footprint-average estimate is tap_j + g*j). dCorr + center is
+            // historyColorSpace exactly (dCorr was defined as history minus
+            // center), so the center terms CANCEL; the simplified form saves
+            // two float3 adds per component and one rounding, exact in real
+            // arithmetic (compilers cannot reassociate float +/- to find it).
+            float3 dd = historyColorSpace - neighborhoodTaps[j] + stats.phaseShift;
             float  qj = dot(dd * dd, invComp);
-            lComp[j - 1] = lMass[j - 1]
-                         - kT * log(1.0 + qj / nu)
-                         - 0.5 * (log(vComp.x) + log(vComp.y) + log(vComp.z));
-            lMax = max(lMax, lComp[j - 1]);
+            lComp2[j - 1] = lMass2[j - 1]
+                         - kT * log2(1.0 + qj / nu)
+                         - logDetCompHalf2;
+            lMax2 = max(lMax2, lComp2[j - 1]);
         }
 
         // The temporal tail: the old content absent from the 9-tap sample.
@@ -996,26 +1110,29 @@ ClipGateResult ClipHistoryToStatisticGate(
         float3 invTail = float3(1.0, 1.0, 1.0) / tailScale;
         float qTail = dot(dCorr * dCorr, invTail);
 
-        float lTail = lMassTail
-                    - kT * log(1.0 + qTail / nu)
-                    - 0.5 * (log(tailScale.x) + log(tailScale.y) + log(tailScale.z));
-        lMax = max(lMax, lTail);
+        float logDetTailHalf2 = 0.5 * (log2(tailScale.x) + log2(tailScale.y) + log2(tailScale.z));
+        float lTail2 = lMassTail2
+                     - kT * log2(1.0 + qTail / nu)
+                     - logDetTailHalf2;
+        lMax2 = max(lMax2, lTail2);
 
         float wSum = 0.0;
         [unroll]
         for (int j2 = 0; j2 < 8; ++j2)
-            wSum += exp(lComp[j2] - lMax);
-        wSum += exp(lTail - lMax);
+            wSum += exp2(lComp2[j2] - lMax2);
+        wSum += exp2(lTail2 - lMax2);
 
-        // llr = log p1 - log p0: the conditional mixture's logsumexp
-        // (renormalized through -logSumM), plus the null's full -log p0
-        // (the t-core and its log-det normalizer).
-        float llrFrame = (lMax + log(max(wSum, 1e-10))) - logSumM
-                       + kT * log(1.0 + q0Comp / nu)
-                       + 0.5 * logDetNull;
+        // llr2 = log2 p1 - log2 p0: the conditional mixture's logsumexp
+        // (renormalized through -logSumM), plus the null's full -log2 p0
+        // (the t-core and its log-det normalizer). Every term carries the
+        // uniform log2(e) scaling, so the final sigmoid consumes the sum
+        // directly through exp2.
+        float llrFrame2 = (lMax2 + log2(max(wSum, 1e-10))) - logSumM2
+                        + kT * log2(1.0 + q0Comp / nu)
+                        + 0.5 * logDetNull2;
 
-        float logOdds = logPriorOdds + llrFrame;
-        float p1 = 1.0 / (1.0 + exp(-logOdds));
+        float logOdds2 = logPriorOdds2 + llrFrame2;
+        float p1 = 1.0 / (1.0 + exp2(-logOdds2));
 
         // The scalar pull -- the posterior-mean action, floored by the
         // hard ray clamp. The pull IS the eviction mechanism for the miss

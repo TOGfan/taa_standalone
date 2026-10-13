@@ -219,7 +219,10 @@ function M.build()
     taaPreFx:setField("texture", 4, "#TAA_HistMotion")
     -- The clip-state read: #TAA_History bound a second time, point-sampled
     -- (slot 2 is the linear Kaiser color binding; the packed alpha needs a
-    -- filter-free fetch).
+    -- filter-free fetch). Frame 0 / post-resize reads whatever the engine
+    -- left in the target (typically zero): alpha 0 decodes as tag 0 = a
+    -- COLD record, so those pixels run the cold gate for one frame and the
+    -- state self-corrects from the next store on.
     taaPreFx:setField("texture", 5, "#TAA_History")
     taaPreFx:setField("target", 0, "#TAA_Result")
     taaPreFx:setField("targetFormat", 0, "GFXFormatR32G32B32A32F")
@@ -303,7 +306,7 @@ end
 -- The gate's sampling law is F(3, nu), nu = the record's effective dof
 -- (Satterthwaite; taaClip.h.hlsl): nu = 1 / [D/nu0 + varFrac(r)(1-D)] with
 -- D = (1-rho)^{2t} and varFrac(r) = rho / (r (2-rho)), r = the ingest's
--- chi^2 dof. The variance inflation restoring the NOMINAL chi-coverage is
+-- chi^2 dof. The variance inflation restoring the NOMINAL chi^2-coverage is
 --     S(nu) = 3 * F^-1_{3,nu}(p) / chi^2,   p = CDF_chi2_3(chi^2),
 -- a function of the slider: S(4) is 1.18 at chi = 1.5 and 2.52 at 2.8 --
 -- a fixed constant cannot serve both. The host fits
@@ -369,32 +372,39 @@ end
 local function f3nuQuantile(p, nu)
     -- q with P(F(3, nu) <= q) = p, via P(F <= q) = I_u(1.5, nu/2),
     -- u = 3q / (3q + nu). The Simpson NORMALIZER is constant per b -- hoisted
-    -- out of the bisection (it was recomputed on every evaluation: ~2x the
-    -- work per fit, and every varianceGamma/clipOvershoot tick refits).
-    -- Accurate deep into the tail (the coverage fit consumes p = 0.95-ish
-    -- and the cold-gate side p = 1e-2): the bisection resolves u to double
-    -- precision and the 512-interval Simpson carries ~1e-8 absolute CDF
-    -- error, far beneath the tail rates that matter here. Do NOT replace
-    -- these quantiles with asymptotic power-law estimates -- they disagree
-    -- with the exact values by multiples in the F(3, small-nu) tail.
+    -- out of the bisection. 128 intervals carry ~2e-7 absolute CDF error and
+    -- 32 bisection steps resolve u to 2^-32: both far beneath the tail rates
+    -- that matter here (the coverage fit consumes p = 0.95-ish and the
+    -- cold-gate side p = 1e-2), and ~6x cheaper per fit than the 512/48 grid
+    -- this used to run -- every varianceGamma / clipOvershoot change refits,
+    -- including each tick of a coverage-slider drag. Do NOT replace these
+    -- quantiles with asymptotic power-law estimates -- they disagree with
+    -- the exact values by multiples in the F(3, small-nu) tail.
     local b = nu * 0.5
-    local invNorm = 1.0 / beta15PdfSimpson(1.0, 512, b - 1.0)
+    local invNorm = 1.0 / beta15PdfSimpson(1.0, 128, b - 1.0)
     local lo, hi = 0.0, 1.0
-    for _ = 1, 48 do
+    for _ = 1, 32 do
         local mid = 0.5 * (lo + hi)
-        local cdf = beta15PdfSimpson(math.sqrt(mid), 512, b - 1.0) * invNorm
+        local cdf = beta15PdfSimpson(math.sqrt(mid), 128, b - 1.0) * invNorm
         if cdf < p then lo = mid else hi = mid end
     end
     local u = 0.5 * (lo + hi)
     return nu * u / (3.0 * (1.0 - u))
 end
 
-local studentFitCacheChi, studentFitCacheA, studentFitCacheB, studentFitCacheC
+-- Small exact-key table cache (capped, like kernelChainCache): a
+-- coverage-slider drag emits a stream of distinct chis -- one CHEAP refit
+-- per tick now -- and back-and-forth drags, preset applications and
+-- rebuild() re-hit instead of refitting. The old single-entry cache
+-- refitted on every distinct chi both directions.
+local studentFitCache = {}
+local studentFitCacheCount = 0
 
 local function studentFitABC(chi)
     chi = tonumber(chi) or 2.8
     if chi < 0.25 then chi = 0.25 end
-    if studentFitCacheChi == chi then return studentFitCacheA, studentFitCacheB, studentFitCacheC end
+    local hit = studentFitCache[chi]
+    if hit then return hit[1], hit[2], hit[3] end
 
     local c2 = chi * chi
     local p = math.min(math.max(chiSq3Cdf(c2), 1e-6), 1.0 - 1e-6)
@@ -423,8 +433,12 @@ local function studentFitABC(chi)
     local B = (m[2][4] - m[2][3] * C) / m[2][2]
     local A = (m[1][4] - m[1][3] * C - m[1][2] * B) / m[1][1]
 
-    studentFitCacheChi = chi
-    studentFitCacheA, studentFitCacheB, studentFitCacheC = A, B, C
+    if studentFitCacheCount >= 32 then
+        studentFitCache = {}
+        studentFitCacheCount = 0
+    end
+    studentFitCache[chi] = { A, B, C }
+    studentFitCacheCount = studentFitCacheCount + 1
     return A, B, C
 end
 
@@ -569,34 +583,25 @@ local function jitterPhaseCovariance()
 end
 
 -- ============================================================================
--- THE EXACT SEQUENCE / KERNEL CONSTANTS (v3.2; consumed by the accumulator's
--- variance models and the VarH transport; recomputed on every apply --
--- they track the jitter sequence, its scale, and the feedback rate)
+-- THE VARH TRANSPORT'S HOST CONSTANTS (recomputed on every apply -- they
+-- track the feedback rate and the resample tier)
 -- ----------------------------------------------------------------------------
---   * flipAcc: the accumulator's response power to the flip pattern, per
---     unit c(1-c) -- exact: the DFT of the actual sequence's bit pattern
---     (per coverage bin) through the accumulator filter
---     H(w) = a/(1-(1-a)e^{-iw}), taken at the WORST coverage bin (the
---     conservative end for the variance models: V >= the exact everywhere,
---     so the models can only be conservative, never hot). The
---     low-discrepancy sequences' bounded discrepancy suppresses the
---     low-frequency lines, so this lands ~2 orders below the marginal
---     Bernoulli charge a/(2-a).
---   * noiseAcc: the EXACT steady-state accumulated-NOISE share, varH/Var(x)
---     at the accumulation's spectral fixed point (v3.9 -- see
---     kernelChainConstants; the old a^2/(1-(1-a)^2 gbar) carried the
---     one-step gain and assumed a white-input read gain of 1).
 --   * varhLoss: 1 - D, D = the fixed-point READ gain (kernelChainConstants)
 --     -- varH is transported in READ semantics (the Kaiser-resampled
---     history the gate and the CUSUM test), and the history term of the
---     recursion re-reads the smooth accumulated field at the fixed-point
---     gain. Encoded as a LOSS so an unset constant (0) degrades to the
---     legacy undamped transport.
+--     history the gate tests), and the history term of the recursion
+--     re-reads the smooth accumulated field at the fixed-point gain.
+--     Encoded as a LOSS so an unset constant (0) degrades to the legacy
+--     undamped transport.
 --   * whiteLoss: 1 - w, w = the white-input read gain (E_f[sum k^2])^2 --
 --     the fresh current-frame content enters the accumulator white across
---     texels (its spatial correlation is the mu share's business, not the
---     noise chain's), so the fresh-x term of the recursion carries w, not 1.
---     Encoded as a LOSS for the same degradation reason.
+--     texels, so the fresh-x term of the recursion carries w, not 1.
+--
+-- (v5.6 cleanup: the flip-response gain and the accumulated-noise share --
+-- the CUSUM-era variance models' inputs -- are gone with their shader
+-- constants; the flat model's VarH recursion is closed-form from the record
+-- and these two gains. The worst-coverage-bin flip enumeration this block
+-- used to run was pure dead work: several milliseconds of Lua on every
+-- settings tick, feeding a constant the cbuffer no longer declares.)
 --
 -- KERNEL CONTRACT (v3.8: the ACTUAL kernels, no longer a proxy): the
 -- resolve's history resample is a SEPARABLE per-axis windowed sinc --
@@ -660,8 +665,6 @@ end
 --         Vs (stored) = a^2 sum_k b^k m_k^2
 --         Vr (read)   = a^2 sum_k b^k m_{k+1}^2
 --     and D = Vr/Vs.
---   * noiseAcc      = Vr / Var(x): the exact steady-state accumulated-noise
---     share.
 -- ============================================================================
 local kernelChainCache = {}
 local kernelChainCacheCount = 0
@@ -762,81 +765,29 @@ local function kernelChainConstants(beta, radius, a)
     return whiteGain, readGain, noiseAcc
 end
 
-local function accumulatorFilterPower(bits, a)
-    -- The accumulator h = sum_k a(1-a)^k x_{t-k}: the mean-square of the
-    -- steady-state response to a periodic bit pattern's deviation, exact
-    -- (Parseval: mean square = (1/N^2) sum_omega |B(omega)|^2 |H(omega)|^2).
-    local n = #bits
-    local mean = 0.0
-    for i = 1, n do mean = mean + bits[i] end
-    mean = mean / n
-    local power = 0.0
-    for k = 0, n - 1 do
-        local omega = 2.0 * math.pi * k / n
-        local hMag = a / math.sqrt(1.0 - 2.0 * (1.0 - a) * math.cos(omega) + (1.0 - a) * (1.0 - a))
-        local reB, imB = 0.0, 0.0
-        for t = 0, n - 1 do
-            local ang = -omega * t
-            reB = reB + (bits[t + 1] - mean) * math.cos(ang)
-            imB = imB + (bits[t + 1] - mean) * math.sin(ang)
-        end
-        power = power + (reB * reB + imB * imB) * hMag * hMag
-    end
-    return power / (n * n)
-end
-
-local function cusumHostConstants()
+local function varhHostConstants()
     local s = M.settings
-    -- v3.3: the accumulator rate varies per pixel (motion feedback). All
-    -- rate-dependent constants are computed at the FASTEST configured rate
-    -- so the charged responses are conservative upper bounds everywhere.
+    -- The accumulator rate varies per pixel (motion feedback). The
+    -- rate-dependent gains are computed at the FASTEST configured rate so
+    -- the charged responses are conservative everywhere.
     local a = 1.0 - math.min(tonumber(s.feedbackMin) or 0.97,
                               tonumber(s.feedbackMax) or 0.97)
     a = math.min(math.max(a, 0.001), 0.9)
 
-    -- flipAcc: the worst coverage bin of the accumulator's flip-response
-    -- gain.
-    local flipAcc = 0.0
-    local scale = tonumber(s.jitterScale) or 1.0
-    if s.useJitter and scale > 0.0 then
-        local period = s.useR2Jitter and 32 or 16
-        local proj = {}
-        for i = 0, period - 1 do
-            local hx
-            if s.useR2Jitter then
-                hx = r2_sequence(i)
-            else
-                hx = halton(i + 1, 2)
-            end
-            proj[i + 1] = (hx - 0.5) * scale
-        end
-        table.sort(proj)
-        for k = 1, period - 1 do
-            local cov = k / period
-            if cov >= 0.1 and cov <= 0.9 then
-                local thr = 0.5 * (proj[k] + proj[k + 1])
-                local bits = {}
-                for i = 1, period do bits[i] = (proj[i] > thr) and 1 or 0 end
-                local p = accumulatorFilterPower(bits, a)
-                flipAcc = math.max(flipAcc, p / (cov * (1.0 - cov)))
-            end
-        end
-    end
-
     -- v3.9: the VarH chain's gains from the accumulation's spectral fixed
     -- point, per resample tier (kernelChainConstants).
     local use6 = ((tonumber(s.useKaiser6) or 1.0) > 0.5)
-    local whiteGain, readGain, noiseAcc = kernelChainConstants(
+    local whiteGain, readGain = kernelChainConstants(
         use6 and KAISER6_BETA  or KAISER4_BETA,
         use6 and KAISER6_RADIUS or KAISER4_RADIUS,
         a)
     local varhLoss  = math.min(math.max(1.0 - readGain, 0.0), 0.9)
     local whiteLoss = math.min(math.max(1.0 - whiteGain, 0.0), 0.95)
 
-    return flipAcc, noiseAcc, varhLoss, whiteLoss
+    return varhLoss, whiteLoss
 end
 
-local cusumConstantsLogged = false
+local varhConstantsLogged = false
 
 
 -- Defaults: the single source of truth for every setting. M.settings is a
@@ -848,27 +799,24 @@ local cusumConstantsLogged = false
 -- action is now either the posterior mean (the gate / the soft clip) or the
 -- confirmed corrector; slow luma drift is a persistent offset and is the
 -- corrector's business.
+-- v5.6: the CUSUM-era and drift-era keys are retired WITH their shader
+-- constants (the flat model closed the VarH recursion; the corrector and
+-- the ghost detector are gone): clipGhostReset, driftCompensation,
+-- driftMaxGain, jitterFlickerPadding, jitterFlickerFade,
+-- directionalVariance and clipScopedMu no longer exist anywhere in the
+-- chain. setShaderConst for a constant absent from the cbuffer silently
+-- no-ops, so old settings files still carrying these keys are inert; the
+-- UI strips unknown keys on load.
 M.defaultSettings = {
     useJitter                     = true,
     useR2Jitter                   = true,
     jitterScale                   = 1.0,
     feedbackMin                   = 0.97,
     feedbackMax                   = 0.97,
-    -- v3.8: the drift predict step's enable (the lighting machine: the
-    -- spatial estimator's common mode applied to the history with
-    -- noise-aware shrinkage, capped at the content scale). Requires the
-    -- same-layer mask (Depth-Dilated Motion Search).
-    driftCompensation             = 1.0,
-    -- The drift tracker's gain cap -- THE speed/noise dial. A correction
-    -- applied at gain g injects ~g*Var/2 of noise power into the history
-    -- vs the accumulator's own (a/2)Var -- so g = 0.2 evicts a confirmed
-    -- shift in ~5 frames with a bounded, brief noise bump. The eviction
-    -- floor itself is kGhostD0/2 (taaClip): the residual settles there.
-    driftMaxGain                   = 0.2,
     -- chi: the gate's coverage radius (3-dof, PER-CHANNEL normalized -- the
     -- coverages below are actually true now). Below ~2.2 legit sub-texel
     -- content is under-covered. 2.2 = 82%, 2.8 = 95%.
-    varianceGamma                 = 2.8,
+    varianceGamma                 = 2.5003,
     -- The posterior-mean soft clip's ENABLE. ON by default since v3.2: with
     -- the empirical spatial-marginal alternative and the sequential prior
     -- the action is the exact posterior mean -- the graded pull is where
@@ -877,9 +825,6 @@ M.defaultSettings = {
     -- 0 = the pure hard ellipsoid (the A/B baseline).
     softClip                      = 1.0,
     chromaVarianceMod             = 1.0,
-    jitterFlickerPadding          = 0.0,
-    directionalVariance           = 1.0,
-    jitterFlickerFade             = 0.0,
     depthRejection                = 0.05,
     -- v3.8: 5.0 was pure safety margin -- the comparison is exactly
     -- de-jittered and the landing's velocity is the exact stored effective
@@ -891,7 +836,7 @@ M.defaultSettings = {
     crossTestStrength             = 0.35,
     -- Manual RCAS strength (0 disables; 1 is the maximum lobe RCAS permits
     -- -- very strong; ~0.3-0.5 is the typical range).
-    sharpness                     = 0.35,
+    sharpness                     = 0.50,
     debugMode                     = 0.0,
     useDepthDilation              = 1.0,
     -- Gates the resolve's stored-field analysis (dilation validation, the
@@ -901,9 +846,6 @@ M.defaultSettings = {
     -- re-registering it outside the resolve's pass chain).
     useMotionField                = 1.0,
     lumaVariance                  = 0.0,
-    -- v3.11: INERT (the hierarchical gate replaced the mu-share scoping
-    -- entirely; kept so the UI's slider round-trips harmlessly).
-    clipScopedMu                  = 1.0,
     useHullClipping               = 1.0,
     colorSpaceOklab               = 0.0,
     jitterAwareVariance           = 1.0,
@@ -915,12 +857,6 @@ M.defaultSettings = {
     clipOvershoot                 = 0.0,
     motionBlendStart               = 1.0,
     fallbackFXAA                  = 1.0,
-    -- THE GHOST TRAIL DETECTOR (v5.2: the renewed two-sided CUSUM on the
-    -- phase-corrected luma innovation -- calibrated nats, renewal drain).
-    -- Consumers: the corrector's confirmation ramp, the blend floor's
-    -- posterior, and the hard alarm. 0 = off, 1 = soft (default),
-    -- 2 = telemetry only (debug mode 11), 3 = soft + hard alarm.
-    clipGhostReset                = 1.0
 }
 
 local function freshSettingsCopy()
@@ -980,10 +916,6 @@ function M.applySettings(inputs)
         -- nu.
         pre:setShaderConst("$taaArmingA",                ARMING_A)
         pre:setShaderConst("$taaArmingB",                ARMING_B)
-        -- v3.8: the drift predict step's enable (the winsor tail factors
-        -- are gone -- the v3.3 content-scale cap replaced the W(nu) factor).
-        pre:setShaderConst("$taaDriftCompensation",      s.driftCompensation)
-        pre:setShaderConst("$taaDriftMaxGain",          s.driftMaxGain)
         -- The exact-seed phase covariance (v3.8.4: the full quadratic form,
         -- tracking useJitter / useR2Jitter / jitterScale; CENTERED on the
         -- sequence mean -- the accumulator's phase average).
@@ -991,33 +923,22 @@ function M.applySettings(inputs)
         pre:setShaderConst("$taaJitterPhaseEx",  phEx)
         pre:setShaderConst("$taaJitterPhaseEy",  phEy)
         pre:setShaderConst("$taaJitterPhaseExy", phExy)
-        -- THE ACCUMULATOR'S HOST CONSTANTS (see cusumHostConstants): the
-        -- accumulator's exact flip-response gain (the variance models' step
-        -- charge), the exact accumulated-noise share, and the VarH
-        -- transport's two read gains. They track
-        -- useJitter / useR2Jitter / jitterScale / feedbackMax / useKaiser6,
-        -- so every apply recomputes them.
-        local flipAcc, noiseAcc, varhLoss, whiteLoss = cusumHostConstants()
-        pre:setShaderConst("$taaCusumFlipAcc",           flipAcc)
-        pre:setShaderConst("$taaCusumNoiseAcc",          noiseAcc)
+        -- The VarH transport's two read gains (see varhHostConstants above):
+        -- they track feedbackMax / useKaiser6, so every apply recomputes
+        -- them.
+        local varhLoss, whiteLoss = varhHostConstants()
         pre:setShaderConst("$taaVarhResampleLoss",       varhLoss)
         pre:setShaderConst("$taaVarhWhiteLoss",          whiteLoss)
-        if not cusumConstantsLogged then
-            cusumConstantsLogged = true
+        if not varhConstantsLogged then
+            varhConstantsLogged = true
             if log then
                 log("I", "TAA", string.format(
-                    "Accumulator host constants: flipAcc=%.2e noiseAcc=%.5f varhLoss=%.4f whiteLoss=%.4f armingA=%.4f armingB=%.4f studentA=%.4f studentB=%.4f studentC=%.4f (kernel: separable per-axis Kaiser, beta %.1f (6-tap) / %.1f (4-tap) by useKaiser6; VarH gains from the spectral fixed point -- MUST MATCH taaResample.h.hlsl; the arming and Student triples MUST MATCH taaClip.h.hlsl; ingest dof = 1.0, nu_inf = 12.33)",
-                    flipAcc, noiseAcc, varhLoss, whiteLoss, ARMING_A, ARMING_B, studentA, studentB, studentC, KAISER6_BETA, KAISER4_BETA))
+                    "VarH host constants: varhLoss=%.4f whiteLoss=%.4f armingA=%.4f armingB=%.4f studentA=%.4f studentB=%.4f studentC=%.4f (kernel: separable per-axis Kaiser, beta %.1f (6-tap) / %.1f (4-tap) by useKaiser6; VarH gains from the spectral fixed point -- MUST MATCH taaResample.h.hlsl; the arming and Student triples MUST MATCH taaClip.h.hlsl; ingest dof = 1.0, nu_inf = 12.33)",
+                    varhLoss, whiteLoss, ARMING_A, ARMING_B, studentA, studentB, studentC, KAISER6_BETA, KAISER4_BETA))
             end
         end
-        -- The persistence detector's mode: 0 off / 1 armed / 2 telemetry /
-        -- 3 armed + hard alarm.
-        pre:setShaderConst("$taaClipGhostReset",         s.clipGhostReset)
         pre:setShaderConst("$taaSoftClip",                s.softClip)
         pre:setShaderConst("$taaChromaVarianceMod",       s.chromaVarianceMod)
-        pre:setShaderConst("$taaJitterFlickerPadding",    s.jitterFlickerPadding)
-        pre:setShaderConst("$taaDirectionalVariance",     s.directionalVariance)
-        pre:setShaderConst("$taaJitterFlickerFade",       s.jitterFlickerFade)
         pre:setShaderConst("$taaDepthRejection",          s.depthRejection)
         pre:setShaderConst("$taaVelRejection",            s.velRejection)
         pre:setShaderConst("$taaVelGradientScale",        s.velGradientScale)
@@ -1054,7 +975,6 @@ function M.applySettings(inputs)
     end
 
     if fin then
-        fin:setShaderConst("$taaAutoSharpen", (tonumber(s.autoSharpen) or 1.0))
         fin:setShaderConst("$taaSharpness", s.sharpness)
         fin:setShaderConst("$taaDebugMode", s.debugMode)
     end

@@ -25,16 +25,29 @@
 // coherent-motion round trip still cancels to ~0. The landing is resolved
 // with ClassifyLayerSurface -- the SAME rules as everywhere else.
 //
+// v5.6.2 (exactness + dead-export cleanup):
+//   * The dilation-validation gate's expected-crest depth now carries the
+//     fitted T_y: w' = w*B + T_y composed with the rotation-exact raw form
+//     (the gate itself lives in taa.fx; see the composed rawExpClosest
+//     there and the EXACTNESS NOTES below). The old rotation-only form
+//     biased the gate's threshold by |T_y|/w under camera translation.
+//   * The parallax fit accepts a caller-side pre-fit: the dilation gate
+//     needs T_y BEFORE it decides, and the depth test consumes the same
+//     measurement for non-revoked candidates (one fit, bit-identical
+//     values) instead of recomputing.
+//   * HistoryLandingSurface.tapBandFlag[9] REMOVED: the "estimator edge-tap
+//     mask" consumer documented here never materialized in taa.fx -- the
+//     flags are consumed only inside SampleHistoryLandingSurface
+//     (LandingOwnedDepth, the ownership gate) and now stay a function-local
+//     array (nine fewer transported registers plus the unrolled
+//     copy/init loops).
+//
 // FRAGMENT HEADER: compiled only inside taa.fx.hlsl. Requires host context:
 // samplers (historyMotionTex, depthTex, velocityTex), cbuffer perDraw
 // (rejection thresholds, taaUseDepthDilation, taaUseMotionField, tan fov),
 // postFx macros (tex2Dlod). Requires fragments included before:
 // taaShared.h.hlsl, taaConstants.h.hlsl, taaVelocity.h.hlsl,
 // taaLayers.h.hlsl.
-//
-// EXPORTS: HistoryLandingSurface.tapBandFlag[9] -- the per-tap w channel of
-// the landing 3x3 motion-field gather, consumed by the resolve's estimator
-// edge-tap mask (taa.fx) so the mask adds no fetches of its own.
 // ============================================================================
 #ifndef TAA_DISOCCLUSION_H_HLSL
 #define TAA_DISOCCLUSION_H_HLSL
@@ -173,10 +186,8 @@ struct HistoryLandingSurface
     float pairGradPx;        // the active landing extrapolation pair's gradient
     float shallowVelGradPx;  // the landing's measured shallow-end velocity gradient
 
-    // The per-tap stored flags of the landing 3x3 (the same gather's w
-    // channel), exported for the resolve's estimator edge-tap mask --
-    // the mask reads these instead of re-fetching the field.
-    float tapBandFlag[9];
+    // (v5.6.2) tapBandFlag[9] removed -- see the file header. The stored
+    // per-tap flags are consumed only inside this function.
 };
 
 HistoryLandingSurface SampleHistoryLandingSurface(
@@ -193,9 +204,6 @@ HistoryLandingSurface SampleHistoryLandingSurface(
     h.snapDistPx       = 0.0;
     h.pairGradPx       = 0.0;
     h.shallowVelGradPx = 0.0;
-    [unroll]
-    for (int zf = 0; zf < 9; ++zf)
-        h.tapBandFlag[zf] = 0.0;
 
     // Minimal default when no disocclusion test needs the landing (debug
     // views only): the single nearest tap of the stored field. With the
@@ -209,7 +217,6 @@ HistoryLandingSurface SampleHistoryLandingSurface(
             float4 mCenter   = tex2Dlod(historyMotionTex, float4(clampedUV, 0.0, 0.0));
             h.effectiveDepthRaw               = mCenter.z;
             h.effectiveVelocityJitteredPrevUV = mCenter.xy;
-            h.tapBandFlag[0]                  = mCenter.w;
         }
         return h;
     }
@@ -222,6 +229,7 @@ HistoryLandingSurface SampleHistoryLandingSurface(
 
     float  depths[9];
     float2 velocities[9];
+    float  tapFlags[9];       // function-local (v5.6.2: no longer exported)
     float2 tapUVs[9];
     Build3x3TapUVs(snappedUV, vp.texelSize, vp.minUV, vp.maxUV, tapUVs);
     [unroll]
@@ -230,14 +238,14 @@ HistoryLandingSurface SampleHistoryLandingSurface(
         float4 m = tex2Dlod(historyMotionTex, float4(tapUVs[i], 0.0, 0.0));
         depths[i]         = m.z;    // previous frame's depth (raw / baked band / revoked)
         velocities[i]     = m.xy;   // previous frame's velocity
-        h.tapBandFlag[i]  = m.w;    // post-validation layer record (the export)
+        tapFlags[i]       = m.w;    // post-validation layer record
     }
 
     // THE classifier on the stored structure.
     SurfaceEdgeState landingEdge = AnalyzeSurfaceEdgesCore(depths, useDepthDilation);
 
     // --- Ownership gate ------------------------------------------------------
-    bool centerFg = (h.tapBandFlag[0] >= 0.75);
+    bool centerFg = (tapFlags[0] >= 0.75);
     if (!currentIsForeground && !centerFg)
     {
         // Background-resolved center (flat or REVOKED): resolve strictly as
@@ -254,7 +262,7 @@ HistoryLandingSurface SampleHistoryLandingSurface(
     if (!currentIsForeground && !centerFg)
     {
         // The depth must never blend across the ownership boundary.
-        landingLayer.effectiveDepth = LandingOwnedDepth(depths, h.tapBandFlag, fracPx);
+        landingLayer.effectiveDepth = LandingOwnedDepth(depths, tapFlags, fracPx);
     }
 
     h.effectiveDepthRaw               = landingLayer.effectiveDepth;
@@ -306,6 +314,26 @@ HistoryLandingSurface SampleHistoryLandingSurface(
 // depth-side rule as MeasureShallowForegroundGeometry -- dilation centers
 // are background (foreground-side taps only), edge centers are the crest
 // (not-behind taps only), flat is velocity-only.
+//
+// EXACTNESS NOTES (v5.6.2 audit -- verified, deliberately not changed):
+//   * The CENTERED relation has ZERO intercept by construction: the exact
+//     pointwise law is K*p_px = T_y*s'_px + const_px per axis (one shared
+//     T_y, per-axis constants), and subtracting the center tap's (s, G)
+//     removes the constants exactly. The pooled slope formula and the
+//     residual sum below are therefore IDENTICAL to the free-intercept fit
+//     on the centered data (the per-axis intercepts come out zero); the
+//     dof is deliberately kept at 2n-3 -- charging the two structurally
+//     zero intercepts -- a ~10% conservative inflation of tySigma.
+//     Tightening to 2n-1 is exact but tightens the depth tolerance; that
+//     is a policy choice, documented here so it is not "fixed" blindly.
+//     The center tap's own (0,0) point carries no independent noise draw
+//     (it is the centering origin, identically zero) yet is counted in n;
+//     that offsets the dof conservatism above. Both conventions left
+//     as-is.
+//   * The tap coordinates carry no hidden jitter-position error: snapped
+//     texel-center values serve as the frame-space positions of the
+//     fetched content exactly (the stable/frame grids coincide at texel
+//     centers by the snap design), so u_i below IS the true u_i.
 // ============================================================================
 bool EstimateLayerForwardParallax(
     float2 refVelocityUV,          // the resolved layer's effective (jittered) velocity
@@ -399,7 +427,8 @@ bool EstimateLayerForwardParallax(
     float  covSum = sumSG - n * dot(meanS, meanG);
     float  yySum  = sumG2 - n * dot(meanG, meanG);
 
-    // The model: G = a - T_y * s (a: per-channel intercept = rescaled T_perp).
+    // The model: G = a - T_y * s (a: per-channel intercept = rescaled T_perp;
+    // structurally zero after the centering -- see the EXACTNESS NOTES).
     ty = -covSum / varSum;
 
     float residSS = max(yySum - covSum * covSum / varSum, 0.0);
@@ -413,6 +442,12 @@ bool EstimateLayerForwardParallax(
 // ----------------------------------------------------------------------------
 // Returns a continuous score; >= 1.0 rejects, and saturate((1-score)*2) is
 // the depthGate.
+//
+// v5.6.2: (tyIn, tySigmaIn, tyMeasuredIn) let the caller supply the layer's
+// pre-fitted displacement (the dilation gate fits T_y before it decides and
+// hands the SAME measurement to the depth test -- identical inputs, identical
+// value; revoked candidates pass tyMeasuredIn = false and this function fits
+// locally exactly as it always did, behind the early-out below).
 // ============================================================================
 float ComputeDepthDisocclusionScore(
     float  effectiveDepthRaw,
@@ -439,7 +474,10 @@ float ComputeDepthDisocclusionScore(
     CameraBasis previousCamera,
     float  fitRadiusPx,
     float  historySupportTexels,
-    ViewportParams vp)
+    ViewportParams vp,
+    float  tyIn,
+    float  tySigmaIn,
+    bool   tyMeasuredIn)
 {
     if (taaDepthRejection <= 0.001) return 0.0;
 
@@ -459,21 +497,35 @@ float ComputeDepthDisocclusionScore(
     // unconditionally. If even that cannot exceed wHist, the history is
     // provably too far BEHIND to ever reject (the test is one-sided: only a
     // history IN FRONT rejects) -- skip the parallax fit entirely.
+    // (v5.6.2 note: the bound is honest for the CLAMPED transport; a true
+    // |T_y| > wCur -- near surface, fast approach -- can hide a genuine
+    // rejection behind this skip in that rare corner. The clamp guards the
+    // transport itself; relaxing one without the other is not meaningful.)
     if (wCur * bCur + wCur <= wHist) return 0.0;
 
     float ty, tySigma;
-    bool  tyMeasured = EstimateLayerForwardParallax(
-        effectiveVelocityUV, frameBaseUV, stableUV,
-        depthRaw, velocityJitteredUV, tapUVs,
-        isDilationZone, isForegroundEdge,
-        currentCamera, previousCamera, prevFwd, fitRadiusPx, vp, ty, tySigma);
-
-    if (!tyMeasured)
+    if (tyMeasuredIn)
     {
-        // Unmeasurable (isolated fragment): the CPU prior if provided, else
-        // assume the motion is below the fit's own detection floor.
-        ty      = taaDepthParallaxStep;
-        tySigma = kTyUnmeasuredFrac * wCur;
+        // The caller's pre-fit (the dilation gate's, for non-revoked
+        // candidates): the same fit the block below would run.
+        ty      = tyIn;
+        tySigma = tySigmaIn;
+    }
+    else
+    {
+        bool tyMeasured = EstimateLayerForwardParallax(
+            effectiveVelocityUV, frameBaseUV, stableUV,
+            depthRaw, velocityJitteredUV, tapUVs,
+            isDilationZone, isForegroundEdge,
+            currentCamera, previousCamera, prevFwd, fitRadiusPx, vp, ty, tySigma);
+
+        if (!tyMeasured)
+        {
+            // Unmeasurable (isolated fragment): the CPU prior if provided, else
+            // assume the motion is below the fit's own detection floor.
+            ty      = taaDepthParallaxStep;
+            tySigma = kTyUnmeasuredFrac * wCur;
+        }
     }
     ty = clamp(ty, -wCur, wCur);      // degenerate-guard, not a tuning knob
     float wExp   = max(wCur * bCur + ty, 1e-4);
@@ -486,7 +538,10 @@ float ComputeDepthDisocclusionScore(
     // --- tolerance: the measured error budget --------------------------------
     bool isFlat = !isDilationZone && !isForegroundEdge;
 
-    // (a)+(b) representation noise: both sides' depth quanta.
+    // (a)+(b) representation noise: both sides' depth quanta. (Charged at
+    // wExp^2 for both; the current side's exact conversion is B*wCur^2 --
+    // the difference is second-order in T_y/w and the charge is the
+    // conservative side of it.)
     float noiseZ = max(depthQuantStep, depthNoiseFloor);
     float quantW = 2.0 * noiseZ * wExpSq;
 

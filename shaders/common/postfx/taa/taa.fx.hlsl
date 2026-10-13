@@ -30,6 +30,16 @@
 //   velocity | 7 pursuit divergence | 8 layer state | 9 dilation gate |
 //   10 alignment drop | 11 clip gate state | 12 dejittered residual |
 //   13 gate null law (calibration: dbgA = saturate(mdd/16)).
+//
+// v5.6.2 (depth-disocclusion exactness): the dilation-validation gate's
+//   expected-crest depth now carries the fitted T_y (w' = w*B + T_y composed
+//   with the rotation-exact raw form). The layer's forward displacement is
+//   fitted BEFORE the gate for dilation candidates and SHARED with the depth
+//   test -- identical inputs, bit-identical values for every non-revoked
+//   pixel; revoked pixels drop the measurement and re-fit inside the depth
+//   test's early-out-gated path exactly as before. The only behavioral
+//   change anywhere: the gate's fgThreshold under camera translation, now
+//   the exact value instead of the rotation-only one.
 // ============================================================================
 
 #include "shaders/common/postFx/postFx.h.hlsl"
@@ -219,6 +229,20 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
     float2 jitterTransportUV  = EstimateJitterTransportUV(jitterOffsetCurUV, jitterOffsetPrevUV, jitterOffsetPrev2UV);
 
     // 8) Own-history dilation validation.
+    //
+    // v5.6.2: the layer's forward displacement T_y is fitted BEFORE the gate
+    // for dilation candidates: the gate's expected-crest depth is transported
+    // with the SAME exact relation the depth test uses (w' = w*B + T_y; see
+    // the composed rawExpClosest below). The fit runs on the PRE-revocation
+    // layer -- for a dilation candidate that mask IS the foreground (the
+    // crest and its kin), exactly the layer the crest depth belongs to. The
+    // measurement is REUSED by the depth test (identical inputs -> identical
+    // value), so non-revoked candidates pay ONE fit, not two; on revocation
+    // the measurement is dropped and the depth test re-fits on the background
+    // layer inside its own early-out-gated path (as it always did).
+    float  ty = 0.0, tySigma = 0.0;
+    bool   tyMeasured = false;
+
     bool dilationRevoked   = false;
     bool dilationCandidate = false;
     bool gateViaFlag       = false;
@@ -227,11 +251,35 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
     {
         dilationCandidate = true;
 
+        if (depthTestActive)
+        {
+            float3 prevFwd = CameraForwardAxis(previousCamera);
+            tyMeasured = EstimateLayerForwardParallax(
+                currentLayer.effectiveVelocityUV, stableInFrameUV, IN.uv0,
+                neighborhood.depthRaw, neighborhood.velocityJitteredUV, tapUVs,
+                currentLayer.isDilationZone, currentLayer.isForegroundEdge,
+                currentCamera, previousCamera, prevFwd,
+                coherenceRadiusPx, vp, ty, tySigma);
+        }
+
         float rayLenCur  = RayLengthFromUV(IN.uv0, taaTanHalfFovX, taaTanHalfFovY);
         float rayLenPrev = RayLengthFromUV(repro.sampleUV, taaTanHalfFovX, taaTanHalfFovY);
         float perspScale = rayLenPrev / max(rayLenCur, 1e-6);
 
-        float rawExpClosest = currentLayer.closestDepth * perspScale;
+        // v5.6.2 (exactness): the expected stored raw of the crest, WITH the
+        // translation. The rayLen ratio is the EXACT raw transport under a
+        // pure rotation (raw(u) = rayLen(u)/D with D the Euclidean distance,
+        // invariant under rotation about the eye -- so 1/rawExpRot = w*B
+        // exactly), but the stored field is last frame's and the camera
+        // TRANSLATES: the exact relation is w' = w*B + T_y, hence
+        // rawExp = 1/(1/rawExpRot + ty). The old rotation-only form biased
+        // fgThreshold by |ty|/w -- up to ~10% at close range under speed,
+        // twice the default 5% tolerance: keep-biased under forward camera
+        // motion (stale dilation bands surviving), revoke-biased under
+        // retreat (silhouette shimmer). ty = 0 (fit off or failed)
+        // degenerates to the rotation-only value.
+        float rawExpRot     = currentLayer.closestDepth * perspScale;
+        float rawExpClosest = 1.0 / max(1.0 / max(rawExpRot, 1e-6) + ty, kEpsilon);
 
         float2 crestOffset = currentLayer.closestOffsetPx;
         float  objectSlant = (abs(currentLayer.gradX * crestOffset.x) + abs(currentLayer.gradY * crestOffset.y)) * perspScale;
@@ -250,6 +298,14 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
 
             repro = ReprojectToHistory(
                 IN.uv0, stableInFrameUV, pixel.fracPx, currentLayer.effectiveVelocityUV, previousCamera, vp);
+
+            // The pre-gate fit measured the FOREGROUND layer; the revoked
+            // pixel now transports its OWN background surface. Drop the
+            // measurement: the depth test re-fits internally (behind its
+            // early-out, exactly the pre-v5.6.2 code path).
+            tyMeasured = false;
+            ty = 0.0;
+            tySigma = 0.0;
         }
     }
 
@@ -294,7 +350,8 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
             edge.depthNoiseFloor, edge.depthQuantStep,
             currentCamera, previousCamera,
             coherenceRadiusPx, historySupportTexels,
-            vp);
+            vp,
+            ty, tySigma, tyMeasured);
     }
     bool  depthRejected = (depthDisocclusionScore >= 1.0);
 

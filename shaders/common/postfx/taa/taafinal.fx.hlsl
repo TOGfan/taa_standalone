@@ -305,20 +305,16 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
     ASU2 ip = ASU2(IN.uv0 / oneOverTargetSize);
     AF4 tE = FsrRcasLoadF(ip);
 
-    // MANUAL: the slider is the RCAS strength.
-    AF1 strength = amount;
-
-    if (strength <= AF1_(0.001)) {
-        return float4(max(tE.rgb, AF3_(0.0)), 1.0);
-    }
-
+    // (v5.6.1 cleanup) the old `strength` copy and its duplicate <= 0.001
+    // early-out were dead: amount > 0.001 is already established above and
+    // strength was bit-identical to amount.
     // con.x is the ONLY word the 32-bit RCAS path consumes (the lobe scale in
     // FsrRcasF's `lobe * AF1_AU1(con.x)`); con[1] belongs to the 16-bit
     // variants. FsrRcasCon would compute exp2(-stops), exactly undoing the
     // log2 needed to build stops -- set the word directly, skipping the
     // transcendental round trip (and its rounding). FsrRcasCon stays verbatim
     // above for the FSR embedding; it is intentionally uncalled.
-    AU4 con = AU4(AU1_AF1(max(strength, AF1_(1.0 / 1024.0))), 0u, 0u, 0u);
+    AU4 con = AU4(AU1_AF1(max(amount, AF1_(1.0 / 1024.0))), 0u, 0u, 0u);
 
     AF1 pixR, pixG, pixB;
     FsrRcasF(pixR, pixG, pixB, AU2(ip), con);

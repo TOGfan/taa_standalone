@@ -162,7 +162,7 @@ const settingsSchema = [
 {
   name: "General & Sharpening",
   items: [
-    { id: 'sharpness', type: 'float', min: 0.0, max: 1.0, step: 0.01, default: 0.35, name: "Sharpness", desc: "Fixed FSR RCAS sharpening strength: 0 disables, 1.0 is the maximum lobe RCAS permits (very strong). RCAS's built-in contrast limiter and noise suppression remain active, so edges are protected from ringing and grain amplification. Values around 0.3-0.5 are a typical starting point." },
+    { id: 'sharpness', type: 'float', min: 0.0, max: 1.0, step: 0.01, default: 0.50, name: "Sharpness", desc: "Fixed FSR RCAS sharpening strength: 0 disables, 1.0 is the maximum lobe RCAS permits (very strong). RCAS's built-in contrast limiter and noise suppression remain active, so edges are protected from ringing and grain amplification. Values around 0.3-0.5 are a typical starting point." },
     { id: 'jitterScale', type: 'float', min: 0.0, max: 2.0, step: 0.01, default: 1.0, name: "Jitter Spread Scale", desc: "Scales the sub-pixel camera offset pattern. Above 1 samples a wider area within each pixel (more edge anti-aliasing, more temporal softening); below 1 tightens it." },
     { id: 'fallbackFXAA', type: 'numBool', default: 1.0, name: "Fallback Spatial AA (FXAA)", desc: "Applies FXAA edge smoothing to pixels whose temporal history was rejected, so disoccluded areas don't alias while the history rebuilds." }
   ]
@@ -197,7 +197,7 @@ const settingsSchema = [
       // here made every preset write varianceGamma = 95.06 (chi!) into the
       // config and the settings file. All display-unit conversions live in
       // the helpers below.
-      default: 2.8,
+      default: 2.5003,// 2.8,
       name: "Clip Coverage (Accepted History)",
       desc: "The percentage of statistically valid history the clip gate accepts untouched each frame (the coverage of the 3-degree-of-freedom confidence region). 95% is the principled default. The false clips that remain at any setting are marginal -- a one-frame few-percent pull toward the neighborhood mean, invisible -- so the reason to go higher is heavy-tailed content (specular sparkle, noise) rather than shimmer: 99.9% is a ~4.0-sigma gate, 99.99% is ~4.6. Lower = tighter: sharper and less ghosting, but below ~82% legitimate sub-pixel detail starts getting clipped and shimmers. This is the EFFECTIVE coverage: the Clip Radius Margin below widens it beyond what this slider alone shows. Calibrate with debug mode 13: on a static scene the brightness histogram's 95th percentile should sit at mid-gray -- the nominal point is exact by construction, so a static scene should sit ON it. A systematic offset there is a modeling error, not a tuning choice." },
     { id: 'colorSpaceOklab', type: 'numBool', default: 0.0, name: "Perceptual Working Color Space (Oklab)", desc: "Runs the history clipping statistics in Oklab, a perceptually uniform color space: the clip gate's error budget then weights color differences roughly the way human vision does, so clipping decisions favor what you'd actually notice. Off switches to the cheaper YCoCg space -- the resolve's single biggest ALU block is the nine-tap Oklab conversion (three cube roots per tap), so off is a measurable GPU saving, and is what the Performance preset selects. The cost: chroma error gets weighted like luma error, so colored-edge clipping decisions are slightly less perceptual; expect subtly different chroma-shimmer / colored-ghost behavior at equal slider values." },
@@ -262,17 +262,17 @@ settingsSchema.forEach(cat => {
 const presets = {
   Performance: {
     feedbackMax: 0.95, feedbackMin: 0.95,
-    useKaiser6: 0, colorSpaceOklab: 0, useMotionField: 0,
+    useKaiser6: 0, useMotionField: 0,
     // --- aggressive tier (each has a visible cost):
-    // useDepthDilation: 0,    // -16 fetches/px, the biggest gate; silhouettes lose dilated motion
+    useDepthDilation: 0,    // -16 fetches/px, the biggest gate; silhouettes lose dilated motion
     // sharpness: 0,          // the RCAS pass becomes free
-    // useHullClipping: 0,    // fine-detail shimmer (the record, VarH and the split all ride this state)
+    useHullClipping: 0,    // fine-detail shimmer (the record, VarH and the split all ride this state)
     // jitterAwareVariance: 0, // ~50 ops/px; statistically sound since the test-vector phase fix
     // fallbackFXAA: 0,        // 4 fetches on transient pixels; aliased reveals
   },
   Balanced: {},                     // = defaults
   Clarity: { feedbackMax: 0.95, feedbackMin: 0.95 },
-  Smooth: { varianceGamma: 4.594 }  // stored chi: ~99.99% effective coverage
+  Smooth: { varianceGamma: 2.8 }  // stored chi: 95% effective coverage
 }
 
 function toLuaValue(val) {
