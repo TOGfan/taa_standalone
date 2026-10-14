@@ -57,6 +57,63 @@
 //       both IRLS passes). The hoists and collapses are bit-identical:
 //       same operations, same order.
 //
+// v5.6.3 (hypothesis-side exactness): the v5.6 hat-matrix work closed the
+//       plane-side bookkeeping; the residual calibration error lived in
+//       the TEST LEVELS and the soft clip's metric. Every channel-model
+//       asymmetry between the tests is removed:
+//         * ONE channel law for the innovation-scale tests: the spike's
+//           record branch is WHITENED through the shrunk full metric
+//           (exactly chi^2_3 under the null). The old scalar-total form
+//           assumed exchangeable uncorrelated channels: on
+//           luminance-dominated YCoCg content the 3-channel sum's
+//           effective dof is ~1, the priced ~1e-6 spike level ran at
+//           ~1e-3 (records resetting ~1000x the priced rate) and the 0.1%
+//           winsor point at ~2% (the record systematically under-ingested
+//           legitimate variance). The winsor now censors at the ingest's
+//           OWN Satterthwaite dof (WinsorCapNuStar, Wilson-Hilferty
+//           quantile); the transport scatter is charged per-channel
+//           inside the metric instead of as a scalar threshold addend.
+//         * THE SHARED METRIC: the soft clip's 8 neighbor components and
+//           its temporal tail are standardized through the SAME shrunk
+//           correlation matrix R as the null and the hard test (one
+//           hoisted R^-1 at unit scale). The old diagonal-only component
+//           metric left a spurious -0.5*log2|R| in the odds (x0.5-0.7 at
+//           typical correlations) and mis-shaped q_j along the coupled
+//           direction: the soft clip under-engaged ~1.4-2.2x on
+//           correlated content. The |R| factors now cancel exactly
+//           between the hypotheses' log-dets.
+//         * The component cell masses at two-term Euler-Maclaurin (the
+//           density-times-area form is ~4% low at sigma ~ 0.7 texel).
+//         * The correlation dof from the W2 Kish count (the moments' own
+//           effective size; the w3 sandwich count understated it and
+//           over-shrank).
+//         * The Studentization is a Pade (2,1) rational in 1/nu, host-fit
+//           by weighted least squares over a dense anchor set (the
+//           3-anchor cubic was exact at its anchors but wobbled a few
+//           percent between them on the steep low-nu end).
+//       Reviewed and deliberately NOT changed: the record's ingest dof
+//       stays kRecordIngestDof (a dynamic nu* there would break the
+//       STUDENT_NUINF host sync -- version it deliberately if ever
+//       needed); the gate's varH charge stays the full transported
+//       varHPer (varH is maintained in READ semantics -- it already IS
+//       the Kaiser read's variance; a Sum-c^2 discount would
+//       double-count); the nuPost dof blend stays variance-weighted (the
+//       honest recalibration is a host-side simulation, not shader
+//       algebra -- the documented open item).
+//
+// v5.6.4 (two local tail-law upgrades): the winsor's censoring point is a
+//       PEARSON-III (3-cumulant) match -- the sum's skewness,
+//       kap3 = 8*tr(Sigma^3), was invisible to the 2-cumulant
+//       Satterthwaite form, which ran the 0.1% point low on mixed
+//       variance/correlation structures (a low cap over-censors
+//       legitimate variance). The soft clip's radial tails (the prior
+//       odds and the temporal tail mass) are ANISOTROPY-CORRECT: a
+//       3-cumulant gamma for r^2 replaces the Rayleigh-at-sEffSq form,
+//       which was exact only at sx = sy and UNDERstated the tail on
+//       directional misses (a one-axis scatter is a chi^2_1-type tail,
+//       half the exponential's rate). Both degenerate to the old forms
+//       exactly on their old validity sets.
+//
 // THE GATE: the history's accumulation target is the phase-swept CENTER
 // TEXEL; the gate tests the history against the posterior of that target
 // given the current frame. PRIOR: plane0, variance tauB2 + sPer*evalVar.
@@ -66,13 +123,14 @@
 // residual carries the step -- the flip REQUIRES that width.
 //
 // THE RECORD: the transported sigma^2 MEANS sPer, ingested H-free
-// (dev^2 - vPrior + 2*cPT). The winsor caps the chi^2_3-scaled ingest at
-// 0.1%: the null bias is ~0.6% and a center-tap firefly's record impact
-// is half the old 9x cap's. The spike's record branch is a priced ~1e-6
-// chi^2_3 test; the range branch (16x the observed AABB range) is the
-// distribution-free garbage backstop -- effectively never on the null by
-// design, the level-change job having moved to the H-free ingest and the
-// reveal job to geoCorroboration.
+// (dev^2 - vPrior + 2*cPT). The winsor caps the ingest at its OWN
+// Satterthwaite dof's 0.1% point (v5.6.3 -- WinsorCapNuStar; the null
+// bias is ~0.6% and a center-tap firefly's record impact is half the old
+// 9x cap's). The spike's record branch is a priced ~1e-6 chi^2_3 test,
+// whitened through the shrunk full metric; the range branch (16x the
+// observed AABB range) is the distribution-free garbage backstop --
+// effectively never on the null by design, the level-change job having
+// moved to the H-free ingest and the reveal job to geoCorroboration.
 //
 // TRANSPORT (tag 101): [31] sign, [30:28] tag, [27:22] sigma (6-bit,
 // = sPer), [21:10] VarH ratio (12-bit), [9:6] age (4-bit), [5:0] split
@@ -98,6 +156,11 @@ struct ColorNeighborhoodStats
                                 // (the soft clip's temporal tail)
     float  invNeff;             // the SANDWICH information count (dof side:
                                 // Sum w*psi' mass, information-positive only)
+    float  invNeffW2;           // (v5.6.3) the W2 Kish count -- the effective
+                                // sample size of the moments the correlations
+                                // are computed FROM (the correlations' own
+                                // dof base; the sandwich count is the
+                                // predictive side's)
     float  evalVar;             // Sum c_k^2: the EXACT evaluation variance
                                 // (the vFit multiplier -- the plain w2
                                 // concentration plus the exact lever terms)
@@ -126,11 +189,16 @@ struct ColorNeighborhoodStats
 static const float kClipSigmaEmaRate         = 0.15;
 static const float kClipSigmaRecordFloorSq   = (1.0 / 255.0) * (1.0 / 255.0);
 // ---- the shared chi^2_3 levels (one law, three tests) ----
-// The 3-dof null's quantiles. The innovation-scale consumers (the winsor,
-// the spike) go through the /3: a 3-channel SUM whose null mean is the
-// total scale is (total/3) * chi^2_3.
+// (v5.6.3) All three innovation-scale tests now run through the SAME
+// channel model: the corroboration reset and the spike's record branch are
+// WHITENED through the shrunk full metric (exactly chi^2_3 under the
+// null), and the winsor censors at the ingest's own Satterthwaite dof
+// (Wilson-Hilferty quantile, computed in WinsorCapNuStar). The old
+// scalar-total forms assumed exchangeable uncorrelated channels: on
+// luminance-dominated YCoCg deviations the 3-channel sum's effective dof
+// is ~1, so the priced 1e-6 spike level ran at ~1e-3 and the 0.1% winsor
+// point at ~2%.
 static const float kChiSq3_95   = 7.815;     // the corroboration reset: 5%
-static const float kChiSq3_999  = 16.266;    // the winsor: 0.1% censoring
 static const float kChiSq3_1e6  = 31.0;      // the spike's record branch
                                              // (exact tail 8.5e-7 via the
                                              // erfc form)
@@ -154,11 +222,19 @@ static const float kRecordIngestDof = 1.0;
 // mass for the change-class ghost (old content absent for reasons other
 // than a miss, e.g. lighting steps) -- 0 = the pure miss model; raise to
 // ~0.02-0.1 if static-scene lighting transitions evict too slowly.
+// (v5.6.3 note: with the shared component metric the posterior runs
+// somewhat hotter on correlated content at a fixed dial -- the honest
+// direction; re-baseline field tuning here if the soft clip over-engages.)
 static const float kMinMissSigma    = 0.125;  // texels: the floor (underflow
                                               // safety; below it "no miss")
 static const float kMissRadiusOdds  = 1.0;
 static const float kMissRadiusTail  = 1.5;
 static const float kTailChangeFloor = 0.0;
+// (v5.6.3) The cell-mass Euler-Maclaurin correction's clamp floor: below
+// sigma ~ 0.29 texel the two-term expansion's zero-z factor would go
+// negative; the prior odds have already collapsed there, so the clamp
+// only keeps the log finite.
+static const float kMinMassCorr     = 0.0625;
 // The tail component's content-scale prior (the unknown old content's
 // spread around the neighborhood mean, in content sigmas).
 static const float kGhostPriorSigma = 1.0;
@@ -265,7 +341,7 @@ void AccumulateColorMoments(float3 taps[9], float w[9], out ColorMomentAccum a)
     a.offSumW2 = float2(0.0, 0.0);
     a.offXSqW2 = 0.0;
     a.offYYSqW2 = 0.0;
-    a.offXYW2 = 0.0;
+    a.offXYW2  = 0.0;
 
     [unroll]
     for (int i = 0; i < 9; ++i)
@@ -496,6 +572,10 @@ ColorNeighborhoodStats ComputeColorNeighborhoodStats(
 
         float2 dEval = jitterPx - cenPx;
         float plainInvNeff = acc.totalWSq / max(acc.totalW * acc.totalW, 1e-6);
+        // (v5.6.3) The W2 Kish count: the moments' own effective sample
+        // size, exported for the correlations' dof (see
+        // ShrunkenCorrelations). plainInvNeff IS it -- no recomputation.
+        stats.invNeffW2 = saturate(plainInvNeff);
 
         // The inverse scatter matrix and its rank flag, built ONCE: the
         // exact evaluation variance, the exact residual dof and the F1
@@ -577,15 +657,54 @@ ColorNeighborhoodStats ComputeColorNeighborhoodStats(
         stats.residSq = max(ssr * acc.totalW / dofSSR, 0.0);
 
         // F1: the prior/tap shared-sample covariance, on the robust
-        // weights. The residSq basis models the structure as sharing
-        // through the kernel; the Cauchy-Schwarz clamp guards both limits.
-        float crossQuad = 0.0;
+        // weights -- (v5.6.5) THE EXACT LEVER. The load-bearing identity
+        // is the ingest's de-bias, E[dev^2] = sPer + vPrior - 2*cPT with
+        // dev = x0c - plane0 and the FITTED phase correction, which pins
+        //     cPT = sPer * (k0 + L):
+        //     k0 = (w2_0/W) * (1 - dEval' S^-1 cen)   -- the plain
+        //          shared-sample term (exact when the phase gradient is
+        //          treated as deterministic),
+        //     L  = jitterPx' S^-1 c2
+        //        + 0.5 * (dEval' S^-1 S2 S^-1 dEval - cen' S^-1 S2 S^-1 cen)
+        //        - (w2_0/W) * jitterPx' S^-1 cen
+        // with c2 = Sum (w2/W)^2 (o - cen) and S2 = Sum (w2/W)^2 (o-cen)
+        // (o-cen)' -- the w2-SQUARED centroid offset and scatter (the
+        // same accumulator class the exact evaluation variance uses).
+        // The old crossQuad form was the UNIFORM-WEIGHT lever of a
+        // different convention (the full Cov(plane0, x0c)): exact only
+        // at w2 = const, where the conventions meet. Under the actual
+        // kernel/IRLS weights it over-charged cPT two ways at once --
+        // the convention factor (2x even at uniform weights) and the
+        // w2-for-w2^2 substitution (~3.3x at the default kernel shape)
+        // -- biasing the ingest's de-bias low (the record's fixed point
+        // sagged ~21% at extreme sub-pixel phase with jitter-aware
+        // weighting off) and qTapDen tight (~29%). With jitter-aware
+        // weighting ON (the default) dEval ~ 0 and neither form's lever
+        // engages: the fix is invisible there by construction.
+        // Degenerate spread: the plain shared-sample term stands (the
+        // lever's S^-1 does not exist). jitterPx = 0 makes L vanish and
+        // k0 = b0 identically; uniform w2 reduces L to
+        // dEval' S^-1 dEval / (2N).
+        float priorTapCoef = w2[0] * invTotalWeight;
         if (scatterFullRank)
         {
-            float2 cRhs  = jitterPx - w2[0] * cenPx;
-            crossQuad = dEval.x * dot(vInv0, cRhs) + dEval.y * dot(vInv1, cRhs);
+            float  invW2 = invTotalWeight * invTotalWeight;
+            float2 sumW2offCen = acc.offSumW2 - cenPx * acc.totalWSq;
+            float  sXX = acc.offXSqW2 - 2.0 * cenPx.x * acc.offSumW2.x + acc.totalWSq * cenPx.x * cenPx.x;
+            float  sYY = acc.offYYSqW2 - 2.0 * cenPx.y * acc.offSumW2.y + acc.totalWSq * cenPx.y * cenPx.y;
+            float  sXY = acc.offXYW2 - cenPx.x * acc.offSumW2.y - cenPx.y * acc.offSumW2.x + acc.totalWSq * cenPx.x * cenPx.y;
+            float2 vC  = float2(dot(vInv0, cenPx),  dot(vInv1, cenPx));    // S^-1 cen
+            float2 vD  = float2(dot(vInv0, dEval),  dot(vInv1, dEval));    // S^-1 dEval
+            float2 uC2 = float2(dot(vInv0, sumW2offCen), dot(vInv1, sumW2offCen)); // S^-1 Sum w2^2 (o-cen)
+            float quadD = (sXX * vD.x * vD.x + 2.0 * sXY * vD.x * vD.y + sYY * vD.y * vD.y) * invW2;
+            float quadC = (sXX * vC.x * vC.x + 2.0 * sXY * vC.x * vC.y + sYY * vC.y * vC.y) * invW2;
+            float k0 = (w2[0] * invTotalWeight) * (1.0 - dot(dEval, vC));
+            float lever = dot(jitterPx, uC2) * invW2
+                        + 0.5 * (quadD - quadC)
+                        - (w2[0] * invTotalWeight) * dot(jitterPx, vC);
+            priorTapCoef = k0 + lever;
         }
-        stats.priorTapCov = max(stats.residSq * invTotalWeight * (w2[0] + crossQuad), float3(0.0, 0.0, 0.0));
+        stats.priorTapCov = max(stats.residSq * priorTapCoef, float3(0.0, 0.0, 0.0));
 
         // the transport scatter, projected on the robust gradient
         stats.transportVar = (transportErrPx.x * transportErrPx.x) * (fit.gradX * fit.gradX)
@@ -622,11 +741,70 @@ float ShrinkCorrelation(float r, float nu)
 
 void ShrunkenCorrelations(ColorNeighborhoodStats stats, out float rXY, out float rXZ, out float rYZ)
 {
-    float rDof = max(1.0 / max(stats.invNeff, 1e-3) - 1.0, 2.0);
-    float nuCorr = max(rDof - 2.0, 1.0);   // n_eff - 3: the correlation's own dof
+    // (v5.6.3) The correlation dof from the W2 Kish count: the moments
+    // these correlations are computed FROM are w2-weighted, so their own
+    // effective size is the honest dof base -- the w3 sandwich count is
+    // the information-side quantity and understates n_eff here (the old
+    // use over-shrank every correlation). nu = n_eff(w2) - 3 is the
+    // Fisher-z form EXACTLY: for a correlation from n samples,
+    // Var(r) ~= (1-r^2)^2/(n-3) -- the -3 is already in the call, not a
+    // large-n limit left un-corrected (audited: do not "fix" it again).
+    float nuCorr = max(1.0 / max(stats.invNeffW2, 1e-3) - 3.0, 1.0);
     rXY = clamp(ShrinkCorrelation(stats.covCross.x / max(stats.sigmaClean.x * stats.sigmaClean.y, kEpsilon), nuCorr), -0.95, 0.95);
     rXZ = clamp(ShrinkCorrelation(stats.covCross.y / max(stats.sigmaClean.x * stats.sigmaClean.z, kEpsilon), nuCorr), -0.95, 0.95);
     rYZ = clamp(ShrinkCorrelation(stats.covCross.z / max(stats.sigmaClean.y * stats.sigmaClean.z, kEpsilon), nuCorr), -0.95, 0.95);
+}
+
+// ============================================================================
+// THE SHARED CORRELATION METRIC'S QUADRATIC FORM (v5.6.3)
+// ============================================================================
+// y' R^-1 y at unit scale, R = [[1, rXY, rXZ], [rXY, 1, rYZ], [rXZ, rYZ, 1]],
+// with the inverse passed as its symmetric cofactors over detR
+// (rC01 = (rXZ*rYZ - rXY)/detR etc). Standardizing a deviation by its
+// per-channel scales and applying this is EXACTLY the full metric
+// diag(v) R diag(v) -- one implementation serves the hard test, the soft
+// clip's null, its 8 neighbor components and its temporal tail.
+float QuadFormUnitR(float3 y, float rC00, float rC01, float rC02, float rC11, float rC12, float rC22)
+{
+    return rC00 * y.x * y.x + rC11 * y.y * y.y + rC22 * y.z * y.z
+         + 2.0 * (rC01 * y.x * y.y + rC02 * y.x * y.z + rC12 * y.y * y.z);
+}
+
+// ============================================================================
+// (v5.6.4) THE ANISOTROPIC RADIAL TAIL: log2 P(|miss| > r) at unequal x/y
+// scatter. r^2 = sx^2 z1^2 + sy^2 z2^2 is a two-term generalized
+// chi-square; its 3-cumulant match is a SHIFTED gamma,
+//     kap1 = m = sx^2 + sy^2,  kap2 = 2(sx^4 + sy^4),  kap3 = 8(sx^6 + sy^6)
+//     alpha = kap1^2 / kap2  in [1/2, 1],  delta = kap1 - 2 kap2^2 / kap3 >= 0
+// (both bounds are identities: alpha by AM-GM on (a, b), delta by
+// Cauchy-Schwarz on the eigenvalues; both are equalities at sx = sy, and
+// delta = 0 also at full anisotropy -- the chi^2_1 family is exactly
+// gamma). The survival is the gamma's uniform tail asymptotic,
+//     S ~ u^(alpha-1) e^(-u) / Gamma(alpha),   u = (r^2 - delta) / theta,
+// evaluated in log2 (the ln terms fold: ln(u) * kLog2E = log2(u)).
+// EXACTLY the old Rayleigh form when sx = sy (alpha = 1, delta = 0:
+// log2 S = -r^2 * kLog2E / m, at every r). Accuracy: a tail estimate --
+// solid for p <~ 0.01, ~±20% through the hot transition, exact at both
+// axis endpoints. lnGamma on [1/2, 1] is the quadratic through
+// (1/2, 0.5724), (3/4, 0.2033), (1, 0): max error ~5e-3 in the log.
+// ============================================================================
+float Log2RadialTail2(float rSq, float sx, float sy)
+{
+    float a = sx * sx;
+    float b = sy * sy;
+    float m = a + b;
+    float kap2 = 2.0 * (a * a + b * b);
+    float kap3 = 8.0 * (a * a * a + b * b * b);
+    float alpha = (m * m) / max(kap2, 1e-20);                      // [0.5, 1]
+    float delta = max(m - (2.0 * kap2 * kap2) / max(kap3, 1e-30), 0.0);
+    float u = max((rSq - delta) * alpha / max(m, 1e-20), 0.0);     // (r^2 - delta)/theta
+    float uLog = max(u, 0.5);   // the log term's asymptotic validity floor
+    float oneMinusA = 1.0 - alpha;
+    float lnGamma = 1.3264 * oneMinusA * oneMinusA + 0.4815 * oneMinusA;
+    // The min() pins S <= 0.9997: near u = 0 with alpha near 1 the
+    // asymptotic can drift a hair above S = 1, and S > 1 would explode the
+    // prior odds through the (1 - p) term.
+    return min(-u * kLog2E + (alpha - 1.0) * log2(uLog) - lnGamma * kLog2E, -0.0005);
 }
 
 // ============================================================================
@@ -788,6 +966,76 @@ float WhitenedInnovSq(float3 innov, RecordVarianceParts p, float3 transportVar,
 }
 
 // ============================================================================
+// THE WINSOR'S CENSORING POINT (v5.6.3: the ingest's own Satterthwaite dof)
+// ============================================================================
+// The ingest is a 3-channel SUM of correlated squared devs. For
+// x ~ N(0, S), the sum of squares has Satterthwaite dof
+//     nuStar = (tr S)^2 / tr(S^2)
+//            = (sum v)^2 / (sum v^2 + 2*sum rho^2 v_j v_k)   in [1, 3]
+// -- 1 on luminance-dominated YCoCg deviations (all power in Y), 3 only
+// for exchangeable uncorrelated channels. NOTE the rho^2: the covariance
+// of SQUARES carries the SQUARED correlation (Cov(x_j^2, x_k^2) =
+// 2 S_jk^2) -- not rho; do not "simplify" it. The per-channel null
+// variances are the tap dev's own (vPrior + sPer - 2*cPT -- the same
+// identity the ingest de-biases with, replicated here bit-for-bit from
+// the gate's qTapDen), so the censoring point is the honest 0.1%
+// quantile of the actual null:
+//     cap = Q_0.999(null) / kap1 * spatialPriorSq
+// with Q via the PEARSON-III match (v5.6.4: the 3-cumulant SHIFTED gamma;
+// the v5.6.3 nuStar form was its 2-cumulant special case -- exact when the
+// channel sum is chi^2-shaped, ~2-6% low otherwise, and a low cap
+// over-censors legitimate variance). The Wilson-Hilferty quantile of the
+// gamma part runs ~1-3% high -- the conservative side for a censor.
+// The OLD form (chi^2_3/3 = 5.42x) ran the 0.1% point at ~2% on gray
+// content: the record systematically under-ingested legitimate variance
+// there, sagging the aged gate.
+// ============================================================================
+float WinsorCapNuStar(
+    RecordVarianceParts parts,
+    ColorNeighborhoodStats stats,
+    float  splitFrac,
+    float  rXY, float rXZ, float rYZ)
+{
+    float3 tauB2  = max(splitFrac, 0.0) * stats.residSq;
+    float3 vPrior = tauB2 + parts.sPer * stats.evalVar;
+    float3 qDen   = max(vPrior + parts.sPer - 2.0 * stats.priorTapCov,
+                        0.25 * (vPrior + parts.sPer));
+    float vx = qDen.x, vy = qDen.y, vz = qDen.z;
+    float vSum   = vx + vy + vz;
+    float vSqSum = vx * vx + vy * vy + vz * vz
+                 + 2.0 * (rXY * rXY * vx * vy + rXZ * rXZ * vx * vz + rYZ * rYZ * vy * vz);
+    // (v5.6.4) PEARSON-III (3-cumulant) instead of Satterthwaite: the sum's
+    // skewness, kap3 = 8*tr(Sigma^3), is invisible to the 2-cumulant chi^2
+    // form. The matched law is a SHIFTED gamma,
+    //     delta = kap1 - 2 kap2^2 / kap3 >= 0   (Cauchy-Schwarz on the
+    //              eigenvalues; zero exactly on the chi^2 family),
+    //     alpha = 4 kap2^3 / kap3^2  in [0.5, 1.5]  (skew <= 2*sqrt(2)
+    //              for any PSD Sigma),
+    // and the 0.999 quantile is delta + (2 kap2^2 / kap3) * WH(alpha)^3.
+    // On gamma-consistent channel sums this is form-identical to the old
+    // nuStar path (delta = 0, alpha = nuStar/2, the same WH); on mixed
+    // variance/correlation structures it roughly halves the 0.1%-quantile
+    // error, with the residual on the high side (a slightly high cap
+    // censors slightly less -- the safe direction for a censor).
+    float vXY3 = rXY * rXY * vx * vy * (vx + vy)
+               + rXZ * rXZ * vx * vz * (vx + vz)
+               + rYZ * rYZ * vy * vz * (vy + vz);
+    float trSigma3 = vx * vx * vx + vy * vy * vy + vz * vz * vz
+                   + 3.0 * vXY3
+                   + 6.0 * (rXY * rXZ * rYZ) * vx * vy * vz;
+    float kap1 = vSum;
+    float kap2 = 2.0 * vSqSum;
+    float kap3 = 8.0 * trSigma3;
+    float gammaMean = 2.0 * kap2 * kap2 / max(kap3, 1e-30);      // alpha * theta
+    float delta = max(kap1 - gammaMean, 0.0);
+    float alphaW = 4.0 * (kap2 * kap2 * kap2) / max(kap3 * kap3, 1e-60);
+    // Wilson-Hilferty at z_0.999 = 3.090232306167813
+    float wh = 1.0 - 1.0 / (9.0 * alphaW) + 3.090232306167813 * sqrt(1.0 / (9.0 * alphaW));
+    float chiQ = delta + gammaMean * wh * wh * wh;
+    return (chiQ / max(kap1, 1e-20)) * max(parts.spatialPriorSq, kClipSigmaRecordFloorSq);
+}
+
+// ============================================================================
 // THE MAHALANOBIS GATE
 // ============================================================================
 struct ClipGateResult
@@ -808,7 +1056,10 @@ ClipGateResult ClipHistoryToStatisticGate(
     float  recordAge,
     float  splitFrac,
     float2 missSigmaPx,
-    float3 neighborhoodTaps[9])
+    float3 neighborhoodTaps[9],
+    float  rXY, float rXZ, float rYZ)   // (v5.6.3) the caller's shrunk
+                                        // correlations -- ONE evaluation
+                                        // shared by every consumer
 {
     ClipGateResult r;
     r.center = stats.plane0;
@@ -885,10 +1136,20 @@ ClipGateResult ClipHistoryToStatisticGate(
                       / max(A * A / nuRecordSafe + B * B / nuPrior, float3(1e-10, 1e-10, 1e-10));
         nuFlat = max(nuFlat, float3(2.0, 2.0, 2.0));
 
-        // The host fit is exact at THREE anchors (nu = 2, nu0, nu_inf).
-        float3 studentS = 1.0 + taaStudentA / nuFlat
-                       + taaStudentB / (nuFlat * nuFlat)
-                       + taaStudentC / (nuFlat * nuFlat * nuFlat);
+        // (v5.6.3) The host fit is a Pade (2,1) rational in x = 1/nu,
+        //     S(nu) = (1 + A*x + B*x^2) / (1 + C*x),
+        // weighted-least-squares fit to the exact F(3,nu) quantile
+        // relation over a dense anchor set (taa.lua -- the same
+        // f3nuQuantile machinery the old cubic consumed). The cubic was
+        // exact at its three anchors but wobbled a few percent between
+        // them on the steep low-nu end (S rises ~3x between nu = 4 and
+        // nu = 2); the rational tracks the exact curve roughly an order
+        // of magnitude tighter. The denominator is Lua-verified positive
+        // over x in [0, 0.5] (nu >= 2 everywhere here); the max() is a
+        // NaN-safety floor that never binds on a valid fit.
+        float3 xNu = 1.0 / nuFlat;
+        float3 studentS = (1.0 + taaStudentA * xNu + taaStudentB * xNu * xNu)
+                        / max(1.0 + taaStudentC * xNu, 0.0625);
         gateVar = max(gateVarBase * studentS, float3(minGateVar, minGateVar, minGateVar));
 
         float gSum = gateVar.x + gateVar.y + gateVar.z;
@@ -927,38 +1188,32 @@ ClipGateResult ClipHistoryToStatisticGate(
     float3 chromaScale = max(float3(1.0, taaChromaVarianceMod, taaChromaVarianceMod), 0.0);
     float chi = max(taaVarianceGamma, kEpsilon) * (1.0 + max(taaClipOvershoot, 0.0));
 
-    // ---- THE FULL METRIC (the shrunk sample correlations, clamped) ----
-    float rXY, rXZ, rYZ;
-    ShrunkenCorrelations(stats, rXY, rXZ, rYZ);
-    float vX = max(gateVar.x * chromaScale.x * chromaScale.x, minGateVar);
-    float vY = max(gateVar.y * chromaScale.y * chromaScale.y, minGateVar);
-    float vZ = max(gateVar.z * chromaScale.z * chromaScale.z, minGateVar);
-    float sX = sqrt(vX), sY = sqrt(vY), sZ = sqrt(vZ);
-    float m01 = rXY * sX * sY;
-    float m02 = rXZ * sX * sZ;
-    float m12 = rYZ * sY * sZ;
+    // ---- THE SHARED METRIC (v5.6.3) ----
+    // One correlation matrix R (the caller's shrunk correlations -- the
+    // same values the spike, the winsor and the corroboration test
+    // consume), one hoisted R^-1 at unit scale. Every quadratic form in
+    // this gate -- the hard test's mdd, the soft clip's null, its 8
+    // neighbor components, its temporal tail -- standardizes its
+    // deviation by the hypothesis' per-channel scales and runs through
+    // this R^-1: exactly the full metric diag(v) R diag(v), and the SAME
+    // channel coupling on both sides of the soft clip's likelihood ratio
+    // (the old per-use inline inverses and the components' diagonal-only
+    // metric are gone).
+    float detR = 1.0 + 2.0 * rXY * rXZ * rYZ - rXY * rXY - rXZ * rXZ - rYZ * rYZ;
+    bool  rFull = (detR > 1e-6);
+    float invDetR = rFull ? (1.0 / detR) : 0.0;
+    float rC00 = (1.0 - rYZ * rYZ) * invDetR;
+    float rC01 = (rXZ * rYZ - rXY) * invDetR;
+    float rC02 = (rXY * rYZ - rXZ) * invDetR;
+    float rC11 = (1.0 - rXZ * rXZ) * invDetR;
+    float rC12 = (rXY * rXZ - rYZ) * invDetR;
+    float rC22 = (1.0 - rXY * rXY) * invDetR;
 
-    float c0 = vY * vZ - m12 * m12;
-    float c1 = m12 * m02 - m01 * vZ;
-    float c2 = m01 * m12 - vY * m02;
-    float det = vX * c0 + m01 * c1 + m02 * c2;
-    float mdd;
-    if (det > 1e-12)
-    {
-        float invDet = 1.0 / det;
-        float i00 = c0 * invDet;
-        float i01 = c1 * invDet;
-        float i02 = c2 * invDet;
-        float i11 = (vX * vZ - m02 * m02) * invDet;
-        float i12 = (m02 * m01 - vX * m12) * invDet;
-        float i22 = (vX * vY - m01 * m01) * invDet;
-        mdd = i00 * dCorr.x * dCorr.x + i11 * dCorr.y * dCorr.y + i22 * dCorr.z * dCorr.z
-            + 2.0 * (i01 * dCorr.x * dCorr.y + i02 * dCorr.x * dCorr.z + i12 * dCorr.y * dCorr.z);
-    }
-    else
-    {
-        mdd = dCorr.x * dCorr.x / vX + dCorr.y * dCorr.y / vY + dCorr.z * dCorr.z / vZ;
-    }
+    // The hard test's statistic through the shared metric.
+    float3 vMet = max(gateVar * chromaScale * chromaScale, float3(minGateVar, minGateVar, minGateVar));
+    float mdd = rFull
+        ? QuadFormUnitR(dCorr / sqrt(vMet), rC00, rC01, rC02, rC11, rC12, rC22)
+        : dot(dCorr * dCorr, float3(1.0, 1.0, 1.0) / vMet);
     r.mdd = mdd;
 
     float tHard = (mdd > 1e-20) ? min(chi / sqrt(mdd), 1.0) : 1.0;
@@ -987,6 +1242,12 @@ ClipGateResult ClipHistoryToStatisticGate(
         // UNCHANGED -- and log2/exp2 are the native opcodes (HLSL log/exp
         // each pay an extra multiply against the ln(2)/log2(e) factor that
         // this form folds into constants instead).
+        //
+        // (v5.6.3) The neighbor masses carry the two-term Euler-Maclaurin
+        // cell correction, and the components and the tail run through the
+        // SHARED correlation metric above -- so the |R| log-det factors
+        // cancel EXACTLY between the hypotheses (both sides keep only
+        // their diagonal log-dets).
         float3 nullScale = max((gateVarBase + transportTerm) * (chromaScale * chromaScale), float3(minGateVar, minGateVar, minGateVar));
         float3 vCompRaw = recordLive
             ? parts.varHPer + max(parts.sPer, float3(1e-8, 1e-8, 1e-8)) + transportTerm
@@ -997,71 +1258,77 @@ ClipGateResult ClipHistoryToStatisticGate(
         float kT = 0.5 * (nu + 3.0);
 
         float3 invComp = float3(1.0, 1.0, 1.0) / vComp;
+        float3 invSqrtComp = 1.0 / sqrt(vComp);
 
-        float q0Comp;
-        float logDetNull2;
-        {
-            float nX = nullScale.x, nY = nullScale.y, nZ = nullScale.z;
-            float nsXY = rXY * sqrt(nX * nY);
-            float nsXZ = rXZ * sqrt(nX * nZ);
-            float nsYZ = rYZ * sqrt(nY * nZ);
-            float nc0 = nY * nZ - nsYZ * nsYZ;
-            float nc1 = nsYZ * nsXZ - nsXY * nZ;
-            float nc2 = nsXY * nsYZ - nY * nsXZ;
-            float ndet = nX * nc0 + nsXY * nc1 + nsXZ * nc2;
-            if (ndet > 1e-12)
-            {
-                float nInvDet = 1.0 / ndet;
-                float ni00 = nc0 * nInvDet;
-                float ni01 = nc1 * nInvDet;
-                float ni02 = nc2 * nInvDet;
-                float ni11 = (nX * nZ - nsXZ * nsXZ) * nInvDet;
-                float ni12 = (nsXZ * nsXY - nX * nsYZ) * nInvDet;
-                float ni22 = (nX * nY - nsXY * nsXY) * nInvDet;
-                q0Comp = ni00 * dCorr.x * dCorr.x + ni11 * dCorr.y * dCorr.y + ni22 * dCorr.z * dCorr.z
-                       + 2.0 * (ni01 * dCorr.x * dCorr.y + ni02 * dCorr.x * dCorr.z + ni12 * dCorr.y * dCorr.z);
-                logDetNull2 = log2(ndet);
-            }
-            else
-            {
-                q0Comp = dot(dCorr * dCorr, float3(1.0, 1.0, 1.0) / nullScale);
-                logDetNull2 = log2(nullScale.x) + log2(nullScale.y) + log2(nullScale.z);
-            }
-        }
+        // ---- the null: q0 through the shared R^-1; the DIAGONAL log-det --
+        // (v5.6.3) |Sigma_0| = |nullScale| * |R| and every component's
+        // |Sigma_j| = |vComp| * |R|: the |R| factors cancel in the LLR, so
+        // BOTH sides keep only their diagonal log-dets. The old null
+        // log-det carried the |R| alone -- a spurious -0.5*log2|R| in the
+        // odds (x0.5-0.7 at typical correlations) biasing the soft clip
+        // cold on correlated content.
+        float logDetNull2 = log2(nullScale.x) + log2(nullScale.y) + log2(nullScale.z);
+        float q0Comp = rFull
+            ? QuadFormUnitR(dCorr / sqrt(nullScale), rC00, rC01, rC02, rC11, rC12, rC22)
+            : dot(dCorr * dCorr, float3(1.0, 1.0, 1.0) / nullScale);
 
         // ---- the miss model ----
         float sx = max(missSigmaPx.x, kMinMissSigma);
         float sy = max(missSigmaPx.y, kMinMissSigma);
-        float sEffSq = 0.5 * (sx * sx + sy * sy);
+        // (v5.6.4) sEffSq is gone: both radial-tail consumers now take the
+        // anisotropic scales directly (Log2RadialTail2).
         // ln-exponents, base-2-scaled: the log2(e) factor folded in so the
         // Gaussian log-density terms below are straight log2.
         float inv2Sx2 = (0.5 * kLog2E) / (sx * sx);
         float inv2Sy2 = (0.5 * kLog2E) / (sy * sy);
         float logNormC2 = -log2(6.2831853 * sx * sy);
 
-        // The prior odds: P(|miss| > r0) / P(|miss| <= r0), the Rayleigh
-        // tail. Collapses on clean content (the soft clip switches itself
-        // off); runs hot on large measured scatter (the history really is
+        // The prior odds: P(|miss| > r0) / P(|miss| <= r0), the radial
+        // tail at the ANISOTROPIC scales (v5.6.4: Log2RadialTail2 -- the
+        // old Rayleigh-at-sEffSq form was exact only at sx = sy and
+        // UNDERstated the tail on directional misses; a one-axis scatter
+        // is a chi^2_1-type tail, half the exponential's rate). Collapses
+        // on clean content (the soft clip switches itself off); runs hot
+        // on large measured scatter (the history really is
         // miss-contaminated). The dial is kMissRadiusOdds, never a cap.
-        float pH1 = exp2(-(0.5 * kLog2E) * kMissRadiusOdds * kMissRadiusOdds / sEffSq);
-        float logPriorOdds2 = log2(max(pH1, 1e-30)) - log2(max(1.0 - pH1, 1e-6));
+        // (Also kills the old exp2 -> log2 round trip: the helper already
+        // returns log2.)
+        float logPH1_2 = Log2RadialTail2(kMissRadiusOdds * kMissRadiusOdds, sx, sy);
+        float logPriorOdds2 = max(logPH1_2, -100.0)
+                            - log2(max(1.0 - exp2(logPH1_2), 1e-6));
 
-        // The component masses: P(miss in texel j) = the Gaussian density
-        // at offset j (texel area 1 -- the density-times-area form is
-        // within ~4% of the exact integral for all sigma); the tail:
-        // P(|miss| > r1) + the optional change-class floor. logSumM
-        // renormalizes the 9 into the conditional distribution GIVEN a
-        // ghost.
+        // The component masses (v5.6.3: two-term Euler-Maclaurin): the
+        // mass of texel j is, per axis, the exact Phi-difference's midpoint
+        // expansion
+        //     P = 2*delta*phi(z) * (1 + delta^2*(z^2-1)/6 + O(delta^4)),
+        // delta = 0.5/sigma -- the first term IS the density-times-area
+        // form the old code used (~4% low at sigma ~ 0.7 texel, worse
+        // below); the correction takes it under ~0.5% for sigma >= 0.5.
+        // logSumM renormalizes the 9 into the conditional distribution
+        // GIVEN a ghost.
         float lMass2[8];
         float lMassTail2;
         float logSumM2;
         {
+            float invSx2 = 1.0 / (sx * sx);
+            float invSy2 = 1.0 / (sy * sy);
+            float hx2 = 0.25 * invSx2;   // (0.5/sigma_x)^2
+            float hy2 = 0.25 * invSy2;
             float lmMax = -1e30;
             [unroll]
             for (int j = 1; j < 9; ++j)
             {
                 float2 o = kOffsets3x3[j];
-                lMass2[j - 1] = logNormC2 - (o.x * o.x) * inv2Sx2 - (o.y * o.y) * inv2Sy2;
+                float zx2 = (o.x * o.x) * invSx2;
+                float zy2 = (o.y * o.y) * invSy2;
+                // Clamped: below sigma ~ 0.29 the expansion's zero-z factor
+                // would go negative -- a regime where the prior odds have
+                // already collapsed, so the clamp only keeps the log
+                // finite.
+                float corrX = max(1.0 + hx2 * (zx2 - 1.0) * (1.0 / 6.0), kMinMassCorr);
+                float corrY = max(1.0 + hy2 * (zy2 - 1.0) * (1.0 / 6.0), kMinMassCorr);
+                lMass2[j - 1] = logNormC2 - (o.x * o.x) * inv2Sx2 - (o.y * o.y) * inv2Sy2
+                              + log2(corrX) + log2(corrY);
                 lmMax = max(lmMax, lMass2[j - 1]);
             }
             // kTailChangeFloor = 0: log(exp(x)) is x. fxc does not fold the
@@ -1069,8 +1336,8 @@ ClipGateResult ClipHistoryToStatisticGate(
             // floor is a compile-time constant, so the branch collapses and
             // the default build pays neither the exp2 nor the log2.
             lMassTail2 = (kTailChangeFloor > 0.0)
-                ? log2(exp2(-(0.5 * kLog2E) * kMissRadiusTail * kMissRadiusTail / sEffSq) + kTailChangeFloor)
-                : -(0.5 * kLog2E) * kMissRadiusTail * kMissRadiusTail / sEffSq;
+                ? log2(exp2(Log2RadialTail2(kMissRadiusTail * kMissRadiusTail, sx, sy)) + kTailChangeFloor)
+                : Log2RadialTail2(kMissRadiusTail * kMissRadiusTail, sx, sy);
             lmMax = max(lmMax, lMassTail2);
             float mSum = 0.0;
             [unroll]
@@ -1082,7 +1349,8 @@ ClipGateResult ClipHistoryToStatisticGate(
 
         // The component log-dets are j-invariant: hoisted out of the
         // unrolled mixture loop (the compiler may CSE them; the hoist
-        // guarantees it on every backend).
+        // guarantees it on every backend). Diagonal only -- the |R| factor
+        // cancels against the null's (see above).
         float logDetCompHalf2 = 0.5 * (log2(vComp.x) + log2(vComp.y) + log2(vComp.z));
 
         float lComp2[8];
@@ -1097,7 +1365,14 @@ ClipGateResult ClipHistoryToStatisticGate(
             // two float3 adds per component and one rounding, exact in real
             // arithmetic (compilers cannot reassociate float +/- to find it).
             float3 dd = historyColorSpace - neighborhoodTaps[j] + stats.phaseShift;
-            float  qj = dot(dd * dd, invComp);
+            // (v5.6.3) q_j through the SHARED R^-1 (standardized): the
+            // components' channel coupling is the content's, same as the
+            // null's -- the old diagonal-only form mis-shaped q_j along
+            // the coupled direction and, with the log-det asymmetry above,
+            // under-engaged the soft clip ~1.4-2.2x on correlated content.
+            float  qj = rFull
+                ? QuadFormUnitR(dd * invSqrtComp, rC00, rC01, rC02, rC11, rC12, rC22)
+                : dot(dd * dd, invComp);
             lComp2[j - 1] = lMass2[j - 1]
                          - kT * log2(1.0 + qj / nu)
                          - logDetCompHalf2;
@@ -1107,8 +1382,9 @@ ClipGateResult ClipHistoryToStatisticGate(
         // The temporal tail: the old content absent from the 9-tap sample.
         float3 sigAC = stats.sigmaClean;
         float3 tailScale = nullScale + (kGhostPriorSigma * kGhostPriorSigma) * (sigAC * sigAC);
-        float3 invTail = float3(1.0, 1.0, 1.0) / tailScale;
-        float qTail = dot(dCorr * dCorr, invTail);
+        float qTail = rFull
+            ? QuadFormUnitR(dCorr / sqrt(tailScale), rC00, rC01, rC02, rC11, rC12, rC22)
+            : dot(dCorr * dCorr, float3(1.0, 1.0, 1.0) / tailScale);
 
         float logDetTailHalf2 = 0.5 * (log2(tailScale.x) + log2(tailScale.y) + log2(tailScale.z));
         float lTail2 = lMassTail2
@@ -1137,6 +1413,13 @@ ClipGateResult ClipHistoryToStatisticGate(
         // The scalar pull -- the posterior-mean action, floored by the
         // hard ray clamp. The pull IS the eviction mechanism for the miss
         // class; the change class is the hard clamp's (v5.5).
+        // (v5.6.3 audit note) The pull target is `center`, NOT the matched
+        // neighbor, and that is exact Bayes: under H0 the optimal store
+        // keeps the history; under H1 this texel's store should be the
+        // CURRENT-frame posterior -- which IS `center` (the phase-corrected
+        // plane evaluation). Pulling toward the matched neighbor component
+        // would store NEIGHBOR CONTENT at this texel and perpetuate the
+        // miss. Do not "fix" this into a directional pull.
         float wPull = saturate(p1);
         wPull = max(wPull, 1.0 - tHard);
 

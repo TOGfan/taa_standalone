@@ -309,12 +309,20 @@ end
 -- chi^2 dof. The variance inflation restoring the NOMINAL chi^2-coverage is
 --     S(nu) = 3 * F^-1_{3,nu}(p) / chi^2,   p = CDF_chi2_3(chi^2),
 -- a function of the slider: S(4) is 1.18 at chi = 1.5 and 2.52 at 2.8 --
--- a fixed constant cannot serve both. The host fits
---     S(nu) = 1 + A/nu + B/nu^2 + C/nu^3
--- exactly at THREE anchors: the Satterthwaite clamp floor (nu = 2 -- the
--- old two-term form's weak zone, where it under-inflated: tight-side,
--- flicker-side only), the young record (nu0) and the converged record
--- (nu_inf). The rational form extrapolates benignly above nu_inf.
+-- a fixed constant cannot serve both. The host fits (v5.6.3) a PADE (2,1)
+-- RATIONAL in x = 1/nu,
+--     S(nu) = (1 + A*x + B*x^2) / (1 + C*x),
+-- by weighted least squares over a dense anchor set -- the relation is
+-- LINEAR in (A, B, C) after multiplying through (A*x + B*x^2 - S*C*x =
+-- S - 1), so the fit is a closed 3x3 normal-equations solve. The anchor
+-- weights concentrate on the operative points (the Satterthwaite clamp
+-- floor nu = 2, the young record nu0, the converged nu_inf) and densify
+-- the steep low-nu end, where S rises ~3x between nu = 4 and nu = 2: the
+-- old 3-anchor cubic in 1/nu was exact at its anchors but wobbled a few
+-- percent between them there. The rational extrapolates benignly above
+-- nu_inf (S -> 1 + (A-C)/nu). Eight quantiles per fit (~2.7x the cubic's
+-- three; still one cached fit per distinct chi -- a coverage-slider drag
+-- stays interactive).
 --
 -- v5.2 (dof corrected): the record ingests the pixel's own squared
 -- innovation -- a single squared Gaussian, chi^2_1 -- so the honest ingest
@@ -335,7 +343,9 @@ end
 -- modeling).
 --
 -- MUST MATCH taaClip.h.hlsl: kClipSigmaEmaRate (rho), kClipStudentPriorDof
--- (nu0) and kRecordIngestDof (the ingest dof, 1.0).
+-- (nu0), kRecordIngestDof (the ingest dof, 1.0) and the Student
+-- CONSUMPTION FORM (the Pade (2,1) rational in 1/nu: A, B the numerator's
+-- x / x^2 coefficients, C the denominator's x coefficient).
 -- ============================================================================
 local STUDENT_RHO   = 0.15                              -- kClipSigmaEmaRate
 local STUDENT_NU0   = 4.0                               -- kClipStudentPriorDof
@@ -409,29 +419,81 @@ local function studentFitABC(chi)
     local c2 = chi * chi
     local p = math.min(math.max(chiSq3Cdf(c2), 1e-6), 1.0 - 1e-6)
 
-    -- Three exact anchors: nu = 2 (the Satterthwaite clamp floor -- closes
-    -- the old two-term form's under-inflating weak zone), nu0, nu_inf.
-    local s2 = 3.0 * f3nuQuantile(p, 2.0) / c2
-    local s0 = 3.0 * f3nuQuantile(p, STUDENT_NU0) / c2
-    local s1 = 3.0 * f3nuQuantile(p, STUDENT_NUINF) / c2
+    -- (v5.6.3) Pade (2,1) rational in x = 1/nu, weighted least squares
+    -- over a dense anchor set: S(x) = (1 + A*x + B*x^2) / (1 + C*x). The
+    -- relation is LINEAR in (A, B, C) after multiplying through --
+    -- A*x + B*x^2 - S*C*x = S - 1 -- so the fit is a closed 3x3 normal-
+    -- equations solve. Anchor weights concentrate on the operative
+    -- points (the Satterthwaite clamp floor nu = 2, the young record
+    -- nu0, the converged nu_inf) and densify the steep low-nu end (S
+    -- rises ~3x between nu = 4 and nu = 2): the old 3-anchor cubic was
+    -- exact at its anchors but wobbled a few percent between them there.
+    -- Eight quantiles per fit (~2.7x the cubic's three; still one cached
+    -- fit per distinct chi -- a coverage-slider drag stays interactive).
+    local anchors = {
+        { 2.0,           8.0 },   -- the Satterthwaite clamp floor (pile-up)
+        { 2.5,           2.0 },
+        { 3.25,          2.0 },
+        { STUDENT_NU0,   5.0 },   -- the young record (age 0)
+        { 5.5,           1.0 },
+        { 8.0,           1.0 },
+        { STUDENT_NUINF, 5.0 },   -- the converged record
+        { 18.0,          1.0 },
+    }
 
-    -- Solve 1 + A/nu + B/nu^2 + C/nu^3 = S at all three anchors
-    -- (Vandermonde in x = 1/nu; tiny Gaussian elimination, cached per chi).
-    local x = { 0.5, 1.0 / STUDENT_NU0, 1.0 / STUDENT_NUINF }
-    local r = { s2 - 1.0, s0 - 1.0, s1 - 1.0 }
-    local m = {}
-    for i = 1, 3 do
-        m[i] = { x[i], x[i] * x[i], x[i] * x[i] * x[i], r[i] }
+    local sVals = {}
+    local n = { { 0.0, 0.0, 0.0, 0.0 }, { 0.0, 0.0, 0.0, 0.0 }, { 0.0, 0.0, 0.0, 0.0 } }
+    for idx, an in ipairs(anchors) do
+        local nu, w = an[1], an[2]
+        local x = 1.0 / nu
+        local S = 3.0 * f3nuQuantile(p, nu) / c2
+        sVals[idx] = S
+        local c1, c2c, c3c = x, x * x, -S * x
+        local rhs = S - 1.0
+        n[1][1] = n[1][1] + w * c1 * c1; n[1][2] = n[1][2] + w * c1 * c2c; n[1][3] = n[1][3] + w * c1 * c3c
+        n[2][2] = n[2][2] + w * c2c * c2c; n[2][3] = n[2][3] + w * c2c * c3c
+        n[3][3] = n[3][3] + w * c3c * c3c
+        n[1][4] = n[1][4] + w * c1 * rhs
+        n[2][4] = n[2][4] + w * c2c * rhs
+        n[3][4] = n[3][4] + w * c3c * rhs
     end
+    n[2][1] = n[1][2]; n[3][1] = n[1][3]; n[3][2] = n[2][3]
+
     for col = 1, 3 do
         for row = col + 1, 3 do
-            local f = m[row][col] / m[col][col]
-            for k = col, 4 do m[row][k] = m[row][k] - f * m[col][k] end
+            local f = n[row][col] / n[col][col]
+            for k = col, 4 do n[row][k] = n[row][k] - f * n[col][k] end
         end
     end
-    local C = m[3][4] / m[3][3]
-    local B = (m[2][4] - m[2][3] * C) / m[2][2]
-    local A = (m[1][4] - m[1][3] * C - m[1][2] * B) / m[1][1]
+    local C = n[3][4] / n[3][3]
+    local B = (n[2][4] - n[2][3] * C) / n[2][2]
+    local A = (n[1][4] - n[1][3] * C - n[1][2] * B) / n[1][1]
+
+    -- Denominator safety: 1 + C*x must stay comfortably positive over
+    -- the shader's whole nu range (x = 1/nu in [0, 0.5]; nu >= 2
+    -- everywhere). A sane fit never approaches the pole; the clamp plus
+    -- the fixed-C 2x2 refit guard the pathological case only.
+    if C > 1.5 or C < -6.0 then
+        C = math.min(math.max(C, -6.0), 1.5)
+        local m11, m12, m22 = 0.0, 0.0, 0.0
+        local r1, r2 = 0.0, 0.0
+        for idx, an in ipairs(anchors) do
+            local w = an[2]
+            local x = 1.0 / an[1]
+            local S = sVals[idx]
+            local rhs = (S - 1.0) + S * C * x
+            m11 = m11 + w * x * x
+            m12 = m12 + w * x * x * x
+            m22 = m22 + w * x * x * x * x
+            r1 = r1 + w * x * rhs
+            r2 = r2 + w * x * x * rhs
+        end
+        local det = m11 * m22 - m12 * m12
+        if math.abs(det) > 1e-14 then
+            B = (m11 * r2 - m12 * r1) / det
+            A = (m22 * r1 - m12 * r2) / det
+        end
+    end
 
     if studentFitCacheCount >= 32 then
         studentFitCache = {}
@@ -902,8 +964,9 @@ function M.applySettings(inputs)
         pre:setShaderConst("$taaDepthParallaxStep",       0.0)
         -- The Studentization EXACTLY tracks the slider: the fit consumes
         -- the EFFECTIVE radius (chi * (1 + clipOvershoot)) -- the same
-        -- threshold the gate tests. Pin points: nu = 2 (the Satterthwaite
-        -- clamp floor), nu0 = 4 and nu_inf = 12.33 (STUDENT_NUINF above).
+        -- threshold the gate tests. The Pade (2,1) rational is fit over
+        -- nu in [2 (the Satterthwaite clamp floor), 18], with the anchor
+        -- weights concentrated at the operative points (2, nu0, nu_inf).
         local chiEff = (tonumber(s.varianceGamma) or 2.8)
                      * (1.0 + math.max(tonumber(s.clipOvershoot) or 0.0, 0.0))
         local studentA, studentB, studentC = studentFitABC(chiEff)
@@ -933,8 +996,8 @@ function M.applySettings(inputs)
             varhConstantsLogged = true
             if log then
                 log("I", "TAA", string.format(
-                    "VarH host constants: varhLoss=%.4f whiteLoss=%.4f armingA=%.4f armingB=%.4f studentA=%.4f studentB=%.4f studentC=%.4f (kernel: separable per-axis Kaiser, beta %.1f (6-tap) / %.1f (4-tap) by useKaiser6; VarH gains from the spectral fixed point -- MUST MATCH taaResample.h.hlsl; the arming and Student triples MUST MATCH taaClip.h.hlsl; ingest dof = 1.0, nu_inf = 12.33)",
-                    varhLoss, whiteLoss, ARMING_A, ARMING_B, studentA, studentB, studentC, KAISER6_BETA, KAISER4_BETA))
+                    "VarH host constants: varhLoss=%.4f whiteLoss=%.4f armingA=%.4f armingB=%.4f studentA=%.4f studentB=%.4f studentC=%.4f (kernel: separable per-axis Kaiser, beta %.1f (6-tap) / %.1f (4-tap) by useKaiser6; VarH gains from the spectral fixed point -- MUST MATCH taaResample.h.hlsl; the arming pair and the Student Pade triple MUST MATCH taaClip.h.hlsl's consumption (1 + A*x + B*x^2)/(1 + C*x), x = 1/nu; ingest dof = 1.0, nu_inf = %.2f)",
+                    varhLoss, whiteLoss, ARMING_A, ARMING_B, studentA, studentB, studentC, KAISER6_BETA, KAISER4_BETA, STUDENT_NUINF))
             end
         end
         pre:setShaderConst("$taaSoftClip",                s.softClip)

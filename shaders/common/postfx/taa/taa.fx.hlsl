@@ -40,6 +40,13 @@
 //   test's early-out-gated path exactly as before. The only behavioral
 //   change anywhere: the gate's fgThreshold under camera translation, now
 //   the exact value instead of the rotation-only one.
+//
+// v5.6.3 (clipper, hypothesis-side): the spike's record branch is whitened
+//   through the shrunk full metric; the winsor censors at the ingest's own
+//   Satterthwaite dof (WinsorCapNuStar); the shrunk correlations are
+//   computed ONCE and shared by the spike / winsor / corroboration / gate.
+//   The metric, cell-mass and Studentization changes live in taaClip.h.hlsl
+//   (see its v5.6.3 header). No depth/velocity/dilation behavior change.
 // ============================================================================
 
 #include "shaders/common/postFx/postFx.h.hlsl"
@@ -473,26 +480,32 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
     float3 innov   = currentColorSpace - historyColorSpace;
     float  innovSq = dot(innov, innov);
 
+    // ---- the shrunk channel correlations (ONE evaluation: the spike, the
+    //      winsor, the corroboration test and the statistic gate all
+    //      consume the same values -- v5.6.3) ----
+    float rXYg, rXZg, rYZg;
+    ShrunkenCorrelations(colorStats, rXYg, rXZg, rYZg);
+
     // ---- change-points ----
     // The spike: two branches, both explicit. The record branch is a
-    // priced chi^2_3 test at ~1e-6 per frame (the innovation is a
-    // 3-channel SUM: its null scale is (record + varH)/3 per chi^2 unit
-    // -- the /3 matters; composing the level as 4x * 16.27 was dead code,
-    // colder than the branch it was meant to dominate). The range branch
-    // is the distribution-free garbage backstop (16x the observed AABB
-    // range -- effectively never on the null by design: the H-free
-    // ingest absorbed the level-change job, geoCorroboration owns
-    // reveals, and the NaN guard is separate).
-    float spikeRefSq = max(kChiSq3_1e6 * (1.0 / 3.0) * max(sigmaPrevSq + varHPrevSq, kEpsilon),
-                           16.0 * colorStats.rangeSq)
-                     + dot(colorStats.transportVar, float3(1.0, 1.0, 1.0));
-    bool  spike = hadRecord && (innovSq > spikeRefSq);
+    // WHITENED chi^2_3 test at ~1e-6 per frame through the shrunk full
+    // metric (v5.6.3) -- the same channel law as the corroboration reset,
+    // with the transport scatter charged per-channel inside the metric.
+    // The old scalar-total form assumed exchangeable uncorrelated
+    // channels: on luminance-dominated YCoCg content the 3-channel sum's
+    // effective dof is ~1, and the priced ~1e-6 level ran at ~1e-3 there
+    // (records resetting ~1000x the priced rate). The range branch is the
+    // distribution-free garbage backstop (16x the observed AABB range --
+    // effectively never on the null by design: the H-free ingest absorbed
+    // the level-change job, geoCorroboration owns reveals, and the NaN
+    // guard is separate).
+    bool  spike = hadRecord
+        && (innovSq > 16.0 * colorStats.rangeSq
+            || WhitenedInnovSq(innov, partsLive, colorStats.transportVar, rXYg, rXZg, rYZg) > kChiSq3_1e6);
 
     bool geoCorroborated = false;
     if (hadRecord && disoccluded)
     {
-        float rXYg, rXZg, rYZg;
-        ShrunkenCorrelations(colorStats, rXYg, rXZg, rYZg);
         geoCorroborated = (WhitenedInnovSq(innov, partsLive, colorStats.transportVar, rXYg, rXZg, rYZg)
                            > kChiSq3_95);
     }
@@ -525,18 +538,22 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
     // Noise lives in dev = x0c - plane0 (H does not appear); change lives
     // in dCorr (it does not appear here). The de-bias is the exact
     // identity E[dev^2] = sPer + vPrior - 2*cPT. The winsor caps the
-    // chi^2_3-scaled ingest at 0.1%: the null bias is ~0.6% and a
-    // center-tap firefly's record impact is half the old 9x cap's. The
-    // circularity (record -> split -> tauB2 -> vPrior -> ingest -> record)
-    // has loop gain (1 - q) < 1: convergent, honest fixed point e = 0 on
-    // the R > s branch -- the exact residual dof is that statement's
-    // stability condition.
+    // ingest at its OWN Satterthwaite dof's 0.1% point (v5.6.3 --
+    // WinsorCapNuStar): the null bias is ~0.6% and a center-tap firefly's
+    // record impact is half the old 9x cap's. The circularity (record ->
+    // split -> tauB2 -> vPrior -> ingest -> record) has loop gain
+    // (1 - q) < 1: convergent, honest fixed point e = 0 on the R > s
+    // branch -- the exact residual dof is that statement's stability
+    // condition.
     float sigmaStatSq, ageNext;
     {
-        float winsorCap = (kChiSq3_999 / 3.0)
-                        * max(partsLive.spatialPriorSq, kClipSigmaRecordFloorSq);
         if (carryRecord)
         {
+            // (v5.6.3) The honest 0.1% censoring point of the 3-channel
+            // correlated sum -- the old chi^2_3/3 stand-in ran the point
+            // at ~2% on gray content and systematically under-ingested
+            // legitimate variance.
+            float winsorCap = WinsorCapNuStar(partsLive, colorStats, splitPrev, rXYg, rXZg, rYZg);
             float3 devIng    = (currentColorSpace - colorStats.phaseShift) - colorStats.plane0;
             float3 tauB2Ing  = max(splitPrev, 0.0) * colorStats.residSq;
             float3 vPriorIng = tauB2Ing + partsLive.sPer * colorStats.evalVar;
@@ -559,7 +576,8 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
         carryRecord, carryRecord ? agePrev : 0.0,
         splitPrev,
         missSigmaPx,
-        neighborhoodColorSpace);
+        neighborhoodColorSpace,
+        rXYg, rXZg, rYZg);
     float3 clippedHistorySpace = clipGate.clippedColorSpace;
 
     // ---- DEBUG PAYLOAD STASH ----------------------------------------------
