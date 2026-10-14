@@ -734,7 +734,7 @@ local kernelChainCacheCount = 0
 local function kernelChainConstants(beta, radius, a)
     local key = string.format("%.4f:%.2f:%.6f", beta, radius, a)
     local hit = kernelChainCache[key]
-    if hit then return hit[1], hit[2], hit[3] end
+    if hit then return hit[1], hit[2], hit[3], hit[4] end
 
     local lo = -(math.floor(radius) - 1)
     local hi = math.floor(radius)
@@ -818,11 +818,104 @@ local function kernelChainConstants(beta, radius, a)
     local readGain  = vr / math.max(vs, 1e-12)
     local noiseAcc  = vr
 
+    -- (v5.6.6 ITEM 3) THE ACCUMULATED-NOISE STRUCTURE: the soft clip's
+    -- accumulated components price Var(Kaiser-read of the stored field -
+    -- center texel) at the spectral fixed point. The 2D noise spectrum is
+    -- S2D = a^2/(1 - b*Kx2*Ky2); expanding the geometric series, its
+    -- autocovariance is R2D(x,y) = sum_k b^k * cx_k(x) * cx_k(y) with
+    -- cx_k = IDFT(Kbar^{2k}) (the a^2 is a common factor and cancels in
+    -- the normalized r2D). From r2D = R2D/R2D(0,0):
+    --   kappa = E_phase[ sum_nm c_nm r2D(n, m) ]       (read-vs-texel cov)
+    --   Dbar  = E_phase[ sum c c' r2D(n-n', m-m') ]    (read var/texel var)
+    -- both from the ACTUAL per-phase logical 2D coefficients (the 6-tap
+    -- tier's corner skip included), so Cauchy-Schwarz holds between them
+    -- and the factor (Dbar + 1 - 2*kappa)/Dbar is >= 0 by construction.
+    -- The shader consumes it as taaAccNoiseFactor (clamped [0.02, 4]).
+    -- Built-in consistency: R2D(0,0) = sum_k b^k m_k^2 = the moment
+    -- series' vsSum (different summation order -- a small float drift is
+    -- expected, a large one is a bug and warns).
+    local maxOff = hi - lo
+    local nOff = 2 * maxOff + 1
+    local skipCorners = (radius >= 3.0)   -- the 21-tap's four skipped corners
+    local r2d = {}
+    for xi = 1, nOff do
+        r2d[xi] = {}
+        for yi = 1, nOff do r2d[xi][yi] = 0.0 end
+    end
+    do
+        local cosTab = {}
+        for oi = 1, nOff do
+            local off = (oi - 1) - maxOff
+            local ct = {}
+            for j = 0, N - 1 do ct[j + 1] = math.cos(2.0 * math.pi * j * off / N) end
+            cosTab[oi] = ct
+        end
+        local pow2 = {}
+        for j = 1, N do pow2[j] = 1.0 end
+        local bPow2, k2 = 1.0, 0
+        while true do
+            local row = {}
+            for oi = 1, nOff do
+                local ct = cosTab[oi]
+                local s = 0.0
+                for j = 1, N do s = s + pow2[j] * ct[j] end
+                row[oi] = s / N
+            end
+            for xi = 1, nOff do
+                local rx = r2d[xi]
+                for yi = 1, nOff do
+                    rx[yi] = rx[yi] + bPow2 * row[xi] * row[yi]
+                end
+            end
+            local mRow = row[maxOff + 1]
+            for j = 1, N do pow2[j] = pow2[j] * kbar2[j] end
+            bPow2 = bPow2 * b
+            k2 = k2 + 1
+            if k2 > 384 or bPow2 * mRow * mRow < 1e-12 * math.max(r2d[maxOff + 1][maxOff + 1], 1e-12) then break end
+        end
+    end
+    if math.abs(r2d[maxOff + 1][maxOff + 1] - vsSum) > 1e-3 * math.max(vsSum, 1e-12) then
+        if log then
+            log("W", "TAA", string.format("accumNoise: r2d(0,0)=%.6e vs vsSum=%.6e (mismatch -- chain bug)",
+                r2d[maxOff + 1][maxOff + 1], vsSum))
+        end
+    end
+    local vsNorm = math.max(r2d[maxOff + 1][maxOff + 1], 1e-12)
+    local kapSum, dSum = 0.0, 0.0
+    for p = 1, nPhase do
+        local kp = ktab[p]
+        local kapP, dP = 0.0, 0.0
+        for n = lo, hi do
+            local cn = kp[n]
+            for m = lo, hi do
+                local cnm = cn * kp[m]
+                if skipCorners and (n == lo or n == hi) and (m == lo or m == hi) then
+                    cnm = 0.0
+                end
+                if cnm ~= 0.0 then
+                    kapP = kapP + cnm * r2d[n + maxOff + 1][m + maxOff + 1]
+                    for n2 = lo, hi do
+                        local dn = n - n2 + maxOff + 1
+                        local cn2 = kp[n2]
+                        for m2 = lo, hi do
+                            dP = dP + cnm * cn2 * kp[m2] * r2d[dn][m - m2 + maxOff + 1]
+                        end
+                    end
+                end
+            end
+        end
+        kapSum = kapSum + kapP
+        dSum = dSum + dP
+    end
+    local kappa = kapSum / nPhase / vsNorm
+    local dBar  = dSum / nPhase / vsNorm
+    local accFactor = (dBar + 1.0 - 2.0 * kappa) / math.max(dBar, 1e-6)
+
     if kernelChainCacheCount > 32 then
         kernelChainCache = {}
         kernelChainCacheCount = 0
     end
-    kernelChainCache[key] = { whiteGain, readGain, noiseAcc }
+    kernelChainCache[key] = { whiteGain, readGain, noiseAcc, accFactor }
     kernelChainCacheCount = kernelChainCacheCount + 1
     return whiteGain, readGain, noiseAcc
 end
@@ -845,8 +938,9 @@ local function varhHostConstants()
         a)
     local varhLoss  = math.min(math.max(1.0 - readGain, 0.0), 0.9)
     local whiteLoss = math.min(math.max(1.0 - whiteGain, 0.0), 0.95)
+    local accFactor = math.min(math.max(accFactorIn, 0.02), 4.0)
 
-    return varhLoss, whiteLoss
+    return varhLoss, whiteLoss, accFactor
 end
 
 local varhConstantsLogged = false
@@ -917,6 +1011,11 @@ M.defaultSettings = {
     useKaiser6                    = 1.0,
     historyOvershoot              = 1.0,
     clipOvershoot                 = 0.0,
+    -- (v5.6.7) the clip-excess blend reduction (see taaClip.h.hlsl):
+    -- start/width are in GATE RADII of excess past the boundary.
+    clipBlendDrop                 = 0.0,
+    clipBlendDropStart            = 0.5,
+    clipBlendDropWidth            = 1.0,
     motionBlendStart               = 1.0,
     fallbackFXAA                  = 1.0,
 }
@@ -989,15 +1088,19 @@ function M.applySettings(inputs)
         -- The VarH transport's two read gains (see varhHostConstants above):
         -- they track feedbackMax / useKaiser6, so every apply recomputes
         -- them.
-        local varhLoss, whiteLoss = varhHostConstants()
+        local varhLoss, whiteLoss, accFactor = varhHostConstants()
         pre:setShaderConst("$taaVarhResampleLoss",       varhLoss)
         pre:setShaderConst("$taaVarhWhiteLoss",          whiteLoss)
+        -- (v5.6.6 ITEM 3) the accumulated components' noise factor
+        -- (Dbar + 1 - 2*kappa)/Dbar from the spectral chain -- MUST MATCH
+        -- taaClip.h.hlsl's vComp consumption.
+        pre:setShaderConst("$taaAccNoiseFactor",         accFactor)
         if not varhConstantsLogged then
             varhConstantsLogged = true
             if log then
                 log("I", "TAA", string.format(
-                    "VarH host constants: varhLoss=%.4f whiteLoss=%.4f armingA=%.4f armingB=%.4f studentA=%.4f studentB=%.4f studentC=%.4f (kernel: separable per-axis Kaiser, beta %.1f (6-tap) / %.1f (4-tap) by useKaiser6; VarH gains from the spectral fixed point -- MUST MATCH taaResample.h.hlsl; the arming pair and the Student Pade triple MUST MATCH taaClip.h.hlsl's consumption (1 + A*x + B*x^2)/(1 + C*x), x = 1/nu; ingest dof = 1.0, nu_inf = %.2f)",
-                    varhLoss, whiteLoss, ARMING_A, ARMING_B, studentA, studentB, studentC, KAISER6_BETA, KAISER4_BETA, STUDENT_NUINF))
+                    "VarH host constants: varhLoss=%.4f whiteLoss=%.4f accNoiseFactor=%.4f armingA=%.4f armingB=%.4f studentA=%.4f studentB=%.4f studentC=%.4f (kernel: separable per-axis Kaiser, beta %.1f (6-tap) / %.1f (4-tap) by useKaiser6; VarH gains and the accumulated-noise factor from the spectral fixed point -- MUST MATCH taaResample.h.hlsl / taaClip.h.hlsl; the arming pair and the Student Pade triple MUST MATCH taaClip.h.hlsl's consumption (1 + A*x + B*x^2)/(1 + C*x), x = 1/nu; ingest dof = 1.0, nu_inf = %.2f)",
+                    varhLoss, whiteLoss, accFactor, ARMING_A, ARMING_B, studentA, studentB, studentC, KAISER6_BETA, KAISER4_BETA, STUDENT_NUINF))
             end
         end
         pre:setShaderConst("$taaSoftClip",                s.softClip)
@@ -1019,6 +1122,9 @@ function M.applySettings(inputs)
         pre:setShaderConst("$taaUseKaiser6",              s.useKaiser6)
         pre:setShaderConst("$taaHistoryOvershoot",        s.historyOvershoot)
         pre:setShaderConst("$taaClipOvershoot",           s.clipOvershoot)
+        pre:setShaderConst("$taaClipBlendDrop",           s.clipBlendDrop)
+        pre:setShaderConst("$taaClipBlendDropStart",      s.clipBlendDropStart)
+        pre:setShaderConst("$taaClipBlendDropWidth",      s.clipBlendDropWidth)
         pre:setShaderConst("$taaMotionBlendStart",        s.motionBlendStart)
         pre:setShaderConst("$taaFallbackFXAA",            s.fallbackFXAA)
         -- Debug modes no longer rebind the history source: the resolve's RGB

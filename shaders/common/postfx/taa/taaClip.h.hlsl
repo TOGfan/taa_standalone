@@ -114,6 +114,53 @@
 //       half the exponential's rate). Both degenerate to the old forms
 //       exactly on their old validity sets.
 //
+// v5.6.6 (the accumulated H1, the record-scale winsor):
+//         * ITEM 3 -- THE ACCUMULATED COMPONENTS: the soft clip's 8
+//           neighbor components are the HISTORY texels at the landing's
+//           neighbors (fetched by taa.fx, passed as accumulatedNeighbors),
+//           not current-frame taps. The ghost, if it exists, holds
+//           ACCUMULATED content; the old proxies carried ~50x the honest
+//           reference's noise. The component variance is the accumulated
+//           read-vs-texel structure, Var = Vr + Vs - 2*Cov, priced from
+//           the transported varH (Vr, READ semantics) and the host's new
+//           taaAccNoiseFactor (the spectral chain's D and kappa), plus
+//           the within-cell gradient term (gx^2+gy^2)/12. NO sPer (the
+//           accumulated proxy carries no current-frame noise) and NO
+//           transport term (the miss distribution -- the masses --
+//           already charges the landing scatter). The cold path keeps
+//           the old form (no record -> no varH to price the structure).
+//           The v5.6 header's H1 description is finally what the code
+//           does.
+//         * 4(e) EXACTNESS: the winsor anchors at RECORD scale WITH the
+//           mean shift -- cap = Sum sPer + Q_0.999 - kap1 (the ingest's
+//           null is a SHIFTED sum of squares; no previous form priced
+//           either the record's own quantile or the shift). Censoring is
+//           now the priced 0.1% at every record/content ratio. The ARMING
+//           cap keeps its content anchor BY DESIGN (the stale-high guard;
+//           a record-anchored bound is vacuous).
+//         * FIELD RE-BASELINE: the components are far tighter than the
+//           old proxies; engagement shifts up on smooth content at hot
+//           scatter. The dial is kMissRadiusOdds, never the code.
+//
+// v5.6.7 (the clip-excess blend reduction, re-added): a host-toggled
+//       feedback modifier keyed on the gate's REALIZED statistic:
+//       excess = sqrt(mdd)/chi, in gate radii (1.0 = on the boundary).
+//       Past a start margin the history blend falls LINEARLY to zero
+//       over a width, both in radii: historyFeedback *= 1 - drop. Pure
+//       blend-side action -- the clamp / soft clip repair the STORED
+//       value, this decides how much of it survives; the record, the
+//       split and the state transports are untouched by policy (the
+//       VarH recursion DOES see the raised blend weight and correctly
+//       restarts the accumulator on dropped pixels -- its own
+//       semantics, not a special case). Null behavior at the defaults
+//       (start 0.5, width 1.0, 95% coverage): ~0.3% of null pixels
+//       touch the bottom of the ramp past 1.5 radii (negligible drop
+//       there), >50% drop needs 2.0 radii (~2e-5), full drop 2.5 radii
+//       (~2e-8) -- while true reveals sit at 3-10+ radii. The feature
+//       was removed in the pre-v5.6 era when the statistic was not
+//       calibrated enough to key a blend weight on; the mode-13 null
+//       audit is its license to exist.
+//
 // THE GATE: the history's accumulation target is the phase-swept CENTER
 // TEXEL; the gate tests the history against the posterior of that target
 // given the current frame. PRIOR: plane0, variance tauB2 + sPer*evalVar.
@@ -141,7 +188,8 @@
 // taaChromaVarianceMod, taaSoftClip, taaStudentA/B/C, taaArmingA/B,
 // taaJitterPhaseEx/Ey/Exy, taaJitterAwareVariance, taaLumaVariance,
 // taaVelocityAlignedVariance, taaHistoryOvershoot, the feedback
-// constants). Requires taaShared.h.hlsl, taaConstants.h.hlsl included
+// constants, taaAccNoiseFactor, taaClipBlendDrop/Start/Width). Requires
+// taaShared.h.hlsl, taaConstants.h.hlsl included
 // before.
 // ============================================================================
 #ifndef TAA_CLIP_H_HLSL
@@ -980,7 +1028,10 @@ float WhitenedInnovSq(float3 innov, RecordVarianceParts p, float3 transportVar,
 // identity the ingest de-biases with, replicated here bit-for-bit from
 // the gate's qTapDen), so the censoring point is the honest 0.1%
 // quantile of the actual null:
-//     cap = Q_0.999(null) / kap1 * spatialPriorSq
+//     cap = Sum sPer + Q_0.999(null) - kap1
+// (v5.6.6: RECORD scale with the mean shift -- see the return-site note;
+// the v5.6.3/4 forms anchored at content scale and priced neither the
+// record's own quantile nor the shift.)
 // with Q via the PEARSON-III match (v5.6.4: the 3-cumulant SHIFTED gamma;
 // the v5.6.3 nuStar form was its 2-cumulant special case -- exact when the
 // channel sum is chi^2-shaped, ~2-6% low otherwise, and a low cap
@@ -1032,7 +1083,21 @@ float WinsorCapNuStar(
     // Wilson-Hilferty at z_0.999 = 3.090232306167813
     float wh = 1.0 - 1.0 / (9.0 * alphaW) + 3.090232306167813 * sqrt(1.0 / (9.0 * alphaW));
     float chiQ = delta + gammaMean * wh * wh * wh;
-    return (chiQ / max(kap1, 1e-20)) * max(parts.spatialPriorSq, kClipSigmaRecordFloorSq);
+    // (v5.6.6, 4e-exactness) RECORD-SCALE anchoring WITH the mean shift:
+    // the ingest's null is the SHIFTED sum sIngest = Sum[dev^2] - (kap1 -
+    // Sum sPer) -- E[sIngest] = Sum sPer exactly (the de-bias identity) --
+    // so its honest 0.1% point is the sum-of-squares quantile minus the
+    // shift: cap = Sum sPer + chiQ - kap1. The old content-scale anchor
+    // priced neither this record's own quantile nor the shift; the flip
+    // makes the censoring rate the priced 0.1% at EVERY record/content
+    // ratio. Documented cost: a sagged record under rising content now
+    // recovers through the EMA at ~10-20x per frame (the quantile
+    // excess) instead of one jump to content scale -- ~2-3 frames in the
+    // extreme, still bounded above by the ARMING cap (which keeps its
+    // content anchor: it is the stale-high GUARD, and a record-anchored
+    // bound is vacuous -- cap = f(record) always passes).
+    float muIng = parts.sPer.x + parts.sPer.y + parts.sPer.z;
+    return max(muIng + chiQ - kap1, kClipSigmaRecordFloorSq);
 }
 
 // ============================================================================
@@ -1056,7 +1121,7 @@ ClipGateResult ClipHistoryToStatisticGate(
     float  recordAge,
     float  splitFrac,
     float2 missSigmaPx,
-    float3 neighborhoodTaps[9],
+    float3 accumulatedNeighbors[8],
     float  rXY, float rXZ, float rYZ)   // (v5.6.3) the caller's shrunk
                                         // correlations -- ONE evaluation
                                         // shared by every consumer
@@ -1249,8 +1314,25 @@ ClipGateResult ClipHistoryToStatisticGate(
         // cancel EXACTLY between the hypotheses (both sides keep only
         // their diagonal log-dets).
         float3 nullScale = max((gateVarBase + transportTerm) * (chromaScale * chromaScale), float3(minGateVar, minGateVar, minGateVar));
+        // (v5.6.6 ITEM 3) The components' variance: the accumulated read
+        // vs the accumulated texel -- Var = Vr + Vs - 2*Cov, all from the
+        // transported varH (Vr, READ semantics) and the host's spectral
+        // chain constants folded into taaAccNoiseFactor = (D + 1 -
+        // 2*kappa)/D (D = Vr/Vs, kappa = the read-vs-center-texel
+        // covariance in units of Vs; Cauchy-Schwarz on the shared field
+        // keeps the factor >= 0, the clamp is numerical). PLUS the
+        // within-cell gradient term: given the miss landed in texel j,
+        // the read center sits up to half a texel from the texel center,
+        // so E[(g.(delta - o_j))^2] = (gx^2 + gy^2)/12 per channel (the
+        // uniform cell's variance) -- at edges this is the width that
+        // keeps the flip honest. NO sPer (removing the ~50x proxy noise
+        // is the point) and NO transport term (the masses charge the
+        // miss; adding it here would double-count). The cold path keeps
+        // the old form: with no record there is no varH to price the
+        // structure, and the seed's gateVarBase is the honest stand-in.
+        float3 cellGrad = (stats.gradLSx * stats.gradLSx + stats.gradLSy * stats.gradLSy) * (1.0 / 12.0);
         float3 vCompRaw = recordLive
-            ? parts.varHPer + max(parts.sPer, float3(1e-8, 1e-8, 1e-8)) + transportTerm
+            ? max(parts.varHPer, float3(1e-10, 1e-10, 1e-10)) * max(taaAccNoiseFactor, 0.02) + cellGrad
             : (gateVarBase + transportTerm);
         float3 vComp = max(vCompRaw * (chromaScale * chromaScale), float3(minGateVar, minGateVar, minGateVar));
 
@@ -1358,13 +1440,14 @@ ClipGateResult ClipHistoryToStatisticGate(
         [unroll]
         for (int j = 1; j < 9; ++j)
         {
-            // The phase-corrected component residual (the neighbor texel's
-            // footprint-average estimate is tap_j + g*j). dCorr + center is
-            // historyColorSpace exactly (dCorr was defined as history minus
-            // center), so the center terms CANCEL; the simplified form saves
-            // two float3 adds per component and one rounding, exact in real
-            // arithmetic (compilers cannot reassociate float +/- to find it).
-            float3 dd = historyColorSpace - neighborhoodTaps[j] + stats.phaseShift;
+            // (v5.6.6 ITEM 3) The component is the ACCUMULATED history at
+            // the landing's neighbor texel -- what a landing-miss ghost
+            // actually holds. Both sides are stable-space accumulated
+            // values: NO frame-to-stable phase correction (the old
+            // current-frame proxy needed tap_j + g*jitter to estimate the
+            // stable content; the accumulated texel IS the stable
+            // content), and no current-frame noise in vComp (see above).
+            float3 dd = historyColorSpace - accumulatedNeighbors[j - 1];
             // (v5.6.3) q_j through the SHARED R^-1 (standardized): the
             // components' channel coupling is the content's, same as the
             // null's -- the old diagonal-only form mis-shaped q_j along
@@ -1432,6 +1515,31 @@ ClipGateResult ClipHistoryToStatisticGate(
         r.tGate = tHard;
     }
     return r;
+}
+
+// ============================================================================
+// (v5.6.7) THE CLIP-EXCESS BLEND REDUCTION
+// ----------------------------------------------------------------------------
+// How far the history landed OUTSIDE the gate, in gate radii:
+//     excess = sqrt(mdd) / chi    (1.0 = exactly on the boundary)
+// -- the same realized statistic debug mode 13 displays (mdd/16 gray).
+// The drop is LINEAR in excess from (1 + taaClipBlendDropStart) over
+// taaClipBlendDropWidth, saturating at 1; the caller multiplies the
+// history feedback by (1 - drop). The t-IRLS/F5 robustification keeps
+// current-frame fireflies from tripping it (a firefly pulls the gate's
+// CENTER, not the history's residual). Null-safety at any coverage is
+// the START slider's job: the coverage band itself (5% at 95%) sits
+// between 1.0 and ~1.2 radii -- the margin must clear it.
+// MUST MATCH the gate's own chi (and taa.fx's chiDbg): the effective
+// radius taaVarianceGamma * (1 + taaClipOvershoot).
+// ============================================================================
+float ComputeClipExcessBlendDrop(ClipGateResult gate)
+{
+    if (taaClipBlendDrop < 0.5) return 0.0;
+    float chi = max(taaVarianceGamma, kEpsilon) * (1.0 + max(taaClipOvershoot, 0.0));
+    float excess = (gate.mdd > 1e-20) ? (sqrt(gate.mdd) / chi) : 0.0;
+    return saturate((excess - (1.0 + max(taaClipBlendDropStart, 0.0)))
+                    / max(taaClipBlendDropWidth, 1e-3));
 }
 
 // ============================================================================

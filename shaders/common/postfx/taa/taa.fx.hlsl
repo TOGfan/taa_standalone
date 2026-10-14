@@ -97,6 +97,9 @@ cbuffer perDraw
     float  taaJitterPhaseEx;                float  taaJitterPhaseEy;
     float  taaJitterPhaseExy;
     float  taaVarhResampleLoss;             float  taaVarhWhiteLoss;
+    float  taaAccNoiseFactor;
+    float  taaClipBlendDrop;                float  taaClipBlendDropStart;
+    float  taaClipBlendDropWidth;
 
     float2 oneOverTargetSize;
     POSTFX_UNIFORMS
@@ -123,6 +126,82 @@ void FetchFxaaCorners(float2 tapUVs[9], out float3 cornersRGB[4])
     [unroll]
     for (int c = 0; c < 4; ++c)
         cornersRGB[c] = max(tex2Dlod(sceneTex, float4(tapUVs[c + 5], 0.0, 0.0)).rgb, 0.0);
+}
+
+// ============================================================================
+// (v5.6.6) THE CLIP STATE, DECODE-THEN-BLENDED
+// ----------------------------------------------------------------------------
+// The state must describe the content the Kaiser read actually blended --
+// a ~9-21 texel footprint -- not one coin-flipped texel. Four point-sampled
+// fetches (the bilinear quad around the landing), each DECODED, then:
+//   * the CONTINUOUS fields (sigma^2, varH -- linear space; varH's ratio
+//     code decodes against ITS OWN texel's sigma first) blend with the
+//     bilinear weights, renormalized over the valid texels;
+//   * the DISCRETE transports (age: 4 bits, split: 6 bits -- blends of
+//     packed fields are meaningless) come from the maximum-weight VALID
+//     texel -- which is exactly the nearest, i.e. exactly the old snapped
+//     read's choice;
+//   * no valid texel -> COLD, as before.
+// The raw bits are never interpolated and nothing is re-encoded. At an
+// exact texel-center landing (the static identity) the weights degenerate
+// to (1,0,0,0) and the read is BIT-IDENTICAL to the old snapped form --
+// the blend engages only with sub-texel phase, never with motion state.
+// Known approximation (accepted): a linear blend of varH still understates
+// the blended accumulator's read variance (neighboring accumulators are
+// correlated through the resample chain -- the same structure
+// taaAccNoiseFactor prices); far closer than a snap.
+// ============================================================================
+void SampleHistoryClipState(float2 historyUV, ViewportParams vp,
+                            out float sigmaSq, out float varHSq,
+                            out float recordAge, out float splitFrac)
+{
+    sigmaSq = -1.0;
+    varHSq = 0.0;
+    recordAge = 0.0;
+    splitFrac = 0.0;
+
+    float2 pixelPos  = historyUV * vp.sizePixels;
+    float2 baseTexel = floor(pixelPos - 0.5) + 0.5;   // the bilinear quad's base
+    float2 f         = pixelPos - baseTexel;           // [0,1)^2
+
+    float2 tc0  = clamp(baseTexel * vp.texelSize, vp.minUV, vp.maxUV);
+    float2 tcX  = clamp((baseTexel + float2(1.0, 0.0)) * vp.texelSize, vp.minUV, vp.maxUV);
+    float2 tcY  = clamp((baseTexel + float2(0.0, 1.0)) * vp.texelSize, vp.minUV, vp.maxUV);
+    float2 tcXY = clamp((baseTexel + float2(1.0, 1.0)) * vp.texelSize, vp.minUV, vp.maxUV);
+
+    float a0  = tex2Dlod(historyStateTex, float4(tc0,  0.0, 0.0)).a;
+    float aX  = tex2Dlod(historyStateTex, float4(tcX,  0.0, 0.0)).a;
+    float aY  = tex2Dlod(historyStateTex, float4(tcY,  0.0, 0.0)).a;
+    float aXY = tex2Dlod(historyStateTex, float4(tcXY, 0.0, 0.0)).a;
+
+    float s0, v0, ag0, sp0;
+    float sX, vX, agX, spX;
+    float sY, vY, agY, spY;
+    float sXY, vXY, agXY, spXY;
+    DecodeClipState(a0,  s0,  v0,  ag0,  sp0);
+    DecodeClipState(aX,  sX,  vX,  agX,  spX);
+    DecodeClipState(aY,  sY,  vY,  agY,  spY);
+    DecodeClipState(aXY, sXY, vXY, agXY, spXY);
+
+    float w0  = (1.0 - f.x) * (1.0 - f.y);
+    float wX  = f.x * (1.0 - f.y);
+    float wY  = (1.0 - f.x) * f.y;
+    float wXY = f.x * f.y;
+
+    float wSum = 0.0;
+    float sSum = 0.0;
+    float vSum = 0.0;
+    float wBest = 0.0;
+    if (s0 >= 0.0)  { wSum += w0;  sSum += w0 * s0;  vSum += w0 * v0;   if (w0  >= wBest) { wBest = w0;  recordAge = ag0;  splitFrac = sp0; } }
+    if (sX >= 0.0)  { wSum += wX;  sSum += wX * sX;  vSum += wX * vX;   if (wX  >= wBest) { wBest = wX;  recordAge = agX;  splitFrac = spX; } }
+    if (sY >= 0.0)  { wSum += wY;  sSum += wY * sY;  vSum += wY * vY;   if (wY  >= wBest) { wBest = wY;  recordAge = agY;  splitFrac = spY; } }
+    if (sXY >= 0.0) { wSum += wXY; sSum += wXY * sXY; vSum += wXY * vXY; if (wXY >= wBest) { wBest = wXY; recordAge = agXY; splitFrac = spXY; } }
+
+    if (wSum > 1e-6)
+    {
+        sigmaSq = sSum / wSum;
+        varHSq  = vSum / wSum;
+    }
 }
 
 // ============================================================================
@@ -398,9 +477,11 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
 
     if (temporalStateEnabled)
     {
-        float2 stateUV = SnapUVToTexel(repro.sampleUV, vp).snappedUV;
-        DecodeClipState(tex2Dlod(historyStateTex, float4(stateUV, 0.0, 0.0)).a,
-                        sigmaPrevSq, varHPrevSq, agePrev, splitPrev);
+        // (v5.6.6) decode-then-blend: the state describes the footprint
+        // the Kaiser read actually blended. Bit-identical to the old
+        // snapped read at exact texel centers (the static identity).
+        SampleHistoryClipState(repro.sampleUV, vp,
+                               sigmaPrevSq, varHPrevSq, agePrev, splitPrev);
     }
 
     bool hadRecord = (sigmaPrevSq >= 0.0);
@@ -474,6 +555,37 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
 
     if (taaHistoryOvershoot > 0.001 || taaColorSpaceOklab > 0.5)
         historyColorSpace = CompressGamut(historyColorSpace);
+
+    // ---- the accumulated neighborhood (v5.6.6 ITEM 3): the soft clip's
+    //      H1 components -- the history texels at the landing's 8
+    //      neighbors, what a landing-miss ghost actually holds. Fetched
+    //      only when the soft clip can run (its enable flag): ~8 fetches
+    //      = ~10% of the resolve's fetch traffic with the posterior
+    //      enabled. Exact texel centers through the linear slot-2
+    //      sampler (the documented invariant); NO CompressGamut (raw
+    //      stored texels are in-gamut by construction, unlike the
+    //      Kaiser read); NO phase correction (stable-space content).
+    //      Motion-agnostic: the prior odds do the gating, as before. ----
+    float3 accumulatedNeighbors[8];
+    if (taaSoftClip > 0.001)
+    {
+        float2 landingTexel = floor(repro.sampleUV * vp.sizePixels) + 0.5;
+        [unroll]
+        for (int aj = 1; aj < 9; ++aj)
+        {
+            float2 uv = clamp((landingTexel + kOffsets3x3[aj]) * vp.texelSize, vp.minUV, vp.maxUV);
+            float3 acc = ToSpace(max(tex2Dlod(historyTex, float4(uv, 0.0, 0.0)).rgb, 0.0));
+            if (!(dot(acc, acc) < kLargeValue))
+                acc = colorStats.plane0;    // the NaN guard's policy, as the center read
+            accumulatedNeighbors[aj - 1] = acc;
+        }
+    }
+    else
+    {
+        [unroll]
+        for (int ajOff = 0; ajOff < 8; ++ajOff)
+            accumulatedNeighbors[ajOff] = float3(0.0, 0.0, 0.0);
+    }
 
     // ---- the innovation (the stream the spike and the corroboration
     //      price) ----
@@ -576,7 +688,7 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
         carryRecord, carryRecord ? agePrev : 0.0,
         splitPrev,
         missSigmaPx,
-        neighborhoodColorSpace,
+        accumulatedNeighbors,
         rXYg, rXZg, rYZg);
     float3 clippedHistorySpace = clipGate.clippedColorSpace;
 
@@ -674,6 +786,19 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
     // 12) Feedback & the temporal blend.
     // ------------------------------------------------------------------
     float historyFeedback    = ComputeHistoryFeedback(repro, currentSingleLayer);
+
+    // (v5.6.7) The clip-excess blend reduction: how far the history
+    // landed outside the gate (in gate radii) linearly drops the history
+    // blend to zero past a start margin. Purely blend-side -- the clamp /
+    // soft clip fix the STORED value, this fixes how much of it survives
+    // this frame; the record and the split are untouched by policy, and
+    // the VarH recursion sees the raised blend weight and correctly
+    // restarts the accumulator on dropped pixels through its own
+    // semantics. With the motion field off this is the disocclusion
+    // path: ~2e-8 on the nominal null at the defaults, routine on true
+    // reveals (which sit at 3-10+ radii).
+    historyFeedback *= 1.0 - ComputeClipExcessBlendDrop(clipGate);
+
     float currentBlendWeight = 1.0 - historyFeedback;
 
     if (disoccluded)
