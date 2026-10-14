@@ -917,7 +917,7 @@ local function kernelChainConstants(beta, radius, a)
     end
     kernelChainCache[key] = { whiteGain, readGain, noiseAcc, accFactor }
     kernelChainCacheCount = kernelChainCacheCount + 1
-    return whiteGain, readGain, noiseAcc
+    return whiteGain, readGain, noiseAcc, accFactor
 end
 
 local function varhHostConstants()
@@ -932,7 +932,7 @@ local function varhHostConstants()
     -- v3.9: the VarH chain's gains from the accumulation's spectral fixed
     -- point, per resample tier (kernelChainConstants).
     local use6 = ((tonumber(s.useKaiser6) or 1.0) > 0.5)
-    local whiteGain, readGain = kernelChainConstants(
+    local whiteGain, readGain, _, accFactorIn = kernelChainConstants(
         use6 and KAISER6_BETA  or KAISER4_BETA,
         use6 and KAISER6_RADIUS or KAISER4_RADIUS,
         a)
