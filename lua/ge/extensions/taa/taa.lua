@@ -1,6 +1,6 @@
 local M = {}
 
-local MOD_VERSION = "1.6"
+local MOD_VERSION = "1.7"
 -- THE SHADER-CONTENT KEY: derived from MOD_VERSION (bumped every public
 -- release), so normal releases re-key automatically. SHADER_PATCH is bumped
 -- ONLY for shader-only hotfixes shipped without a version bump. The key

@@ -936,14 +936,14 @@ M.defaultSettings = {
     -- chi: the gate's coverage radius (3-dof, PER-CHANNEL normalized -- the
     -- coverages below are actually true now). Below ~2.2 legit sub-texel
     -- content is under-covered. 2.2 = 82%, 2.8 = 95%.
-    varianceGamma                 = 2.5003,
+    varianceGamma                 = 2.8,
     -- The posterior-mean soft clip's ENABLE. ON by default: with the
     -- empirical spatial-marginal alternative and the sequential prior the
     -- action is the exact posterior mean -- the graded pull is where the
     -- remaining flicker:ghost headroom lives (the hard ellipsoid is the
     -- minimax action and overpays on marginal pixels).
     -- 0 = the pure hard ellipsoid (the A/B baseline).
-    softClip                      = 1.0,
+    softClip                      = 0.0,
     chromaVarianceMod             = 1.0,
     depthRejection                = 0.05,
     -- The comparison is exactly de-jittered and the landing's velocity is
@@ -969,7 +969,7 @@ M.defaultSettings = {
     colorSpaceOklab               = 0.0,
     jitterAwareVariance           = 1.0,
     velocityAlignedVariance       = 0.0,
-    alignmentFeedbackDrop         = 0.25,
+    alignmentFeedbackDrop         = 0.15,
     motionBlendDropSpeed          = 1.0,
     useKaiser6                    = 1.0,
     historyOvershoot              = 1.0,
