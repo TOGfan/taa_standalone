@@ -378,7 +378,12 @@ bool EstimateLayerForwardParallax(
     // offset conditions the sums: without it, sumS2 - n*mean^2 cancels
     // ~1e6-magnitude terms down to ~10 and float32 loses the variance.
     float  dotC = tapUVs[0].x * pfP + pfQ - tapUVs[0].y * pfR;
-    float  kC   = (1.0 / max(depthRaw[0], kEpsilon)) * dotC;
+    // ScrubF first: a NaN depth makes max(depth, kEpsilon) UB on the GLSL
+    // path before it can reach the fit's sums; the scrub maps it to 0 --
+    // the far-depth handling D3D already applies -- on every backend.
+    // -Inf passes ScrubF by design and is floored by the same max
+    // (finite-vs-infinite max is defined everywhere).
+    float  kC   = (1.0 / max(ScrubF(depthRaw[0], 0.0), kEpsilon)) * dotC;
     float2 gC   = g0 + Apply2x2(mRot, tapUVs[0] - frameBaseUV);
     float2 sC   = (tapUVs[0] + velocityUV[0]) * px;
     float2 GC   = kC * ((velocityUV[0] - gC) * px);
@@ -403,8 +408,13 @@ bool EstimateLayerForwardParallax(
         else if (isForegroundEdge) { if (depthRaw[i] <  depthRaw[0])           continue; }
 
         // B_i's cur-forward denominator is 1 +- the sub-pixel jitter only.
+        // ScrubF first: a NaN depth makes max(depth, kEpsilon) UB on the
+        // GLSL path before it can reach the fit's sums; the scrub maps it
+        // to 0 -- the far-depth handling D3D already applies -- on every
+        // backend. -Inf passes ScrubF by design and is floored by the same
+        // max (finite-vs-infinite max is defined everywhere).
         float  dotD = tapUVs[i].x * pfP + pfQ - tapUVs[i].y * pfR;
-        float  k    = (1.0 / max(depthRaw[i], kEpsilon)) * dotD;
+        float  k    = (1.0 / max(ScrubF(depthRaw[i], 0.0), kEpsilon)) * dotD;
         float2 g    = g0 + Apply2x2(mRot, tapUVs[i] - frameBaseUV);
         float2 s    = (tapUVs[i] + velocityUV[i]) * px - sC;
         float2 G    = k * ((velocityUV[i] - g) * px) - GC;
@@ -486,11 +496,16 @@ float ComputeDepthDisocclusionScore(
     float3 prevFwd = CameraForwardAxis(previousCamera);
     float3 curFwd  = CameraForwardAxis(currentCamera);
 
-    float  wCur = 1.0 / max(effectiveDepthRaw, kEpsilon);
+    // Scrubbed at the entry: a NaN effective depth makes the downstream
+    // saturate() UB on the GLSL path; NaN -> 0 is the far-depth value,
+    // under which the one-sided test provably cannot reject.
+    float  wCur = 1.0 / max(ScrubF(effectiveDepthRaw, 0.0), kEpsilon);
     float3 dCur = frameBaseUV.x * currentCamera.rightTanFov + currentCamera.forward
                 - frameBaseUV.y * currentCamera.downTanFov;
     float  bCur = dot(dCur, prevFwd) / max(dot(dCur, curFwd), 1e-6);
-    float  wHist = 1.0 / max(landingDepthRaw, kEpsilon);
+    // Belt-and-braces: the writer scrubs its stores, but a stale/garbage
+    // target (frame 0 / post-resize) can hold anything.
+    float  wHist = 1.0 / max(ScrubF(landingDepthRaw, 0.0), kEpsilon);
 
     // --- early-out ----------------------------------------------------------
     // T_y is clamped to [-wCur, wCur], so wExp <= wCur * bCur + wCur

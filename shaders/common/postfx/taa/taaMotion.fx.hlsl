@@ -110,7 +110,10 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
     if (taaUseMotionField < 0.5)
     {
         float2 centerVelocity = ScrubF2(tex2Dlod(velocityTex, float4(pixel.snappedUV, 0.0, 0.0)).rg, float2(0.0, 0.0));
-        float  centerDepth    = ScrubF(tex2Dlod(depthTex,    float4(pixel.snappedUV, 0.0, 0.0)).r, 0.0);
+        // Same max(...,0) floor as the classification stores below: the
+        // fast path writes through the same target and must not store
+        // -Inf either.
+        float  centerDepth    = ScrubF(max(tex2Dlod(depthTex,    float4(pixel.snappedUV, 0.0, 0.0)).r, 0.0), 0.0);
         return float4(centerVelocity, centerDepth, 0.0);
     }
 
@@ -161,17 +164,21 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
             // (the center always was the background layer; the dilation only
             // borrowed the crest's values). The resolve re-projected with
             // exactly these values after revoking.
-            return float4(centerVelocity, ScrubF(depths[0], 0.0), 0.0);
+            // max(...,0) floors -Inf before the scrub (kills the
+            // -Inf*0 = NaN corner in LandingOwnedDepth at the store); the
+            // scrub catches max's own NaN output on the GLSL path, so the
+            // composition is safe on every backend.
+            return float4(centerVelocity, ScrubF(max(depths[0], 0.0), 0.0), 0.0);
         }
 
         // Kept candidate: the crest's raw sample -- the anchor.
         float2 crestVelocity = ScrubF2(tex2Dlod(velocityTex, float4(closestUV, 0.0, 0.0)).rg, float2(0.0, 0.0));
-        return float4(crestVelocity, ScrubF(closestDepth, 0.0), 2.0);
+        return float4(crestVelocity, ScrubF(max(closestDepth, 0.0), 0.0), 2.0);
     }
 
     // Flat / foreground edge: the raw center sample (the landing re-classifies
     // and re-resolves with its own phase; no pre-resolution needed here).
-    return float4(centerVelocity, ScrubF(depths[0], 0.0), edge.isForegroundEdge ? 1.0 : 0.0);
+    return float4(centerVelocity, ScrubF(max(depths[0], 0.0), 0.0), edge.isForegroundEdge ? 1.0 : 0.0);
 }
 
 PFXVertToPix mainV(PFXVert IN) { return processPostFxVert(IN); }

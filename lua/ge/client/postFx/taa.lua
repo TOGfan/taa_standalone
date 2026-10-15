@@ -854,6 +854,13 @@ local function kernelChainConstants(beta, radius, a)
     local kapSum, dSum = 0.0, 0.0
     for p = 1, nPhase do
         local kp = ktab[p]
+        -- The 2D renormalization the shader's corner skip applies: the
+        -- fetched coefficients are the corner-zeroed products divided by
+        -- the fetched mass (cornerMass = (k(lo)+k(hi))^2).
+        local ren = 1.0
+        if skipCorners then
+            ren = 1.0 / math.max(1.0 - (kp[lo] + kp[hi]) * (kp[lo] + kp[hi]), 1e-6)
+        end
         local kapP, dP = 0.0, 0.0
         for n = lo, hi do
             local cn = kp[n]
@@ -865,17 +872,26 @@ local function kernelChainConstants(beta, radius, a)
                 if cnm ~= 0.0 then
                     kapP = kapP + cnm * r2d[n + maxOff + 1][m + maxOff + 1]
                     for n2 = lo, hi do
-                        local dn = n - n2 + maxOff + 1
                         local cn2 = kp[n2]
                         for m2 = lo, hi do
-                            dP = dP + cnm * cn2 * kp[m2] * r2d[dn][m - m2 + maxOff + 1]
+                            local c2 = cn2 * kp[m2]
+                            -- The SECOND coefficient pair carries the same
+                            -- corner skip: the actual fetch pattern has no
+                            -- corner coefficients on either side of the
+                            -- read-variance quadratic form.
+                            if skipCorners and (n2 == lo or n2 == hi) and (m2 == lo or m2 == hi) then
+                                c2 = 0.0
+                            end
+                            if c2 ~= 0.0 then
+                                dP = dP + cnm * c2 * r2d[n - n2 + maxOff + 1][m - m2 + maxOff + 1]
+                            end
                         end
                     end
                 end
             end
         end
-        kapSum = kapSum + kapP
-        dSum = dSum + dP
+        kapSum = kapSum + kapP * ren
+        dSum = dSum + dP * ren * ren
     end
     local kappa = kapSum / nPhase / vsNorm
     local dBar  = dSum / nPhase / vsNorm
@@ -906,8 +922,19 @@ local function varhHostConstants()
         use6 and KAISER6_BETA  or KAISER4_BETA,
         use6 and KAISER6_RADIUS or KAISER4_RADIUS,
         a)
+    -- BOTH gains are the read gain D. The lumped recursion
+    --     varH' = (1-a)^2 * D * varH + a^2 * F * sPer
+    -- has its fixed point at a^2 * sPer * F / (1 - (1-a)^2 D), and the
+    -- moment series telescopes (M0 - b*M1 = m0^2 = 1), so 1 - b*D = 1/M0
+    -- and the fixed point equals the exact spectral Vr* = a^2 sPer * M1
+    -- iff F = M1/M0 = D -- for EVERY feedback rate. (F = whiteGain = m1^2
+    -- converges to m1^2*M0 instead: ~13% low at feedback 0.97, exact only
+    -- for the first post-reset step.) Equivalently the corrected
+    -- recursion is D * [(1-a)^2 varH + a^2 sPer] -- the stored-variance
+    -- blend scaled by the read gain, which is what READ-semantics
+    -- transport means. whiteGain stays computed for the log only.
     local varhLoss  = math.min(math.max(1.0 - readGain, 0.0), 0.9)
-    local whiteLoss = math.min(math.max(1.0 - whiteGain, 0.0), 0.95)
+    local whiteLoss = math.min(math.max(1.0 - readGain, 0.0), 0.95)
     local accFactor = math.min(math.max(accFactorIn, 0.02), 4.0)
 
     return varhLoss, whiteLoss, accFactor

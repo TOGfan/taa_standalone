@@ -524,7 +524,13 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
     // it a few ops on quiet quads. The boost lifts the prior odds only --
     // the scales, the masses and the tail stay measured. The dials are
     // the constants in taaClip, never a cap on the measured scale.
-    float4 missModel;   // xy = the miss sigmas (texels), z = the scale's dof, w = the rate boost (log2)
+    // Consumed ONLY by the soft clip's posteriorPath: with taaSoftClip off
+    // the whole block is dead work (no debug mode reads it -- mode 8
+    // recomputes its own straddle test), so the uniform branch skips it.
+    // transportErrPx above stays -- the gate's transportVar consumes it in
+    // every configuration.
+    float4 missModel = float4(0.0, 0.0, 2.0, 0.0);   // xy = the miss sigmas (texels), z = the scale's dof, w = the rate boost (log2)
+    if (taaSoftClip > 0.001)
     {
         float velNoisePx = (transportFloorPx > 0.0) ? transportFloorPx : kVelQuantFloorPx;
         missModel.x = sqrt(transportErrPx.x * transportErrPx.x + velNoisePx * velNoisePx);
@@ -565,12 +571,11 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
     if (hadRecord)
         partsLive = SplitRecordVariance(colorStats, sigmaPrevSq, varHPrevSq, nuPrev);
 
-    // ---- the history read (Kaiser) ----
     float3 historyColorSpace;
     if (taaUseKaiser6 > 0.5)
-        historyColorSpace = SampleHistoryColor_Kaiser6_21Tap(repro.sampleUV, vp, historyMinUV, historyMaxUV);
+        historyColorSpace = SampleHistoryColor_Kaiser6_21Tap(repro.sampleUV, vp, vp.minUV, vp.maxUV);
     else
-        historyColorSpace = SampleHistoryColor_Kaiser4_9Tap(repro.sampleUV, vp, historyMinUV, historyMaxUV);
+        historyColorSpace = SampleHistoryColor_Kaiser4_9Tap(repro.sampleUV, vp, vp.minUV, vp.maxUV);
 
     if (!(dot(historyColorSpace, historyColorSpace) < kLargeValue))
         historyColorSpace = colorStats.plane0;
@@ -618,6 +623,19 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
     float rXYg, rXZg, rYZg;
     ShrunkenCorrelations(colorStats, rXYg, rXZg, rYZg);
 
+    // THE SHARED METRIC, built once: the whitened innovation AND the
+    // statistic gate's every quadratic form consume the same R^-1 at unit
+    // scale (the gate's internal cofactor block is gone -- it reads this
+    // struct now).
+    SharedCorrelationMetric sharedMetric = BuildSharedCorrelationMetric(rXYg, rXZg, rYZg);
+
+    // ONE evaluation of the whitened innovation: the spike's record branch
+    // and the corroboration reset both consume it (the former double
+    // evaluation is gone).
+    float wInnovSq = 0.0;
+    if (hadRecord)
+        wInnovSq = WhitenedInnovSq(innov, partsLive, colorStats.transportVar, sharedMetric);
+
     // ---- change-points ----
     // The spike: two branches, both explicit. The record branch is a
     // WHITENED chi^2_3 test at ~1e-6 per frame through the shrunk full
@@ -632,13 +650,12 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
     // reveals, and the NaN guard is separate).
     bool  spike = hadRecord
         && (innovSq > 16.0 * colorStats.rangeSq
-            || WhitenedInnovSq(innov, partsLive, colorStats.transportVar, rXYg, rXZg, rYZg) > kChiSq3_1e6);
+            || wInnovSq > kChiSq3_1e6);
 
     bool geoCorroborated = false;
     if (hadRecord && disoccluded)
     {
-        geoCorroborated = (WhitenedInnovSq(innov, partsLive, colorStats.transportVar, rXYg, rXZg, rYZg)
-                           > kChiSq3_95);
+        geoCorroborated = (wInnovSq > kChiSq3_95);
     }
 
     bool  resetRecord = hadRecord
@@ -711,7 +728,7 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
         splitPrev,
         missModel,
         accumulatedNeighbors,
-        rXYg, rXZg, rYZg);
+        sharedMetric);
     float3 clippedHistorySpace = clipGate.clippedColorSpace;
 
     // ---- DEBUG PAYLOAD STASH ----------------------------------------------

@@ -568,21 +568,25 @@ ColorNeighborhoodStats ComputeColorNeighborhoodStats(
         // (a dof-side quantity); mixing it here would double-count the
         // psi' factor into the variance. Degenerate spread: the unobserved
         // direction is dropped by the decoupled fit; the charge is guarded.
+        // Shared w^2 moments and S^-1 projections: the exact evaluation
+        // variance and the F1 lever below both consume these -- hoisted
+        // once (also guarantees the sharing on translation paths whose CSE
+        // is weak across scopes).
+        float2 sumW2offCen = acc.offSumW2 - cenPx * acc.totalWSq;
+        float  sXX = acc.offXSqW2 - 2.0 * cenPx.x * acc.offSumW2.x + acc.totalWSq * cenPx.x * cenPx.x;
+        float  sYY = acc.offYYSqW2 - 2.0 * cenPx.y * acc.offSumW2.y + acc.totalWSq * cenPx.y * cenPx.y;
+        float  sXY = acc.offXYW2 - cenPx.x * acc.offSumW2.y
+                   - cenPx.y * acc.offSumW2.x
+                   + acc.totalWSq * cenPx.x * cenPx.y;
+        float2 vC = float2(dot(vInv0, cenPx),  dot(vInv1, cenPx));   // S^-1 cen
+        float2 vD = float2(dot(vInv0, dEval), dot(vInv1, dEval));   // S^-1 dEval
+
         float evalVar;
         if (scatterFullRank)
         {
-            float2 uEval = float2(dot(vInv0, dEval), dot(vInv1, dEval));
-            float2 sumW2offCen = acc.offSumW2 - cenPx * acc.totalWSq;
-            float  sXX = acc.offXSqW2 - 2.0 * cenPx.x * acc.offSumW2.x
-                       + acc.totalWSq * cenPx.x * cenPx.x;
-            float  sYY = acc.offYYSqW2 - 2.0 * cenPx.y * acc.offSumW2.y
-                       + acc.totalWSq * cenPx.y * cenPx.y;
-            float  sXY = acc.offXYW2 - cenPx.x * acc.offSumW2.y
-                       - cenPx.y * acc.offSumW2.x
-                       + acc.totalWSq * cenPx.x * cenPx.y;
-            float cross = dot(uEval, sumW2offCen);
-            float quad  = uEval.x * uEval.x * sXX + uEval.y * uEval.y * sYY
-                        + 2.0 * uEval.x * uEval.y * sXY;
+            float cross = dot(vD, sumW2offCen);
+            float quad  = vD.x * vD.x * sXX + vD.y * vD.y * sYY
+                        + 2.0 * vD.x * vD.y * sXY;
             evalVar = (acc.totalWSq + 2.0 * cross + quad)
                     / max(acc.totalW * acc.totalW, 1e-6);
             evalVar = clamp(evalVar, 1.0 / 9.0, plainInvNeff + kMaxEvalVar);
@@ -625,17 +629,35 @@ ColorNeighborhoodStats ComputeColorNeighborhoodStats(
         // F1: the prior/tap shared-sample covariance on the robust weights
         // -- THE EXACT LEVER. The load-bearing identity is the ingest's
         // de-bias, E[dev^2] = sPer + vPrior - 2*cPT with dev = x0c - plane0
-        // and the FITTED phase correction, which pins
-        //     cPT = sPer * (k0 + L):
-        //     k0 = (w2_0/W) * (1 - dEval' S^-1 cen)   -- the plain
-        //          shared-sample term (exact when the phase gradient is
-        //          treated as deterministic),
+        // and the FITTED phase correction. The GEOMETRY (k0 + L below) is
+        // exact for any white per-tap perturbation; the SCALE is residSq,
+        // NOT sPer: within one frame the fitted plane and the tap share
+        // BOTH the temporal noise and the stable structure (the same tap
+        // realization), so the shared-sample covariance is charged at the
+        // full measured spatial residual. Intended consequence: the
+        // ingest's fixed point is sPer + sigma_S^2*evalVar -- the record
+        // tracks the tap's effective variance against the PHASE-SWEPT
+        // target (the structure's phase-variance included), which is the
+        // likelihood variance the gate consumes; the structure side is
+        // bounded by the winsor and arming caps.
+        //     k0 = (w2_0/W) * (1 - dEval' S^-1 cen)   -- exact when the
+        //          phase gradient is treated as deterministic,
         //     L  = jitterPx' S^-1 c2
         //        + 0.5 * (dEval' S^-1 S2 S^-1 dEval - cen' S^-1 S2 S^-1 cen)
-        //        - (w2_0/W) * jitterPx' S^-1 cen
+        //        + (w2_0/W) * jitterPx' S^-1 cen
         // with c2 = Sum (w2/W)^2 (o - cen) and S2 = Sum (w2/W)^2 (o-cen)
         // (o-cen)' -- the w2-SQUARED centroid offset and scatter (the same
         // accumulator class the exact evaluation variance uses).
+        // DERIVATION (do not flip signs again): with plane0 = Sum a_k x_k
+        // and x0c = x_0 + ghat*j = Sum b_k x_k (b_0 = 1 + beta_0, beta_k =
+        // (w_k/W) jitterPx' S^-1 (o_k - cen)),
+        //     E[dev^2]/sigma^2 = 1 + 2*beta_0 + Sum beta^2 + Sum a^2
+        //                        - 2*Sum a*b,
+        // and matching the transported identity pins
+        //     cPT/sigma^2 = Sum a*b - beta_0 - Sum beta^2 / 2
+        //                 = k0 + L  exactly as written. The last term IS
+        // -beta_0 and enters with PLUS; the degenerate limits (j = 0,
+        // uniform weights) both zero it and CANNOT discriminate its sign.
         // Degenerate spread: the plain shared-sample term stands (the
         // lever's S^-1 does not exist). jitterPx = 0 makes L vanish and
         // k0 = b0 identically; uniform w2 reduces L to
@@ -644,19 +666,13 @@ ColorNeighborhoodStats ComputeColorNeighborhoodStats(
         if (scatterFullRank)
         {
             float  invW2 = invTotalWeight * invTotalWeight;
-            float2 sumW2offCen = acc.offSumW2 - cenPx * acc.totalWSq;
-            float  sXX = acc.offXSqW2 - 2.0 * cenPx.x * acc.offSumW2.x + acc.totalWSq * cenPx.x * cenPx.x;
-            float  sYY = acc.offYYSqW2 - 2.0 * cenPx.y * acc.offSumW2.y + acc.totalWSq * cenPx.y * cenPx.y;
-            float  sXY = acc.offXYW2 - cenPx.x * acc.offSumW2.y - cenPx.y * acc.offSumW2.x + acc.totalWSq * cenPx.x * cenPx.y;
-            float2 vC  = float2(dot(vInv0, cenPx),  dot(vInv1, cenPx));    // S^-1 cen
-            float2 vD  = float2(dot(vInv0, dEval),  dot(vInv1, dEval));    // S^-1 dEval
             float2 uC2 = float2(dot(vInv0, sumW2offCen), dot(vInv1, sumW2offCen)); // S^-1 Sum w2^2 (o-cen)
             float quadD = (sXX * vD.x * vD.x + 2.0 * sXY * vD.x * vD.y + sYY * vD.y * vD.y) * invW2;
             float quadC = (sXX * vC.x * vC.x + 2.0 * sXY * vC.x * vC.y + sYY * vC.y * vC.y) * invW2;
             float k0 = (w2[0] * invTotalWeight) * (1.0 - dot(dEval, vC));
             float lever = dot(jitterPx, uC2) * invW2
                         + 0.5 * (quadD - quadC)
-                        - (w2[0] * invTotalWeight) * dot(jitterPx, vC);
+                        + (w2[0] * invTotalWeight) * dot(jitterPx, vC);
             priorTapCoef = k0 + lever;
         }
         stats.priorTapCov = max(stats.residSq * priorTapCoef, float3(0.0, 0.0, 0.0));
@@ -723,6 +739,35 @@ float QuadFormUnitR(float3 y, float rC00, float rC01, float rC02, float rC11, fl
 {
     return rC00 * y.x * y.x + rC11 * y.y * y.y + rC22 * y.z * y.z
          + 2.0 * (rC01 * y.x * y.y + rC02 * y.x * y.z + rC12 * y.y * y.z);
+}
+
+// ============================================================================
+// THE SHARED CORRELATION METRIC -- built ONCE per pixel (taa.fx), consumed
+// by WhitenedInnovSq AND the gate. R^-1 at unit scale as symmetric
+// cofactors over detR; degenerate detR (|R| ~ 0 under heavy shrink) keeps
+// the diagonal fallback semantics of both former consumers.
+// ============================================================================
+struct SharedCorrelationMetric
+{
+    bool  full;
+    float detR;
+    float c00, c01, c02, c11, c12, c22;   // R^-1 cofactors / detR
+};
+
+SharedCorrelationMetric BuildSharedCorrelationMetric(float rXY, float rXZ, float rYZ)
+{
+    SharedCorrelationMetric m;
+    float detR = 1.0 + 2.0 * rXY * rXZ * rYZ - rXY * rXY - rXZ * rXZ - rYZ * rYZ;
+    m.full = (detR > 1e-6);
+    m.detR = detR;
+    float invDetR = m.full ? (1.0 / detR) : 0.0;
+    m.c00 = (1.0 - rYZ * rYZ) * invDetR;
+    m.c01 = (rXZ * rYZ - rXY) * invDetR;
+    m.c02 = (rXY * rYZ - rXZ) * invDetR;
+    m.c11 = (1.0 - rXZ * rXZ) * invDetR;
+    m.c12 = (rXY * rXZ - rYZ) * invDetR;
+    m.c22 = (1.0 - rXY * rXY) * invDetR;
+    return m;
 }
 
 // ============================================================================
@@ -1003,30 +1048,18 @@ RecordVarianceParts SplitRecordVariance(
 }
 
 // The whitened innovation on the READ-side denominators + the shrunk full
-// metric (the geometric corroboration test's form -- the shared 95% level).
+// metric. y'(D R D)^-1 y == (y./s)' R^-1 (y./s) EXACTLY (D^-1 R^-1 D^-1),
+// and det(D R D) = detR * (v.x*v.y*v.z) -- the original's own degenerate
+// test on the scaled determinant, preserved in form. The diagonal fallback
+// is bit-identical to the original's.
 float WhitenedInnovSq(float3 innov, RecordVarianceParts p, float3 transportVar,
-                      float rXY, float rXZ, float rYZ)
+                      SharedCorrelationMetric m)
 {
     float3 v = max(p.ePer + transportVar, float3(1e-10, 1e-10, 1e-10));
-    float sX = sqrt(v.x), sY = sqrt(v.y), sZ = sqrt(v.z);
-    float m01 = rXY * sX * sY;
-    float m02 = rXZ * sX * sZ;
-    float m12 = rYZ * sY * sZ;
-    float c0 = v.y * v.z - m12 * m12;
-    float c1 = m12 * m02 - m01 * v.z;
-    float c2 = m01 * m12 - v.y * m02;
-    float det = v.x * c0 + m01 * c1 + m02 * c2;
-    if (det <= 1e-12)
-        return dot(innov * innov, float3(1.0, 1.0, 1.0) / v);
-    float invDet = 1.0 / det;
-    float i00 = c0 * invDet;
-    float i01 = c1 * invDet;
-    float i02 = c2 * invDet;
-    float i11 = (v.x * v.z - m02 * m02) * invDet;
-    float i12 = (m02 * m01 - v.x * m12) * invDet;
-    float i22 = (v.x * v.y - m01 * m01) * invDet;
-    return i00 * innov.x * innov.x + i11 * innov.y * innov.y + i22 * innov.z * innov.z
-         + 2.0 * (i01 * innov.x * innov.y + i02 * innov.x * innov.z + i12 * innov.y * innov.z);
+    float3 y = innov / sqrt(v);
+    if (m.full && (m.detR * (v.x * v.y * v.z)) > 1e-12)
+        return QuadFormUnitR(y, m.c00, m.c01, m.c02, m.c11, m.c12, m.c22);
+    return dot(y * y, float3(1.0, 1.0, 1.0));
 }
 
 // ============================================================================
@@ -1125,9 +1158,9 @@ ClipGateResult ClipHistoryToStatisticGate(
                                         // conditional rate boost (log2) --
                                         // see taa.fx's miss-model block
     float3 accumulatedNeighbors[8],
-    float  rXY, float rXZ, float rYZ)   // the caller's shrunk correlations
-                                        // -- ONE evaluation shared by every
-                                        // consumer
+    SharedCorrelationMetric sharedMetric)   // R^-1 at unit scale, built ONCE
+                                            // by the caller (taa.fx) -- the
+                                            // whitened innovation shares it
 {
     ClipGateResult r;
     r.center = stats.plane0;
@@ -1252,21 +1285,21 @@ ClipGateResult ClipHistoryToStatisticGate(
     // ---- THE SHARED METRIC ----
     // One correlation matrix R (the caller's shrunk correlations -- the
     // same values the spike, the winsor and the corroboration test
-    // consume), one hoisted R^-1 at unit scale. Every quadratic form in
-    // this gate -- the hard test's mdd, the soft clip's null, its 8
-    // neighbor components, its temporal tail -- standardizes its deviation
-    // by the hypothesis' per-channel scales and runs through this R^-1:
-    // exactly the full metric diag(v) R diag(v), and the SAME channel
-    // coupling on both sides of the soft clip's likelihood ratio.
-    float detR = 1.0 + 2.0 * rXY * rXZ * rYZ - rXY * rXY - rXZ * rXZ - rYZ * rYZ;
-    bool  rFull = (detR > 1e-6);
-    float invDetR = rFull ? (1.0 / detR) : 0.0;
-    float rC00 = (1.0 - rYZ * rYZ) * invDetR;
-    float rC01 = (rXZ * rYZ - rXY) * invDetR;
-    float rC02 = (rXY * rYZ - rXZ) * invDetR;
-    float rC11 = (1.0 - rXZ * rXZ) * invDetR;
-    float rC12 = (rXY * rXZ - rYZ) * invDetR;
-    float rC22 = (1.0 - rXY * rXY) * invDetR;
+    // consume), one hoisted R^-1 at unit scale, built ONCE by the caller
+    // (taa.fx's BuildSharedCorrelationMetric -- the whitened innovation
+    // uses the same inverse). Every quadratic form in this gate -- the
+    // hard test's mdd, the soft clip's null, its 8 neighbor components,
+    // its temporal tail -- standardizes its deviation by the hypothesis'
+    // per-channel scales and runs through this R^-1: exactly the full
+    // metric diag(v) R diag(v), and the SAME channel coupling on both
+    // sides of the soft clip's likelihood ratio.
+    bool  rFull = sharedMetric.full;
+    float rC00 = sharedMetric.c00;
+    float rC01 = sharedMetric.c01;
+    float rC02 = sharedMetric.c02;
+    float rC11 = sharedMetric.c11;
+    float rC12 = sharedMetric.c12;
+    float rC22 = sharedMetric.c22;
 
     // The hard test's statistic through the shared metric.
     float3 vMet = max(gateVar * chromaScale * chromaScale, float3(minGateVar, minGateVar, minGateVar));
