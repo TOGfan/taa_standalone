@@ -32,7 +32,7 @@
 // (5.2) -- first dropped term < 1e-5, same as the scalar series it replaces.
 // Four windows per evaluation at the cost of one (the recurrence is mads --
 // full-rate and SIMD-wide; transcendentals would NOT pack this way, which is
-// why the Oklab cube roots can't use the same trick). The 6-tap path now
+// why the Oklab cube roots can't use the same trick). The 6-tap path
 // evaluates its six windows in two calls instead of six scalar series.
 float4 KaiserI0Series4x10(float4 u, float beta)
 {
@@ -167,7 +167,7 @@ void GetKaiser6FusedWeights(float frac, float baseCoord, out float3 posPt, out f
 
     // Six windows in TWO lane-parallel evaluations (four + two, the last two
     // lanes dummy zero-u whose series values are unused). Each lane runs the
-    // identical 10-term recurrence as the scalar series above -- bit-identical
+    // identical 10-term recurrence as the scalar series -- bit-identical
     // results, ~2x fewer series operations on the default path.
     float4 uA = max(1.0 - float4(d0_2, d1_2, f2,  d3_2) * (1.0 / 9.0), 0.0);
     float4 uB = max(1.0 - float4(d4_2, d5_2, 9.0, 9.0 ) * (1.0 / 9.0), 0.0);
@@ -297,14 +297,14 @@ float3 ApplyFXAA(float2 centerUV, float2 texelSize, float3 centerRGB, float3 cor
     float2 uv0 = clamp(centerUV + dir * (1.0 / 3.0 - 0.5), minUV, maxUV);
     float2 uv1 = clamp(centerUV + dir * (2.0 / 3.0 - 0.5), minUV, maxUV);
     float3 rgbA = 0.5 * (
-        tex2Dlod(sceneTex, float4(uv0, 0.0, 0.0)).rgb +
-        tex2Dlod(sceneTex, float4(uv1, 0.0, 0.0)).rgb);
+        ScrubRawRGB(tex2Dlod(sceneTex, float4(uv0, 0.0, 0.0)).rgb) +
+        ScrubRawRGB(tex2Dlod(sceneTex, float4(uv1, 0.0, 0.0)).rgb));
 
     float2 uv2 = clamp(centerUV + dir * (0.0 / 3.0 - 0.5), minUV, maxUV);
     float2 uv3 = clamp(centerUV + dir * (3.0 / 3.0 - 0.5), minUV, maxUV);
     float3 rgbB = rgbA * 0.5 + 0.25 * (
-        tex2Dlod(sceneTex, float4(uv2, 0.0, 0.0)).rgb +
-        tex2Dlod(sceneTex, float4(uv3, 0.0, 0.0)).rgb);
+        ScrubRawRGB(tex2Dlod(sceneTex, float4(uv2, 0.0, 0.0)).rgb) +
+        ScrubRawRGB(tex2Dlod(sceneTex, float4(uv3, 0.0, 0.0)).rgb));
 
     float lumaB = LumaRGB(rgbB);
     return ((lumaB < lumaMin) || (lumaB > lumaMax)) ? rgbA : rgbB;

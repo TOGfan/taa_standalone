@@ -1,6 +1,17 @@
 local M = {}
 
 local MOD_VERSION = "1.6"
+-- THE SHADER-CONTENT KEY: derived from MOD_VERSION (bumped every public
+-- release), so normal releases re-key automatically. SHADER_PATCH is bumped
+-- ONLY for shader-only hotfixes shipped without a version bump. The key
+-- reaches the shaders as a DEFINE (busting every compiled-shader cache that
+-- keys on path + macro set: the engine's in-memory manager, the disk
+-- caches, the DX12 PSO cache -- no file or object renames) and the settings
+-- file (deciding when the disk caches are cleared).
+local SHADER_PATCH = "0"
+local SHADER_KEY = MOD_VERSION .. "." .. SHADER_PATCH
+-- local SHADER_PATCH = tostring(os.time())  -- DEV: uncomment to force a recompile on every reload
+
 local settingsPath = "settings/taa_standalone.json"
 local active = true
 local pfx = nil
@@ -41,20 +52,35 @@ local rehookTimer = 0
 
 local savedAA = nil
 
+-- The frameSize fallback has fired (log it once, not every frame).
+local frameSizeWarned = false
+
+-- Clearing the disk caches is HYGIENE, not correctness (the define key
+-- carries correctness). Still: log per-directory counts so a no-op clear
+-- (cache living outside the known paths on some install) is visible in
+-- reporter logs.
 local function clearShaderCache()
     local cacheDirs = { "/temp/shaders", "temp/shaders", "/shaders/cache", "shaders/cache" }
+    local totalFound = 0
     for _, dir in ipairs(cacheDirs) do
         if FS:directoryExists(dir) then
             local files = FS:findFiles(dir, "*", -1, true, false)
+            local found = files and #files or 0
             if files then
                 for _, file in ipairs(files) do
                     FS:removeFile(file)
                 end
             end
             FS:directoryRemove(dir)
+            totalFound = totalFound + found
+            log("I", "TAA", string.format("clearShaderCache: %s -- %d file(s) found", dir, found))
         end
     end
-    log("I", "TAA", "Shader cache cleared for mod version " .. MOD_VERSION)
+    if totalFound == 0 then
+        log("W", "TAA", "clearShaderCache: no candidate cache directory found -- the engine's shader cache on this install lives outside the known paths")
+    else
+        log("I", "TAA", "Shader cache cleared for mod version " .. MOD_VERSION .. " (" .. totalFound .. " file(s))")
+    end
 end
 
 local function halton(index, base)
@@ -91,6 +117,16 @@ local function frameSize()
                 return math.max(1, tonumber(extent.x)), math.max(1, tonumber(extent.y))
             end
         end
+    end
+    -- The hardcoded fallback engaged: both canvas queries failed. The 16:9
+    -- assumption silently mis-scales taaTanHalfFovX on any other aspect --
+    -- a residual wobble the resolve cannot cancel -- so it must be visible
+    -- in the log, not silent. (Uniform DPI scaling is harmless: w/h is
+    -- preserved; the danger is the fallback's fixed aspect.)
+    if not frameSizeWarned then
+        frameSizeWarned = true
+        log("W", "TAA", "frameSize: both canvas queries failed -- falling back to 1920x1080"
+            .. " (wrong aspect on non-16:9 displays: expect residual jitter)")
     end
     return 1920, 1080
 end
@@ -232,11 +268,11 @@ local function saveState()
         tableMerge(merged, pendingSettings)
         currentSettings = merged
     end
-    jsonWriteFile(settingsPath, { version = MOD_VERSION, active = active, settings = currentSettings }, true)
+    jsonWriteFile(settingsPath, { version = MOD_VERSION, active = active, shaderKey = SHADER_KEY, settings = currentSettings }, true)
 end
 
 -- Debounced persistence: settings APPLY immediately but the JSON write
--- trails by 0.4s (a slider drag used to do one disk write per tick).
+-- trails by 0.4s (a slider drag would otherwise do one disk write per tick).
 -- Flushed in onPreRender / stop().
 local savePending, saveTimer = false, 0.0
 local function saveStateSoon()
@@ -250,20 +286,41 @@ local function loadState()
     if savedData and type(savedData) == "table" then
         if savedData.active ~= nil then active = savedData.active end
 
+        -- THE SHADER-CONTENT KEY check: independent of the settings version
+        -- -- a shader-only hotfix must bust the compiled-shader caches
+        -- WITHOUT resetting user settings. Fires once per key change
+        -- (including the one-time nil -> key migration on first run).
+        -- Mid-session, a clear cannot evict memory-resident binaries: a
+        -- restart makes it trustworthy (the define key covers the in-memory
+        -- case regardless).
+        if savedData.shaderKey ~= SHADER_KEY then
+            clearShaderCache()
+            log("I", "TAA", "Shader key " .. tostring(savedData.shaderKey) .. " -> " .. SHADER_KEY
+                .. ": compiled-shader caches cleared")
+        end
+
         if savedData.version ~= MOD_VERSION then
             -- Settings saved by an older version may reference constants or
             -- semantics that no longer exist: reset to the current defaults
-            -- instead of migrating. The enabled/disabled state is kept.
-            -- The settings key is dropped from the file here (so the next
-            -- ensureChain() loads pure defaults); start() persists the full
-            -- defaults once the chain is live. A chain already running
-            -- mid-session is reset through pfx.resetSettings().
+            -- instead of migrating. The enabled/disabled state is kept. The
+            -- settings key is dropped from the file here; start() persists
+            -- the full defaults once the chain is live. A chain already
+            -- running mid-session is reset through pfx.resetSettings().
             clearShaderCache()
             pendingSettings = nil
             settingsResetPending = true
             if pfx and pfx.resetSettings then pfx.resetSettings() end
-            jsonWriteFile(settingsPath, { version = MOD_VERSION, active = active }, true)
+            -- A failed write means the bump never persists: the clear and
+            -- the settings reset would repeat every launch (read-only
+            -- install, sync client, antivirus). Only warn on an explicit
+            -- false -- an API returning nil must not false-positive.
+            if jsonWriteFile(settingsPath, { version = MOD_VERSION, active = active, shaderKey = SHADER_KEY }, true) == false then
+                log("W", "TAA", "loadState: settings version bump NOT persisted (" .. settingsPath
+                    .. ") -- the cache clear and settings reset will repeat every launch until this write succeeds")
+            end
             log("I", "TAA", "Settings reset to defaults (file version " .. tostring(savedData.version) .. " -> " .. MOD_VERSION .. ")")
+        elseif savedData.shaderKey ~= SHADER_KEY then
+            saveState()   -- persist the new shader key; settings untouched
         end
     else
         clearShaderCache()
@@ -281,7 +338,7 @@ local function ensureChain()
         return false
     end
 
-    if mod.build then mod.build() end
+    if mod.build then mod.build(SHADER_KEY) end
     if not mod.exists() then
         pfx = nil
         return false
@@ -296,13 +353,11 @@ local function ensureChain()
         -- or this is a first run whose initial saveState wrote none).
         -- mod.build() just destroyed and recreated every PostEffect this
         -- module owns, and setShaderConst state dies with the old objects:
-        -- the module's load-time applySettings() either never ran (require
-        -- is cached across mod reloads) or was applied to the objects that
-        -- were just deleted. resetSettings() rebuilds M.settings from the
-        -- defaults AND pushes them to the live chain -- without this the
-        -- chain renders on engine-default constants (feedback 0/0 = zero
-        -- temporal accumulation = the raw jittered frame on screen) until
-        -- the user touches a setting.
+        -- resetSettings() rebuilds M.settings from the defaults AND pushes
+        -- them to the live chain -- without this the chain renders on
+        -- engine-default constants (feedback 0/0 = zero temporal
+        -- accumulation = the raw jittered frame on screen) until the user
+        -- touches a setting.
         pfx.resetSettings()
     end
     -- Anything staged while the chain was down was already merged into the

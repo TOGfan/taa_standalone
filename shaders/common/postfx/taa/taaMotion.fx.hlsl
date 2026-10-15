@@ -37,6 +37,11 @@
 // conservative "revoked" encodings of the resolve's early/debug returns are
 // always safe.
 //
+// Every write is scrubbed (ScrubF/ScrubF2): velocity 0 = static and depth
+// 0 = far are the safe degenerate values; a NaN stored here would be read
+// at the landings of every pixel that moves onto it next frame -- NaN
+// smeared along motion trajectories.
+//
 // Fetch budget: the classifier needs all nine depths, but the velocities are
 // fetched lazily -- the center tap always, the crest tap only inside dilation
 // zones -- and the resolve output is fetched only where a revocation could be
@@ -104,8 +109,8 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
     // never be touched (see the header).
     if (taaUseMotionField < 0.5)
     {
-        float2 centerVelocity = tex2Dlod(velocityTex, float4(pixel.snappedUV, 0.0, 0.0)).rg;
-        float  centerDepth    = tex2Dlod(depthTex,    float4(pixel.snappedUV, 0.0, 0.0)).r;
+        float2 centerVelocity = ScrubF2(tex2Dlod(velocityTex, float4(pixel.snappedUV, 0.0, 0.0)).rg, float2(0.0, 0.0));
+        float  centerDepth    = ScrubF(tex2Dlod(depthTex,    float4(pixel.snappedUV, 0.0, 0.0)).r, 0.0);
         return float4(centerVelocity, centerDepth, 0.0);
     }
 
@@ -125,7 +130,7 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
     SurfaceEdgeState edge = AnalyzeSurfaceEdgesCore(depths, (taaUseDepthDilation > 0.5));
 
     // The center velocity is always stored.
-    float2 centerVelocity = tex2Dlod(velocityTex, float4(pixel.snappedUV, 0.0, 0.0)).rg;
+    float2 centerVelocity = ScrubF2(tex2Dlod(velocityTex, float4(pixel.snappedUV, 0.0, 0.0)).rg, float2(0.0, 0.0));
 
     if (edge.isDilationZone)
     {
@@ -156,17 +161,17 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
             // (the center always was the background layer; the dilation only
             // borrowed the crest's values). The resolve re-projected with
             // exactly these values after revoking.
-            return float4(centerVelocity, depths[0], 0.0);
+            return float4(centerVelocity, ScrubF(depths[0], 0.0), 0.0);
         }
 
         // Kept candidate: the crest's raw sample -- the anchor.
-        float2 crestVelocity = tex2Dlod(velocityTex, float4(closestUV, 0.0, 0.0)).rg;
-        return float4(crestVelocity, closestDepth, 2.0);
+        float2 crestVelocity = ScrubF2(tex2Dlod(velocityTex, float4(closestUV, 0.0, 0.0)).rg, float2(0.0, 0.0));
+        return float4(crestVelocity, ScrubF(closestDepth, 0.0), 2.0);
     }
 
     // Flat / foreground edge: the raw center sample (the landing re-classifies
     // and re-resolves with its own phase; no pre-resolution needed here).
-    return float4(centerVelocity, depths[0], edge.isForegroundEdge ? 1.0 : 0.0);
+    return float4(centerVelocity, ScrubF(depths[0], 0.0), edge.isForegroundEdge ? 1.0 : 0.0);
 }
 
 PFXVertToPix mainV(PFXVert IN) { return processPostFxVert(IN); }

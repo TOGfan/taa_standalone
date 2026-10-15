@@ -3,8 +3,8 @@ local M = {}
 -- Every scenetree object this module owns. M.destroy() removes them ALL so
 -- M.build() always constructs the chain fresh from the CURRENT files. A
 -- persistent ShaderData object left behind by an older mod version can keep
--- serving a stale compiled shader (setShaderConst on constants that no longer
--- exist in the running binary silently no-ops).
+-- serving a stale compiled shader (setShaderConst on constants that no
+-- longer exist in the running binary silently no-ops).
 local ownedObjects = {
     -- PostEffects first (they reference the shaders/stateblocks below)
     "TAA_StoreMotionFx",
@@ -37,15 +37,26 @@ local function getOrCreateStateBlock(objName, setupSamplers)
     return obj
 end
 
-local function getOrCreateShader(objName, path)
+-- ALWAYS recreate, and stamp the rev as a DEFINE. The define is the
+-- load-bearing piece: every compiled-shader cache in this engine family
+-- (the in-memory manager, the disk caches, the DX12 PSO cache) keys on
+-- path + MACRO SET, so a changed define forces a fresh compile of the
+-- current file even when every path and object name is unchanged. The
+-- delete-then-create covers the SimObject's own compiled-binary holder.
+-- An unreferenced macro changes no cbuffer and no codegen -- key only.
+-- (One-time verification that the `defines` field is live on this engine
+-- build: point a probe ShaderData at the resolve with defines =
+-- "kEpsilon=### invalid ###" -- a compile error in the log proves it
+-- reaches the preprocessor.)
+local function getOrCreateShader(objName, path, revDefine)
     local obj = scenetree.findObject(objName)
-    if not obj then
-        obj = createObject("ShaderData")
-        obj.DXVertexShaderFile = path
-        obj.DXPixelShaderFile = path
-        obj.pixVersion = 5.0
-        obj:registerObject(objName)
-    end
+    if obj then obj:delete() end
+    obj = createObject("ShaderData")
+    obj.DXVertexShaderFile = path
+    obj.DXPixelShaderFile = path
+    obj.pixVersion = 5.0
+    if revDefine then obj.defines = revDefine end
+    obj:registerObject(objName)
     return obj
 end
 
@@ -60,6 +71,7 @@ end
 --   prev2Yaw/prev2Pitch are likewise passed NEGATED: RotationFlowUV uses the
 --   same (mirrored) convention as basis(), so -angles yields the true t-2
 --   content shift, matching the sense of the two bases above.
+--
 -- setFrameState no-op detection: when the camera state is bit-identical
 -- frame to frame (paused, menus, orbit-static, jitter disabled) the ~30
 -- named setShaderConst calls are skipped entirely; under active jitter every
@@ -88,9 +100,9 @@ function M.setFrameState(tanX, tanY, yaw, pitch, prevYaw, prevPitch, prev2Yaw, p
     pre:setShaderConst("$taaTanHalfFovX", tanX)
     pre:setShaderConst("$taaTanHalfFovY", tanY)
     -- The t-2 jitter rotation pre-evaluated on the CPU: the angles are
-    -- per-draw uniforms; the shader's per-pixel sin/cos of them was 4 wasted
-    -- transcendentals per pixel. The negation convention is preserved
-    -- exactly (sin/cos OF the already-negated angle).
+    -- per-draw uniforms; the shader would otherwise pay 4 transcendentals
+    -- per pixel. The negation convention is preserved exactly (sin/cos OF
+    -- the already-negated angle).
     local p2y = -(prev2Yaw or 0.0)
     local p2p = -(prev2Pitch or 0.0)
     pre:setShaderConst("$taaJitPrev2YawSin",   math.sin(p2y))
@@ -149,16 +161,15 @@ function M.destroy()
     end
 end
 
-function M.build()
-    -- Ensure clean recreation so changes to slots, children or shader files
-    -- never leave a stale object behind.
+function M.build(shaderKey)
+    -- Clean recreation so changes to slots, children or shader files never
+    -- leave a stale object behind.
     M.destroy()
 
-        getOrCreateStateBlock("TAA_StateBlock", function(sb)
+    getOrCreateStateBlock("TAA_StateBlock", function(sb)
         -- Linear for sceneTex: every main-path fetch sits on an exact texel
         -- center (bilinear returns the exact texel there), while the FXAA
-        -- fallback samples at sub-texel positions and needs real filtering to
-        -- function as FXAA.
+        -- fallback samples at sub-texel positions and needs real filtering.
         sb:setField("samplerStates", 0, "SamplerClampLinear")   -- 0: sceneTex
         sb:setField("samplerStates", 1, "SamplerClampPoint")    -- 1: depthTex
         sb:setField("samplerStates", 2, "SamplerClampLinear")   -- 2: historyTex (fused Kaiser tap needs it)
@@ -191,10 +202,11 @@ function M.build()
         sb:setField("samplerStates", 2, "SamplerClampPoint")    -- 2: resolveOutputTex
     end)
 
-    getOrCreateShader("TAA_Resolve_ShaderData", "shaders/common/postFx/taa/taa.fx.hlsl")
-    getOrCreateShader("TAA_Copy_ShaderData", "shaders/common/postFx/taa/taaCopy.fx.hlsl")
-    getOrCreateShader("TAA_Motion_ShaderData", "shaders/common/postFx/taa/taaMotion.fx.hlsl")
-    getOrCreateShader("TAA_Final_ShaderData", "shaders/common/postFx/taa/taaFinal.fx.hlsl")
+    local revDefine = "TAA_REV_" .. tostring(shaderKey or "unknown"):gsub("%.", "_")
+    getOrCreateShader("TAA_Resolve_ShaderData", "shaders/common/postFx/taa/taa.fx.hlsl", revDefine)
+    getOrCreateShader("TAA_Copy_ShaderData", "shaders/common/postFx/taa/taaCopy.fx.hlsl", revDefine)
+    getOrCreateShader("TAA_Motion_ShaderData", "shaders/common/postFx/taa/taaMotion.fx.hlsl", revDefine)
+    getOrCreateShader("TAA_Final_ShaderData", "shaders/common/postFx/taa/taaFinal.fx.hlsl", revDefine)
 
     -- ------------------------------------------------------------------
     -- Resolve pass (root effect): scene + depth + history + velocity +
@@ -234,7 +246,7 @@ function M.build()
     taaPreFx:setField("targetClear", 0, "PFXTargetClear_None")
 
     -- ------------------------------------------------------------------
-    -- Final pass (debug view rendering / auto-parity / manual sharpening):
+    -- Final pass (debug view rendering / manual sharpening):
     -- #TAA_Result -> $backBuffer. MUST be a CHILD of the resolve pass:
     -- children execute immediately after their parent, inside the parent's
     -- pass, i.e. strictly after #TAA_Result is written and before anything
@@ -306,10 +318,12 @@ end
 -- The gate's sampling law is F(3, nu), nu = the record's effective dof
 -- (Satterthwaite; taaClip.h.hlsl): nu = 1 / [D/nu0 + varFrac(r)(1-D)] with
 -- D = (1-rho)^{2t} and varFrac(r) = rho / (r (2-rho)), r = the ingest's
--- chi^2 dof. The variance inflation restoring the NOMINAL chi^2-coverage is
+-- chi^2 dof (= 1.0: the record ingests the pixel's own squared innovation,
+-- a single squared Gaussian). The converged limit is nu_inf = (2-rho)/rho
+-- = 12.33. The variance inflation restoring the NOMINAL chi^2 coverage is
 --     S(nu) = 3 * F^-1_{3,nu}(p) / chi^2,   p = CDF_chi2_3(chi^2),
--- a function of the slider: S(4) is 1.18 at chi = 1.5 and 2.52 at 2.8 --
--- a fixed constant cannot serve both. The host fits (v5.6.3) a PADE (2,1)
+-- a function of the coverage slider (S(4) is 1.18 at chi = 1.5 and 2.52 at
+-- 2.8 -- a fixed constant cannot serve both). The host fits a PADE (2,1)
 -- RATIONAL in x = 1/nu,
 --     S(nu) = (1 + A*x + B*x^2) / (1 + C*x),
 -- by weighted least squares over a dense anchor set -- the relation is
@@ -317,35 +331,19 @@ end
 -- S - 1), so the fit is a closed 3x3 normal-equations solve. The anchor
 -- weights concentrate on the operative points (the Satterthwaite clamp
 -- floor nu = 2, the young record nu0, the converged nu_inf) and densify
--- the steep low-nu end, where S rises ~3x between nu = 4 and nu = 2: the
--- old 3-anchor cubic in 1/nu was exact at its anchors but wobbled a few
--- percent between them there. The rational extrapolates benignly above
--- nu_inf (S -> 1 + (A-C)/nu). Eight quantiles per fit (~2.7x the cubic's
--- three; still one cached fit per distinct chi -- a coverage-slider drag
--- stays interactive).
+-- the steep low-nu end, where S rises ~3x between nu = 4 and nu = 2.
+-- Eight quantiles per fit; one cached fit per distinct chi (a
+-- coverage-slider drag stays interactive).
 --
--- v5.2 (dof corrected): the record ingests the pixel's own squared
--- innovation -- a single squared Gaussian, chi^2_1 -- so the honest ingest
--- dof is r = 1.0 and the converged limit is nu_inf = (2-rho)/rho = 12.33.
--- v4.1's r = 0.5 was the relative-variance INVERSE (1/2), half the dof:
--- the varFrac convention's r counts chi^2 dof (a chi^2_r/r-scaled estimate
--- has relative variance 2/r; the EMA's Satterthwaite reciprocal dof is
--- rho/(r (2-rho))), so the corrected fit tightens the aged gate ~15% in
--- radius and the arming cap ~26%, coverage-neutrally (the fit re-solves S
--- at the exact F quantile). The historical r = 6 (the v3.8.4 spatial
--- estimator, ~6 quasi-independent taps) was honest in the same convention:
--- nu_inf = 74 for THAT estimator.
---
--- The F(3,nu) law itself formally assumes one shared chi^2 denominator
--- across the three channels; the per-channel estimates share the same
--- taps, so the law is exact for gray/near-gray content and mildly
--- approximate for decorrelated RGB (second-order next to the dof
--- modeling).
+-- The F(3,nu) law formally assumes one shared chi^2 denominator across the
+-- three channels; the per-channel estimates share the same taps, so the
+-- law is exact for gray/near-gray content and mildly approximate for
+-- decorrelated RGB (second-order next to the dof modeling).
 --
 -- MUST MATCH taaClip.h.hlsl: kClipSigmaEmaRate (rho), kClipStudentPriorDof
--- (nu0), kRecordIngestDof (the ingest dof, 1.0) and the Student
--- CONSUMPTION FORM (the Pade (2,1) rational in 1/nu: A, B the numerator's
--- x / x^2 coefficients, C the denominator's x coefficient).
+-- (nu0), kRecordIngestDof, and the CONSUMPTION FORM (the Pade (2,1)
+-- rational in 1/nu: A, B the numerator's x / x^2 coefficients, C the
+-- denominator's x coefficient).
 -- ============================================================================
 local STUDENT_RHO   = 0.15                              -- kClipSigmaEmaRate
 local STUDENT_NU0   = 4.0                               -- kClipStudentPriorDof
@@ -384,12 +382,9 @@ local function f3nuQuantile(p, nu)
     -- u = 3q / (3q + nu). The Simpson NORMALIZER is constant per b -- hoisted
     -- out of the bisection. 128 intervals carry ~2e-7 absolute CDF error and
     -- 32 bisection steps resolve u to 2^-32: both far beneath the tail rates
-    -- that matter here (the coverage fit consumes p = 0.95-ish and the
-    -- cold-gate side p = 1e-2), and ~6x cheaper per fit than the 512/48 grid
-    -- this used to run -- every varianceGamma / clipOvershoot change refits,
-    -- including each tick of a coverage-slider drag. Do NOT replace these
-    -- quantiles with asymptotic power-law estimates -- they disagree with
-    -- the exact values by multiples in the F(3, small-nu) tail.
+    -- that matter here. Do NOT replace these quantiles with asymptotic
+    -- power-law estimates -- they disagree with the exact values by
+    -- multiples in the F(3, small-nu) tail.
     local b = nu * 0.5
     local invNorm = 1.0 / beta15PdfSimpson(1.0, 128, b - 1.0)
     local lo, hi = 0.0, 1.0
@@ -402,11 +397,9 @@ local function f3nuQuantile(p, nu)
     return nu * u / (3.0 * (1.0 - u))
 end
 
--- Small exact-key table cache (capped, like kernelChainCache): a
--- coverage-slider drag emits a stream of distinct chis -- one CHEAP refit
--- per tick now -- and back-and-forth drags, preset applications and
--- rebuild() re-hit instead of refitting. The old single-entry cache
--- refitted on every distinct chi both directions.
+-- Small exact-key table cache: a coverage-slider drag emits a stream of
+-- distinct chis (one cheap refit per tick), and back-and-forth drags,
+-- preset applications and rebuild() re-hit instead of refitting.
 local studentFitCache = {}
 local studentFitCacheCount = 0
 
@@ -419,17 +412,10 @@ local function studentFitABC(chi)
     local c2 = chi * chi
     local p = math.min(math.max(chiSq3Cdf(c2), 1e-6), 1.0 - 1e-6)
 
-    -- (v5.6.3) Pade (2,1) rational in x = 1/nu, weighted least squares
-    -- over a dense anchor set: S(x) = (1 + A*x + B*x^2) / (1 + C*x). The
-    -- relation is LINEAR in (A, B, C) after multiplying through --
-    -- A*x + B*x^2 - S*C*x = S - 1 -- so the fit is a closed 3x3 normal-
-    -- equations solve. Anchor weights concentrate on the operative
-    -- points (the Satterthwaite clamp floor nu = 2, the young record
-    -- nu0, the converged nu_inf) and densify the steep low-nu end (S
-    -- rises ~3x between nu = 4 and nu = 2): the old 3-anchor cubic was
-    -- exact at its anchors but wobbled a few percent between them there.
-    -- Eight quantiles per fit (~2.7x the cubic's three; still one cached
-    -- fit per distinct chi -- a coverage-slider drag stays interactive).
+    -- Weighted least squares of S(x) = (1 + A*x + B*x^2) / (1 + C*x) over
+    -- the anchor set. Linear in (A, B, C) after multiplying through
+    -- (A*x + B*x^2 - S*C*x = S - 1): a closed 3x3 normal-equations solve
+    -- (Gaussian elimination + back-substitution below).
     local anchors = {
         { 2.0,           8.0 },   -- the Satterthwaite clamp floor (pile-up)
         { 2.5,           2.0 },
@@ -469,10 +455,10 @@ local function studentFitABC(chi)
     local B = (n[2][4] - n[2][3] * C) / n[2][2]
     local A = (n[1][4] - n[1][3] * C - n[1][2] * B) / n[1][1]
 
-    -- Denominator safety: 1 + C*x must stay comfortably positive over
-    -- the shader's whole nu range (x = 1/nu in [0, 0.5]; nu >= 2
-    -- everywhere). A sane fit never approaches the pole; the clamp plus
-    -- the fixed-C 2x2 refit guard the pathological case only.
+    -- Denominator safety: 1 + C*x must stay comfortably positive over the
+    -- shader's whole nu range (x = 1/nu in [0, 0.5]; nu >= 2 everywhere).
+    -- A sane fit never approaches the pole; the clamp plus the fixed-C 2x2
+    -- refit guard the pathological case only.
     if C > 1.5 or C < -6.0 then
         C = math.min(math.max(C, -6.0), 1.5)
         local m11, m12, m22 = 0.0, 0.0, 0.0
@@ -511,23 +497,17 @@ end
 -- variance estimate against its prior:
 --     cap(nu) = chi^2_nu(0.999) / nu
 -- fit as 1 + A/sqrt(nu) + B/nu, solved exactly at the record's dof
--- trajectory endpoints (nu0 = 4 at age 0, nu_inf = 12.33 converged -- the
--- v5.2 corrected ingest dof; the aged record at kClipMaxAge sits at
--- nu ~ 12.1, essentially converged):
---     chi^2_4(0.999)      = 18.467  (the closed-form CDF 1 - e^{-x/2}(1+x/2),
---                                    inverted by bisection)  -> 4.6168
---     chi^2_12.33(0.999) ~ 33.4     (Wilson-Hilferty; ~0.1% there) -> 2.71
--- -> A ~ 4.35, B ~ 5.77. The rational form tracks the exact quantiles to
--- better than 1% across [4, 12.33] (checked against the exact chi^2_10
--- quantile: 2.951 vs 2.959). A rising variance never binds the cap -- the
--- record lags below the current prior -- and the falling case is exactly
--- the band-carryover fiction the cap exists to bound, where the honest
--- quantile is the right threshold.
+-- trajectory endpoints (nu0 = 4 at age 0, nu_inf = 12.33 converged):
+--     chi^2_4(0.999)      = 18.467 (closed-form CDF, bisection) -> 4.6168
+--     chi^2_12.33(0.999) ~ 33.4   (Wilson-Hilferty)            -> 2.71
+-- The rational tracks the exact quantiles to better than 1% across
+-- [4, 12.33]. The cap anchors at CONTENT scale by design: it is the
+-- stale-high guard, and a record-anchored bound is vacuous.
 -- MUST MATCH taaClip.h.hlsl's consumption (taaArmingA / taaArmingB).
 -- ============================================================================
 local function normQuantile(p)
     -- Acklam's rational approximation to the inverse standard normal CDF
-    -- (|eps| < 1.15e-9) -- the one piece of numerics the WH anchor needs.
+    -- (|eps| < 1.15e-9).
     local a = { -3.969683028665376e+01,  2.209460984245205e+02, -2.759285104469687e+02,
                  1.383577518672690e+02, -3.066479806614716e+01,  2.506628277459239e+00 }
     local b = { -5.447609879822406e+01,  1.615858368580409e+02, -1.556989798598866e+02,
@@ -555,8 +535,6 @@ end
 
 local function chiSq4Quantile(p)
     -- exact: the nu=4 CDF is 1 - e^{-x/2}(1 + x/2) -- closed-form bisection.
-    -- (Only valid at nu = 4 = STUDENT_NU0, the young-record anchor; the
-    -- nu=4 closed form is why the anchor choice is also the convenient one.)
     local lo, hi = 0.0, 64.0
     for _ = 1, 48 do
         local mid = 0.5 * (lo + hi)
@@ -583,7 +561,7 @@ end
 local ARMING_A, ARMING_B = studentArmingFit()
 
 -- ============================================================================
--- JITTER PHASE COVARIANCE (v3.8.4: the FULL 2x2, per-axis and cross)
+-- JITTER PHASE COVARIANCE (the full 2x2, per-axis and cross)
 -- ----------------------------------------------------------------------------
 -- Var[u_x], Var[u_y], Cov[u_x, u_y] of the ACTUAL jitter sequence, in
 -- texels^2 -- CENTERED on the sequence mean. The innovation's phase bit is
@@ -595,10 +573,9 @@ local ARMING_A, ARMING_B = studentArmingFit()
 -- (a centered covariance is PSD by construction, so Q >= 0 everywhere).
 -- Enumerating the exact sequence (the same halton/r2 code, periods and
 -- centering as the camera hook) makes the coefficients exact for the
--- configured sequence and scale.
--- With jitter disabled the energies are exactly ZERO -- tiny positive
--- sentinels so the shader's "constant provided" gate engages the exact
--- (noise-only) seed.
+-- configured sequence and scale. With jitter disabled the energies are
+-- tiny positive sentinels so the shader's "constant provided" gate
+-- engages the exact (noise-only) seed.
 -- ============================================================================
 local function halton(index, base)
     local f, r, i = 1.0, 0.0, index
@@ -657,23 +634,16 @@ end
 --   * whiteLoss: 1 - w, w = the white-input read gain (E_f[sum k^2])^2 --
 --     the fresh current-frame content enters the accumulator white across
 --     texels, so the fresh-x term of the recursion carries w, not 1.
+--   * accFactor: (Dbar + 1 - 2*kappa)/Dbar, the accumulated components'
+--     noise structure (see kernelChainConstants).
 --
--- (v5.6 cleanup: the flip-response gain and the accumulated-noise share --
--- the CUSUM-era variance models' inputs -- are gone with their shader
--- constants; the flat model's VarH recursion is closed-form from the record
--- and these two gains. The worst-coverage-bin flip enumeration this block
--- used to run was pure dead work: several milliseconds of Lua on every
--- settings tick, feeding a constant the cbuffer no longer declares.)
---
--- KERNEL CONTRACT (v3.8: the ACTUAL kernels, no longer a proxy): the
--- resolve's history resample is a SEPARABLE per-axis windowed sinc --
--- logical taps n = -2..3, radius 3, Kaiser beta 5.2 (kKaiserBeta6Tap) for
--- the 6-tap tier, n = -1..2, radius 2, beta 3.2 (kKaiserBeta4Tap) for the
--- 4-tap tier -- selected by useKaiser6. MUST MATCH taaResample.h.hlsl; the
--- resulting constants are logged at startup for cross-checking. (The old
--- model -- a radial beta-2.5 disc over |o|^2 <= 5 -- violated this contract
--- by form, beta and radius, and never switched tiers.) The 21-tap fetch
--- pattern's corner skip is ~0.08% of the kernel mass and is not modeled.
+-- KERNEL CONTRACT: the resolve's history resample is a SEPARABLE per-axis
+-- windowed sinc -- logical taps n = -2..3, radius 3, Kaiser beta 5.2
+-- (kKaiserBeta6Tap) for the 6-tap tier, n = -1..2, radius 2, beta 3.2
+-- (kKaiserBeta4Tap) for the 4-tap tier -- selected by useKaiser6. MUST
+-- MATCH taaResample.h.hlsl; the constants are logged at startup for
+-- cross-checking. The 21-tap fetch pattern's corner skip is ~0.08% of the
+-- kernel mass and is not modeled in the spectral chain.
 -- ============================================================================
 local KAISER6_BETA   = 5.2    -- kKaiserBeta6Tap
 local KAISER6_RADIUS = 3.0
@@ -704,8 +674,7 @@ local function kaiser1DTap(n, phase, beta, radius)
 end
 
 -- ============================================================================
--- THE RESAMPLE KERNEL'S ACCUMULATION CHAIN (v3.9: the spectral fixed point,
--- not the one-step proxy)
+-- THE RESAMPLE KERNEL'S ACCUMULATION CHAIN (the spectral fixed point)
 -- ----------------------------------------------------------------------------
 -- varH means Var(READ) -- the Kaiser-resampled history that the gate and the
 -- detector actually test. Three constants, all measured on the ACTUAL per-tier
@@ -713,8 +682,7 @@ end
 --   * w (whiteGain)  = (E_f[sum_n k(n,f)^2])^2: the read gain against WHITE
 --     input. The fresh current-frame content enters the accumulator white
 --     across texels, so the recursion's fresh-x term carries w. Parseval:
---     the per-axis w1D is also the frequency-mean of Kbar^2 -- a built-in
---     consistency check on the grid below.
+--     the per-axis w1D is also the frequency-mean of Kbar^2.
 --   * D (readGain)   = Vr/Vs at the accumulation's fixed point. With random
 --     per-frame phases (the R2/Halton jitter), the stored SPECTRUM obeys
 --         S'(w) = (1-a)^2 Kbar^2(w) S(w) + a^2 Var(x),
@@ -727,6 +695,22 @@ end
 --         Vs (stored) = a^2 sum_k b^k m_k^2
 --         Vr (read)   = a^2 sum_k b^k m_{k+1}^2
 --     and D = Vr/Vs.
+--
+-- THE ACCUMULATED-NOISE STRUCTURE: the soft clip's accumulated components
+-- price Var(Kaiser-read of the stored field - center texel) at the spectral
+-- fixed point. The 2D noise spectrum is S2D = a^2/(1 - b*Kx2*Ky2); expanding
+-- the geometric series, its autocovariance is R2D(x,y) = sum_k b^k * cx_k(x)
+-- * cx_k(y) with cx_k = IDFT(Kbar^{2k}) (the a^2 is a common factor and
+-- cancels in the normalized r2D). From r2D = R2D/R2D(0,0):
+--   kappa = E_phase[ sum_nm c_nm r2D(n, m) ]       (read-vs-texel cov)
+--   Dbar  = E_phase[ sum c c' r2D(n-n', m-m') ]    (read var/texel var)
+-- both from the ACTUAL per-phase logical 2D coefficients (the 6-tap tier's
+-- corner skip included), so Cauchy-Schwarz holds between them and the
+-- factor (Dbar + 1 - 2*kappa)/Dbar is >= 0 by construction. The shader
+-- consumes it as taaAccNoiseFactor (clamped [0.02, 4]). Built-in
+-- consistency: R2D(0,0) = sum_k b^k m_k^2 = the moment series' vsSum
+-- (different summation order -- a small float drift is expected, a large
+-- one is a bug and warns).
 -- ============================================================================
 local kernelChainCache = {}
 local kernelChainCacheCount = 0
@@ -818,22 +802,8 @@ local function kernelChainConstants(beta, radius, a)
     local readGain  = vr / math.max(vs, 1e-12)
     local noiseAcc  = vr
 
-    -- (v5.6.6 ITEM 3) THE ACCUMULATED-NOISE STRUCTURE: the soft clip's
-    -- accumulated components price Var(Kaiser-read of the stored field -
-    -- center texel) at the spectral fixed point. The 2D noise spectrum is
-    -- S2D = a^2/(1 - b*Kx2*Ky2); expanding the geometric series, its
-    -- autocovariance is R2D(x,y) = sum_k b^k * cx_k(x) * cx_k(y) with
-    -- cx_k = IDFT(Kbar^{2k}) (the a^2 is a common factor and cancels in
-    -- the normalized r2D). From r2D = R2D/R2D(0,0):
-    --   kappa = E_phase[ sum_nm c_nm r2D(n, m) ]       (read-vs-texel cov)
-    --   Dbar  = E_phase[ sum c c' r2D(n-n', m-m') ]    (read var/texel var)
-    -- both from the ACTUAL per-phase logical 2D coefficients (the 6-tap
-    -- tier's corner skip included), so Cauchy-Schwarz holds between them
-    -- and the factor (Dbar + 1 - 2*kappa)/Dbar is >= 0 by construction.
-    -- The shader consumes it as taaAccNoiseFactor (clamped [0.02, 4]).
-    -- Built-in consistency: R2D(0,0) = sum_k b^k m_k^2 = the moment
-    -- series' vsSum (different summation order -- a small float drift is
-    -- expected, a large one is a bug and warns).
+    -- THE ACCUMULATED-NOISE STRUCTURE (r2D / kappa / Dbar -- see the block
+    -- header above). The r2d grid spans +-maxOff in integer texel offsets.
     local maxOff = hi - lo
     local nOff = 2 * maxOff + 1
     local skipCorners = (radius >= 3.0)   -- the 21-tap's four skipped corners
@@ -929,8 +899,8 @@ local function varhHostConstants()
                               tonumber(s.feedbackMax) or 0.97)
     a = math.min(math.max(a, 0.001), 0.9)
 
-    -- v3.9: the VarH chain's gains from the accumulation's spectral fixed
-    -- point, per resample tier (kernelChainConstants).
+    -- The VarH chain's gains from the accumulation's spectral fixed point,
+    -- per resample tier (kernelChainConstants).
     local use6 = ((tonumber(s.useKaiser6) or 1.0) > 0.5)
     local whiteGain, readGain, _, accFactorIn = kernelChainConstants(
         use6 and KAISER6_BETA  or KAISER4_BETA,
@@ -949,20 +919,14 @@ local varhConstantsLogged = false
 -- Defaults: the single source of truth for every setting. M.settings is a
 -- working copy that applySettings/user input mutate. When the settings
 -- file's version changes, ge/extensions/taa.lua calls M.resetSettings() to
--- rebuild this copy -- merging would keep stale keys from settings that were
--- renamed or removed in newer versions.
--- v5.2: lumaDrift* and clipDistanceRejection* are RETIRED -- every surviving
--- action is now either the posterior mean (the gate / the soft clip) or the
--- confirmed corrector; slow luma drift is a persistent offset and is the
--- corrector's business.
--- v5.6: the CUSUM-era and drift-era keys are retired WITH their shader
--- constants (the flat model closed the VarH recursion; the corrector and
--- the ghost detector are gone): clipGhostReset, driftCompensation,
--- driftMaxGain, jitterFlickerPadding, jitterFlickerFade,
--- directionalVariance and clipScopedMu no longer exist anywhere in the
--- chain. setShaderConst for a constant absent from the cbuffer silently
--- no-ops, so old settings files still carrying these keys are inert; the
--- UI strips unknown keys on load.
+-- rebuild this copy -- merging would keep stale keys from settings that
+-- were renamed or removed.
+-- RETIRED KEYS: lumaDrift*, clipDistanceRejection*, the CUSUM-era and
+-- drift-era keys (clipGhostReset, driftCompensation, driftMaxGain,
+-- jitterFlickerPadding, jitterFlickerFade, directionalVariance,
+-- clipScopedMu) no longer exist anywhere in the chain. setShaderConst for a
+-- constant absent from the cbuffer silently no-ops, so old settings files
+-- still carrying these keys are inert; the UI strips unknown keys on load.
 M.defaultSettings = {
     useJitter                     = true,
     useR2Jitter                   = true,
@@ -973,20 +937,19 @@ M.defaultSettings = {
     -- coverages below are actually true now). Below ~2.2 legit sub-texel
     -- content is under-covered. 2.2 = 82%, 2.8 = 95%.
     varianceGamma                 = 2.5003,
-    -- The posterior-mean soft clip's ENABLE. ON by default since v3.2: with
-    -- the empirical spatial-marginal alternative and the sequential prior
-    -- the action is the exact posterior mean -- the graded pull is where
-    -- the remaining flicker:ghost headroom lives (the hard ellipsoid is the
+    -- The posterior-mean soft clip's ENABLE. ON by default: with the
+    -- empirical spatial-marginal alternative and the sequential prior the
+    -- action is the exact posterior mean -- the graded pull is where the
+    -- remaining flicker:ghost headroom lives (the hard ellipsoid is the
     -- minimax action and overpays on marginal pixels).
     -- 0 = the pure hard ellipsoid (the A/B baseline).
     softClip                      = 1.0,
     chromaVarianceMod             = 1.0,
     depthRejection                = 0.05,
-    -- v3.8: 5.0 was pure safety margin -- the comparison is exactly
-    -- de-jittered and the landing's velocity is the exact stored effective
-    -- velocity, so 1.5 is the documented conservative point. Tighten toward
-    -- ~0.5 while watching DEBUG MODE 2 (static scene: R dark, B only
-    -- wobbles; G only on true reveals) and 7.
+    -- The comparison is exactly de-jittered and the landing's velocity is
+    -- the exact stored effective velocity, so 1.5 is the documented
+    -- conservative point. Tighten toward ~0.5 while watching DEBUG MODE 2
+    -- (static scene: R dark, B only wobbles; G only on true reveals) and 7.
     velRejection                  = 1.5,
     velGradientScale              = 1.0,
     crossTestStrength             = 0.35,
@@ -998,8 +961,8 @@ M.defaultSettings = {
     -- Gates the resolve's stored-field analysis (dilation validation, the
     -- depth/velocity disocclusion tests, landing/pursuit). 0 = the resolve
     -- ignores the stored field and disocclusion relies on color clipping
-    -- only. The writer pass itself always runs (it cannot be toggled without
-    -- re-registering it outside the resolve's pass chain).
+    -- only. The writer pass itself always runs (it cannot be toggled
+    -- without re-registering it outside the resolve's pass chain).
     useMotionField                = 1.0,
     lumaVariance                  = 0.0,
     useHullClipping               = 1.0,
@@ -1011,8 +974,8 @@ M.defaultSettings = {
     useKaiser6                    = 1.0,
     historyOvershoot              = 1.0,
     clipOvershoot                 = 0.0,
-    -- (v5.6.7) the clip-excess blend reduction (see taaClip.h.hlsl):
-    -- start/width are in GATE RADII of excess past the boundary.
+    -- The clip-excess blend reduction: start/width are in GATE RADII of
+    -- excess past the boundary.
     clipBlendDrop                 = 0.0,
     clipBlendDropStart            = 0.5,
     clipBlendDropWidth            = 1.0,
@@ -1072,28 +1035,24 @@ function M.applySettings(inputs)
         pre:setShaderConst("$taaStudentA",               studentA)
         pre:setShaderConst("$taaStudentB",               studentB)
         pre:setShaderConst("$taaStudentC",               studentC)
-        -- The arming cap's nu-aware fit (see the ARMING CAP FIT block): the
-        -- exact chi^2_nu(0.999)/nu bound at the record's dof trajectory
-        -- endpoints, consumed as 1 + A/sqrt(nu) + B/nu at the live per-pixel
-        -- nu.
+        -- The arming cap's nu-aware fit: the exact chi^2_nu(0.999)/nu bound
+        -- at the record's dof trajectory endpoints, consumed as
+        -- 1 + A/sqrt(nu) + B/nu at the live per-pixel nu.
         pre:setShaderConst("$taaArmingA",                ARMING_A)
         pre:setShaderConst("$taaArmingB",                ARMING_B)
-        -- The exact-seed phase covariance (v3.8.4: the full quadratic form,
+        -- The exact-seed phase covariance (the full quadratic form,
         -- tracking useJitter / useR2Jitter / jitterScale; CENTERED on the
         -- sequence mean -- the accumulator's phase average).
         local phEx, phEy, phExy = jitterPhaseCovariance()
         pre:setShaderConst("$taaJitterPhaseEx",  phEx)
         pre:setShaderConst("$taaJitterPhaseEy",  phEy)
         pre:setShaderConst("$taaJitterPhaseExy", phExy)
-        -- The VarH transport's two read gains (see varhHostConstants above):
-        -- they track feedbackMax / useKaiser6, so every apply recomputes
-        -- them.
+        -- The VarH transport's two read gains + the accumulated components'
+        -- noise factor: they track feedbackMax / useKaiser6, so every apply
+        -- recomputes them.
         local varhLoss, whiteLoss, accFactor = varhHostConstants()
         pre:setShaderConst("$taaVarhResampleLoss",       varhLoss)
         pre:setShaderConst("$taaVarhWhiteLoss",          whiteLoss)
-        -- (v5.6.6 ITEM 3) the accumulated components' noise factor
-        -- (Dbar + 1 - 2*kappa)/Dbar from the spectral chain -- MUST MATCH
-        -- taaClip.h.hlsl's vComp consumption.
         pre:setShaderConst("$taaAccNoiseFactor",         accFactor)
         if not varhConstantsLogged then
             varhConstantsLogged = true
@@ -1127,8 +1086,8 @@ function M.applySettings(inputs)
         pre:setShaderConst("$taaClipBlendDropWidth",      s.clipBlendDropWidth)
         pre:setShaderConst("$taaMotionBlendStart",        s.motionBlendStart)
         pre:setShaderConst("$taaFallbackFXAA",            s.fallbackFXAA)
-        -- Debug modes no longer rebind the history source: the resolve's RGB
-        -- is always the real blend (views ride the alpha, rendered by
+        -- Debug modes never rebind the history source: the resolve's RGB is
+        -- always the real blend (views ride the alpha, rendered by
         -- TAA_FinalFx), so the accumulation simply keeps running while a
         -- debug mode is active.
     end
@@ -1139,7 +1098,7 @@ function M.applySettings(inputs)
     -- this pass -- its lifecycle is never touched (see build()).
     if mot then
         mot:setShaderConst("$taaUseDepthDilation", s.useDepthDilation)
-        -- Gates the writer's fast path (a 2-fetch write) -- see taaMotion.
+        -- Gates the writer's fast path (a 2-fetch write).
         mot:setShaderConst("$taaUseMotionField", s.useMotionField)
     end
 

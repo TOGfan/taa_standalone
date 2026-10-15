@@ -39,6 +39,43 @@
 
 static const float kEpsilon = 1e-6;
 
+// ============================================================================
+// PORTABLE SCRUBS -- the strict-compare select
+// ----------------------------------------------------------------------------
+// A comparison against NaN is FALSE on every backend (IEEE): the one scrub
+// idiom whose NaN behavior does not depend on min/max semantics. D3D11/D3D12
+// DEFINE min/max (and therefore clamp/saturate) to return the non-NaN
+// operand; the SPIR-V path's FMin/FMax leave the NaN result UNDEFINED and
+// driver-dependent. Never rely on min/max/clamp/saturate as a NaN filter --
+// they are fine for FINITE operands on every backend. +Inf is caught by the
+// same compare; -Inf passes and is handled downstream by the finite-operand
+// clamps (finite-vs-infinite compares ARE defined).
+// NOTE: an Inf RAW scene value must be scrubbed BEFORE Tonemap --
+// Tonemap(Inf) = Inf / (1 + Inf) = NaN on EVERY backend, D3D included.
+// kScrubInf (not kLargeValue): raw scene values may legitimately reach
+// extreme HDR; only non-finites are garbage at the read.
+//
+// PORTABILITY OF THE TERNARY ITSELF: the vector scrubs reduce their
+// condition with all() so every ?: has a SCALAR bool condition. GLSL's
+// ternary (the compileHlslGlsl translation path) permits ONLY scalar
+// conditions -- fxc/DXC additionally accept HLSL's component-wise
+// vector-condition select, so a vector-condition ternary compiles on
+// Windows and hard-fails on Linux. Do NOT follow the GLSL compiler's
+// select() suggestion: select() is SM6.5+ HLSL and absent from the fxc
+// SM5.0 target; all()+?: is valid on every path. Semantics:
+// whole-vector -- ONE non-finite component replaces the entire vector
+// with the fallback (a corrupted tap is garbage, not half-good, and a
+// half-zeroed velocity would point along an axis).
+// ============================================================================
+static const float kScrubInf = 1e30;
+
+float  ScrubF (float  x, float  fallback) { return (x < kScrubInf) ? x : fallback; }
+float2 ScrubF2(float2 v, float2 fallback) { return all(v < float2(kScrubInf, kScrubInf)) ? v : fallback; }
+float3 ScrubF3(float3 v, float3 fallback) { return all(v < float3(kScrubInf, kScrubInf, kScrubInf)) ? v : fallback; }
+
+// Raw scene-tap read guard: NaN/Inf -> 0, negatives floored.
+float3 ScrubRawRGB(float3 c) { return max(ScrubF3(c, float3(0.0, 0.0, 0.0)), float3(0.0, 0.0, 0.0)); }
+
 static const float2 kOffsets3x3[9] =
 {
     float2( 0,  0), float2( 0, -1), float2( 0,  1),
@@ -76,7 +113,7 @@ float2 Bilerp2x2(float2 c00, float2 c10, float2 c01, float2 c11, float2 fraction
 // -- debug colors in RGB would poison the accumulation). The view state
 // rides the alpha instead: the magnitude's only consumers are taaFinal's
 // auto-sharpener (bypassed in debug) and the writer's revocation SIGN (kept
-// genuine). 
+// genuine).
 // Bit layout: 31 = revocation sign; 30..28 = tag 001 (finite,
 // non-subnormal, never NaN/Inf); 27..24 = view code; 23..14 = payload A
 // [0,1] (10 bits); 13..8 = payload B [0,1] (6 bits); 7..6 spare (zero);
@@ -95,13 +132,15 @@ float2 Bilerp2x2(float2 c00, float2 c10, float2 c01, float2 c11, float2 fraction
 // ============================================================================
 static const float kClipSigmaRef = 1.0 / 255.0;   // the clip-state sigma's unit
 
-// 6-bit sigma encoding (v3 transports): 1/4-stop steps over the same range.
-// The estimator's own noise at 9 taps is ~30%; +-9% amplitude quantization
-// is lossless in practice. BOTH transports use these -- one encoding, two
-// packings, exact debug round-trip. Code 0 = cold.
+// 6-bit sigma encoding: 1/4-stop steps over the same range. The estimator's
+// own noise at 9 taps is ~30%; +-9% amplitude quantization is lossless in
+// practice. BOTH transports use these -- one encoding, two packings, exact
+// debug round-trip. Code 0 = cold. Total: NaN would survive max()/clamp()
+// off D3D and reach uint() in the packers (f2u of NaN is UB everywhere).
 float ClipPackSigmaCode(float s)
 {
-    return clamp((log2(max(s, 1e-6) / kClipSigmaRef) + 8.0) * 4.0, 0.0, 63.0);
+    s = ScrubF(max(s, 1e-6), 1e-6);
+    return clamp((log2(s / kClipSigmaRef) + 8.0) * 4.0, 0.0, 63.0);
 }
 
 float ClipUnpackSigmaCode(uint code)
@@ -109,11 +148,15 @@ float ClipUnpackSigmaCode(uint code)
     return kClipSigmaRef * exp2(code * 0.25 - 8.0);
 }
 
-// v3 debug payload: [31] sign (genuine), [30:28] tag 001, [27:24] view code,
+// Debug payload: [31] sign (genuine), [30:28] tag 001, [27:24] view code,
 // [23:14] payload A, [13:8] payload B, [7:6] spare, [5:0] sigma (6-bit,
 // shared encoding -- the record chain runs uninterrupted through debug).
+// Total: every uint() operand is scrubbed to its field's range first.
 float PackDebugAlpha(bool revoked, float code, float a, float b, float sigma)
 {
+    code = min(ScrubF(max(code, 0.0), 0.0), 15.0);
+    a    = min(ScrubF(max(a, 0.0), 0.0), 1.0);
+    b    = min(ScrubF(max(b, 0.0), 0.0), 1.0);
     uint u = 0x10000000u
            | ((uint(code + 0.5) & 0xFu)        << 24)
            | ((uint(a * 1023.0 + 0.5) & 0x3FFu) << 14)
@@ -129,10 +172,6 @@ void UnpackDebugAlpha(float alpha, out uint code, out float a, out float b)
     a    = (float)((u >> 14) & 0x3FFu) * (1.0 / 1023.0);
     b    = (float)((u >> 8) & 0x3Fu) * (1.0 / 63.0);
 }
-
-
-
-
 
 // ============================================================================
 // VIEWPORT & PIXEL GEOMETRY

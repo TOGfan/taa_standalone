@@ -16,37 +16,29 @@
 //   7-10)  exact jitter plumbing, the own-history dilation validation, the
 //          history landing analysis, the depth/velocity disocclusion tests.
 //          [GEOMETRY]
-//   11)    THE FLAT MODEL (taaClip v5.6): the robust coupled-plane
-//          statistics with the exact hat-matrix bookkeeping, the H-free
-//          record, the structure split's transport, the level gate (the
-//          hierarchical posterior + the measured-miss soft clip), the
-//          blend, the VarH recursion.
+//   11)    THE FLAT MODEL (taaClip): the robust coupled-plane statistics
+//          with the exact hat-matrix bookkeeping, the H-free record, the
+//          structure split's transport, the level gate (the hierarchical
+//          posterior + the measured-miss soft clip), the blend, the VarH
+//          recursion.
 //
 // OUTPUT: RGB = the resolved color. A = the packed CLIP STATE (tag 101).
-// Debug modes carry tag 001.
+// Debug modes carry tag 001. Nothing non-finite is ever written (the
+// write-side guard) -- a NaN frame would otherwise be feedback-locked and
+// neighbor-visible through the resample footprint forever.
 //
 // DEBUG MODES: 0 off | 1 frame motion | 2 disocclusion breakdown |
 //   3 center velocity | 4 linearized depth | 5 history color | 6 landing
 //   velocity | 7 pursuit divergence | 8 layer state | 9 dilation gate |
 //   10 alignment drop | 11 clip gate state | 12 dejittered residual |
-//   13 gate null law (calibration: dbgA = saturate(mdd/16)).
+//   13 gate null law (calibration) | 14 deployment canary.
 //
-// v5.6.2 (depth-disocclusion exactness): the dilation-validation gate's
-//   expected-crest depth now carries the fitted T_y (w' = w*B + T_y composed
-//   with the rotation-exact raw form). The layer's forward displacement is
-//   fitted BEFORE the gate for dilation candidates and SHARED with the depth
-//   test -- identical inputs, bit-identical values for every non-revoked
-//   pixel; revoked pixels drop the measurement and re-fit inside the depth
-//   test's early-out-gated path exactly as before. The only behavioral
-//   change anywhere: the gate's fgThreshold under camera translation, now
-//   the exact value instead of the rotation-only one.
-//
-// v5.6.3 (clipper, hypothesis-side): the spike's record branch is whitened
-//   through the shrunk full metric; the winsor censors at the ingest's own
-//   Satterthwaite dof (WinsorCapNuStar); the shrunk correlations are
-//   computed ONCE and shared by the spike / winsor / corroboration / gate.
-//   The metric, cell-mass and Studentization changes live in taaClip.h.hlsl
-//   (see its v5.6.3 header). No depth/velocity/dilation behavior change.
+// DEPTH EXACTNESS: the dilation-validation gate and the depth test share
+// the layer's fitted forward displacement T_y; the expected-crest depth is
+// transported with the exact relation w' = w*B + T_y composed with the
+// rotation-exact raw form (raw(u) = rayLen(u)/D, so 1/rawExpRot = w*B
+// exactly under pure rotation; translation adds T_y). Revoked candidates
+// drop the measurement and the depth test re-fits internally.
 // ============================================================================
 
 #include "shaders/common/postFx/postFx.h.hlsl"
@@ -125,11 +117,11 @@ void FetchFxaaCorners(float2 tapUVs[9], out float3 cornersRGB[4])
 {
     [unroll]
     for (int c = 0; c < 4; ++c)
-        cornersRGB[c] = max(tex2Dlod(sceneTex, float4(tapUVs[c + 5], 0.0, 0.0)).rgb, 0.0);
+        cornersRGB[c] = ScrubRawRGB(tex2Dlod(sceneTex, float4(tapUVs[c + 5], 0.0, 0.0)).rgb);
 }
 
 // ============================================================================
-// (v5.6.6) THE CLIP STATE, DECODE-THEN-BLENDED
+// THE CLIP STATE, DECODE-THEN-BLENDED
 // ----------------------------------------------------------------------------
 // The state must describe the content the Kaiser read actually blended --
 // a ~9-21 texel footprint -- not one coin-flipped texel. Four point-sampled
@@ -139,17 +131,16 @@ void FetchFxaaCorners(float2 tapUVs[9], out float3 cornersRGB[4])
 //     bilinear weights, renormalized over the valid texels;
 //   * the DISCRETE transports (age: 4 bits, split: 6 bits -- blends of
 //     packed fields are meaningless) come from the maximum-weight VALID
-//     texel -- which is exactly the nearest, i.e. exactly the old snapped
-//     read's choice;
-//   * no valid texel -> COLD, as before.
+//     texel -- exactly the nearest, i.e. exactly the snapped read's choice;
+//   * no valid texel -> COLD.
 // The raw bits are never interpolated and nothing is re-encoded. At an
 // exact texel-center landing (the static identity) the weights degenerate
-// to (1,0,0,0) and the read is BIT-IDENTICAL to the old snapped form --
-// the blend engages only with sub-texel phase, never with motion state.
-// Known approximation (accepted): a linear blend of varH still understates
-// the blended accumulator's read variance (neighboring accumulators are
-// correlated through the resample chain -- the same structure
-// taaAccNoiseFactor prices); far closer than a snap.
+// to (1,0,0,0) and the read is BIT-IDENTICAL to the snapped form -- the
+// blend engages only with sub-texel phase, never with motion state.
+// Known approximation (accepted): a linear blend of varH is the smooth-
+// field interpolation of READ-semantics values -- neighboring records
+// share overlapping 3x3 neighborhoods and each transported value already
+// carries the read's own correlation structure; far closer than a snap.
 // ============================================================================
 void SampleHistoryClipState(float2 historyUV, ViewportParams vp,
                             out float sigmaSq, out float varHSq,
@@ -222,7 +213,7 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
     float2 stableInFrameUV   = 2.0 * IN.uv0 - currentJitteredUV;
     SnappedCoord pixel       = SnapUVToTexel(stableInFrameUV, vp);
 
-    float3 currentColorRGB          = max(tex2Dlod(sceneTex,    float4(pixel.snappedUV, 0.0, 0.0)).rgb, 0.0);
+    float3 currentColorRGB          = ScrubRawRGB(tex2Dlod(sceneTex,    float4(pixel.snappedUV, 0.0, 0.0)).rgb);
     float  centerDepthRaw           =       tex2Dlod(depthTex,    float4(pixel.snappedUV, 0.0, 0.0)).r;
     float3 currentColorSpace        = ToSpace(currentColorRGB);
     float2 centerVelocityJitteredUV =       tex2Dlod(velocityTex, float4(pixel.snappedUV, 0.0, 0.0)).rg;
@@ -274,11 +265,11 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
     [unroll]
     for (int i = 1; i < 8; ++i)
     {
-        float3 tapRGB = max(tex2Dlod(sceneTex, float4(tapUVs[i], 0.0, 0.0)).rgb, 0.0);
+        float3 tapRGB = ScrubRawRGB(tex2Dlod(sceneTex, float4(tapUVs[i], 0.0, 0.0)).rgb);
         neighborhoodColorSpace[i] = ToSpace(tapRGB);
     }
     {
-        float3 tapRGB = max(tex2Dlod(sceneTex, float4(tapUVs[8], 0.0, 0.0)).rgb, 0.0);
+        float3 tapRGB = ScrubRawRGB(tex2Dlod(sceneTex, float4(tapUVs[8], 0.0, 0.0)).rgb);
         neighborhoodColorSpace[8] = ToSpace(tapRGB);
     }
 
@@ -314,18 +305,14 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
     float2 jitterCancelUV     = EstimateJitterCancelUV(jitterOffsetCurUV, jitterOffsetPrevUV, jitterOffsetPrev2UV);
     float2 jitterTransportUV  = EstimateJitterTransportUV(jitterOffsetCurUV, jitterOffsetPrevUV, jitterOffsetPrev2UV);
 
-    // 8) Own-history dilation validation.
-    //
-    // v5.6.2: the layer's forward displacement T_y is fitted BEFORE the gate
-    // for dilation candidates: the gate's expected-crest depth is transported
-    // with the SAME exact relation the depth test uses (w' = w*B + T_y; see
-    // the composed rawExpClosest below). The fit runs on the PRE-revocation
-    // layer -- for a dilation candidate that mask IS the foreground (the
-    // crest and its kin), exactly the layer the crest depth belongs to. The
-    // measurement is REUSED by the depth test (identical inputs -> identical
-    // value), so non-revoked candidates pay ONE fit, not two; on revocation
-    // the measurement is dropped and the depth test re-fits on the background
-    // layer inside its own early-out-gated path (as it always did).
+    // 8) Own-history dilation validation: the layer's forward displacement
+    //    T_y is fitted BEFORE the gate for dilation candidates and REUSED
+    //    by the depth test (identical inputs -> bit-identical values for
+    //    every non-revoked pixel); on revocation the measurement is dropped
+    //    and the depth test re-fits inside its own early-out-gated path.
+    //    The pre-gate fit measures the FOREGROUND layer -- for a kept
+    //    dilation candidate that mask IS the foreground (the crest and its
+    //    kin), exactly the layer the crest depth belongs to.
     float  ty = 0.0, tySigma = 0.0;
     bool   tyMeasured = false;
 
@@ -352,17 +339,10 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
         float rayLenPrev = RayLengthFromUV(repro.sampleUV, taaTanHalfFovX, taaTanHalfFovY);
         float perspScale = rayLenPrev / max(rayLenCur, 1e-6);
 
-        // v5.6.2 (exactness): the expected stored raw of the crest, WITH the
-        // translation. The rayLen ratio is the EXACT raw transport under a
-        // pure rotation (raw(u) = rayLen(u)/D with D the Euclidean distance,
-        // invariant under rotation about the eye -- so 1/rawExpRot = w*B
-        // exactly), but the stored field is last frame's and the camera
-        // TRANSLATES: the exact relation is w' = w*B + T_y, hence
-        // rawExp = 1/(1/rawExpRot + ty). The old rotation-only form biased
-        // fgThreshold by |ty|/w -- up to ~10% at close range under speed,
-        // twice the default 5% tolerance: keep-biased under forward camera
-        // motion (stale dilation bands surviving), revoke-biased under
-        // retreat (silhouette shimmer). ty = 0 (fit off or failed)
+        // The expected stored raw of the crest, WITH the translation: the
+        // stored field is last frame's and the camera TRANSLATES -- the
+        // exact relation is w' = w*B + T_y, hence
+        // rawExp = 1/(1/rawExpRot + ty). ty = 0 (fit off or failed)
         // degenerates to the rotation-only value.
         float rawExpRot     = currentLayer.closestDepth * perspScale;
         float rawExpClosest = 1.0 / max(1.0 / max(rawExpRot, 1e-6) + ty, kEpsilon);
@@ -385,10 +365,8 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
             repro = ReprojectToHistory(
                 IN.uv0, stableInFrameUV, pixel.fracPx, currentLayer.effectiveVelocityUV, previousCamera, vp);
 
-            // The pre-gate fit measured the FOREGROUND layer; the revoked
-            // pixel now transports its OWN background surface. Drop the
-            // measurement: the depth test re-fits internally (behind its
-            // early-out, exactly the pre-v5.6.2 code path).
+            // The revoked pixel now transports its OWN background surface;
+            // the pre-gate foreground measurement no longer applies.
             tyMeasured = false;
             ty = 0.0;
             tySigma = 0.0;
@@ -477,9 +455,9 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
 
     if (temporalStateEnabled)
     {
-        // (v5.6.6) decode-then-blend: the state describes the footprint
-        // the Kaiser read actually blended. Bit-identical to the old
-        // snapped read at exact texel centers (the static identity).
+        // Decode-then-blend: the state describes the footprint the Kaiser
+        // read actually blended. Bit-identical to the snapped read at exact
+        // texel centers (the static identity).
         SampleHistoryClipState(repro.sampleUV, vp,
                                sigmaPrevSq, varHPrevSq, agePrev, splitPrev);
     }
@@ -511,20 +489,64 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
         transportErrPx.y = max(abs(repro.jitterResidualPx.y) * motionShare, transportFloorPx);
     }
 
-    // THE LANDING-MISS MODEL'S SCALE (v5.6): the soft clip's H1 is priced
-    // by the measured miss distribution. sigma^2 = the gated transport
-    // scatter (the known residual -- the same quantity the null's variance
-    // charges; it is per-frame noise-like, wandering with the jitter, so
-    // it is SPREAD, not offset: the mixture stays centered on the target
-    // and there is no sign convention to get wrong) + the velocity
-    // field's measured noise scale. Where the quant-step scan was skipped
-    // (high motion), the uniform-field floor stands in -- at high motion
-    // the miss scale is dominated by the measured residual anyway.
-    float2 missSigmaPx;
+    // THE LANDING-MISS MODEL. The soft clip's H1 is priced by the measured
+    // miss distribution. sigma^2 = the gated transport scatter (the known
+    // residual -- per-frame noise-like, wandering with the jitter, so it is
+    // SPREAD, not offset: the mixture stays centered on the target and
+    // there is no sign convention to get wrong) + the velocity field's
+    // measured noise scale. Where the quant-step scan was skipped (high
+    // motion), the uniform-field floor stands in -- at high motion the
+    // miss scale is dominated by the measured residual anyway.
+    //
+    // THE SCALE'S DOF (missModel.z): the residual component of the scale
+    // is EXACT arithmetic (the jitter is known, the landing phase is
+    // known); the velocity component is an ESTIMATE -- the 36-pair
+    // quant-step scan over nine heavily correlated taps (~6 effective
+    // dof), or a convention (the fixed 1/16-px floor, the uniform-field
+    // classification -- numerically Gaussian by nu ~ 256). The
+    // Satterthwaite blend over the variance components,
+    //     nu = nuVel * (1 + exact^2 / estimated^2)^2,
+    // sends certain scales to the Gaussian law and velocity-dominated
+    // scales to nuVel; the tail law and the cell masses marginalize it
+    // (taaClip). A point-Gaussian prior collapses artificially hard at
+    // tight sigma -- the plug-in scale's artifact.
+    //
+    // THE CONDITIONAL MISS RATE (missModel.w, a log2 multiplier on the
+    // prior odds): the SCALE prices how FAR a miss lands, not how OFTEN
+    // one happens -- and landings are not exchangeable. Two measured
+    // high-risk classes, keyed on state the resolve already computed:
+    // the similarity-extrapolated landings (dilation zones and crest
+    // cliff-phases -- the extrapolation's error is first-order in the
+    // field curvature, far above the quant floor the scale charges) and
+    // the velocity-straddled phase quads (the resolved velocity can be
+    // the wrong layer's by a full step). The straddle test is recomputed
+    // rather than exported (the mode-8 precedent); its pre-screen makes
+    // it a few ops on quiet quads. The boost lifts the prior odds only --
+    // the scales, the masses and the tail stay measured. The dials are
+    // the constants in taaClip, never a cap on the measured scale.
+    float4 missModel;   // xy = the miss sigmas (texels), z = the scale's dof, w = the rate boost (log2)
     {
         float velNoisePx = (transportFloorPx > 0.0) ? transportFloorPx : kVelQuantFloorPx;
-        missSigmaPx.x = sqrt(transportErrPx.x * transportErrPx.x + velNoisePx * velNoisePx);
-        missSigmaPx.y = sqrt(transportErrPx.y * transportErrPx.y + velNoisePx * velNoisePx);
+        missModel.x = sqrt(transportErrPx.x * transportErrPx.x + velNoisePx * velNoisePx);
+        missModel.y = sqrt(transportErrPx.y * transportErrPx.y + velNoisePx * velNoisePx);
+
+        float nuVel = (transportFloorPx > 0.0 && !velUniform3x3) ? kMissNuVelMeasured : kMissNuVelFloor;
+        float evSq = velNoisePx * velNoisePx;
+        float ratioX = 1.0 + (transportErrPx.x * transportErrPx.x) / evSq;
+        float ratioY = 1.0 + (transportErrPx.y * transportErrPx.y) / evSq;
+        missModel.z = clamp(min(nuVel * ratioX * ratioX, nuVel * ratioY * ratioY), 2.0, 256.0);
+
+        float missRateBoost2 = 0.0;
+        if (currentLayer.extrapolationDispPx > 0.0)
+            missRateBoost2 += kMissRateExtrapolated2;
+        if (!currentLayer.isDilationZone && !currentLayer.isForegroundEdge)
+        {
+            float2 v00, v10, v01, v11;
+            SelectPhaseQuad(neighborhood.velocityJitteredUV, pixel.fracPx, v00, v10, v01, v11);
+            if (QuadStraddlesVelocityStep(v00, v10, v01, v11, neighborhood.velocityJitteredUV, vp.sizePixels, coherenceRadiusPx))
+                missRateBoost2 += kMissRateStraddled2;
+        }
+        missModel.w = min(missRateBoost2, kMissRateBoostMax2);
     }
 
     // ---- the statistics (the robust coupled 2x2 plane, the exact
@@ -556,16 +578,14 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
     if (taaHistoryOvershoot > 0.001 || taaColorSpaceOklab > 0.5)
         historyColorSpace = CompressGamut(historyColorSpace);
 
-    // ---- the accumulated neighborhood (v5.6.6 ITEM 3): the soft clip's
-    //      H1 components -- the history texels at the landing's 8
-    //      neighbors, what a landing-miss ghost actually holds. Fetched
-    //      only when the soft clip can run (its enable flag): ~8 fetches
-    //      = ~10% of the resolve's fetch traffic with the posterior
-    //      enabled. Exact texel centers through the linear slot-2
-    //      sampler (the documented invariant); NO CompressGamut (raw
-    //      stored texels are in-gamut by construction, unlike the
-    //      Kaiser read); NO phase correction (stable-space content).
-    //      Motion-agnostic: the prior odds do the gating, as before. ----
+    // ---- the accumulated neighborhood: the soft clip's H1 components --
+    //      the history texels at the landing's 8 neighbors, what a
+    //      landing-miss ghost actually holds. Fetched only when the soft
+    //      clip can run (~8 fetches = ~10% of the resolve's fetch traffic
+    //      with the posterior enabled). Exact texel centers through the
+    //      linear slot-2 sampler; NO CompressGamut (raw stored texels are
+    //      in-gamut by construction); NO phase correction (stable-space
+    //      content). Motion-agnostic: the prior odds do the gating. ----
     float3 accumulatedNeighbors[8];
     if (taaSoftClip > 0.001)
     {
@@ -574,7 +594,7 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
         for (int aj = 1; aj < 9; ++aj)
         {
             float2 uv = clamp((landingTexel + kOffsets3x3[aj]) * vp.texelSize, vp.minUV, vp.maxUV);
-            float3 acc = ToSpace(max(tex2Dlod(historyTex, float4(uv, 0.0, 0.0)).rgb, 0.0));
+            float3 acc = ToSpace(ScrubRawRGB(tex2Dlod(historyTex, float4(uv, 0.0, 0.0)).rgb));
             if (!(dot(acc, acc) < kLargeValue))
                 acc = colorStats.plane0;    // the NaN guard's policy, as the center read
             accumulatedNeighbors[aj - 1] = acc;
@@ -594,23 +614,22 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
 
     // ---- the shrunk channel correlations (ONE evaluation: the spike, the
     //      winsor, the corroboration test and the statistic gate all
-    //      consume the same values -- v5.6.3) ----
+    //      consume the same values) ----
     float rXYg, rXZg, rYZg;
     ShrunkenCorrelations(colorStats, rXYg, rXZg, rYZg);
 
     // ---- change-points ----
     // The spike: two branches, both explicit. The record branch is a
     // WHITENED chi^2_3 test at ~1e-6 per frame through the shrunk full
-    // metric (v5.6.3) -- the same channel law as the corroboration reset,
-    // with the transport scatter charged per-channel inside the metric.
-    // The old scalar-total form assumed exchangeable uncorrelated
-    // channels: on luminance-dominated YCoCg content the 3-channel sum's
-    // effective dof is ~1, and the priced ~1e-6 level ran at ~1e-3 there
-    // (records resetting ~1000x the priced rate). The range branch is the
-    // distribution-free garbage backstop (16x the observed AABB range --
-    // effectively never on the null by design: the H-free ingest absorbed
-    // the level-change job, geoCorroboration owns reveals, and the NaN
-    // guard is separate).
+    // metric -- the same channel law as the corroboration reset, with the
+    // transport scatter charged per-channel inside the metric (a scalar-
+    // total form would assume exchangeable uncorrelated channels: on
+    // luminance-dominated YCoCg content the 3-channel sum's effective dof
+    // is ~1, and the priced ~1e-6 level would run at ~1e-3 there). The
+    // range branch is the distribution-free garbage backstop (16x the
+    // observed AABB range -- effectively never on the null by design: the
+    // H-free ingest absorbed the level-change job, geoCorroboration owns
+    // reveals, and the NaN guard is separate).
     bool  spike = hadRecord
         && (innovSq > 16.0 * colorStats.rangeSq
             || WhitenedInnovSq(innov, partsLive, colorStats.transportVar, rXYg, rXZg, rYZg) > kChiSq3_1e6);
@@ -629,8 +648,8 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
     // ---- THE STRUCTURE SPLIT'S TRANSPORT ----
     // The signed normalized fraction f = (R - s)/max(R, s): the spatial
     // residual total against the record (which IS s). With the exact
-    // residual dof this anchor is unbiased -- the v5.5 ingest's fixed
-    // point is e = 0. A fresh record certifies nothing (the seed >= R by
+    // residual dof this anchor is unbiased -- the ingest's fixed point is
+    // e = 0. A fresh record certifies nothing (the seed >= R by
     // construction); a disocclusion restarts the split with the new
     // content.
     float splitFracNext;
@@ -644,27 +663,27 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
         splitFracNext = (carryRecord && !disoccluded)
             ? lerp(splitPrev, fRaw, kSplitEmaRate)
             : fRaw;
+        // Transport scrub: NaN here would reach round() and uint() in the
+        // packer. abs(NaN) <= 1.0 is false -- the strict-compare idiom.
+        splitFracNext = (abs(splitFracNext) <= 1.0) ? splitFracNext : 0.0;
     }
 
     // ---- THE RECORD: THE H-FREE INGEST ----
     // Noise lives in dev = x0c - plane0 (H does not appear); change lives
     // in dCorr (it does not appear here). The de-bias is the exact
     // identity E[dev^2] = sPer + vPrior - 2*cPT. The winsor caps the
-    // ingest at its OWN Satterthwaite dof's 0.1% point (v5.6.3 --
-    // WinsorCapNuStar): the null bias is ~0.6% and a center-tap firefly's
-    // record impact is half the old 9x cap's. The circularity (record ->
-    // split -> tauB2 -> vPrior -> ingest -> record) has loop gain
-    // (1 - q) < 1: convergent, honest fixed point e = 0 on the R > s
+    // ingest at its OWN Satterthwaite dof's 0.1% point. The circularity
+    // (record -> split -> tauB2 -> vPrior -> ingest -> record) has loop
+    // gain (1 - q) < 1: convergent, honest fixed point e = 0 on the R > s
     // branch -- the exact residual dof is that statement's stability
     // condition.
     float sigmaStatSq, ageNext;
     {
         if (carryRecord)
         {
-            // (v5.6.3) The honest 0.1% censoring point of the 3-channel
-            // correlated sum -- the old chi^2_3/3 stand-in ran the point
-            // at ~2% on gray content and systematically under-ingested
-            // legitimate variance.
+            // The honest 0.1% censoring point of the 3-channel correlated
+            // sum (a chi^2_3/3 stand-in would run the point at ~2% on gray
+            // content and systematically under-ingest legitimate variance).
             float winsorCap = WinsorCapNuStar(partsLive, colorStats, splitPrev, rXYg, rXZg, rYZg);
             float3 devIng    = (currentColorSpace - colorStats.phaseShift) - colorStats.plane0;
             float3 tauB2Ing  = max(splitPrev, 0.0) * colorStats.residSq;
@@ -680,6 +699,9 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
             sigmaStatSq = max(SeedRecordTotalSq(colorStats), kClipSigmaRecordFloorSq);
             ageNext     = 0.0;
         }
+        // Transport scrub: NaN here would reach sqrt() in the packer, the
+        // VarH recursion and next frame's record.
+        sigmaStatSq = ScrubF(sigmaStatSq, kClipSigmaRecordFloorSq);
     }
 
     // ---- THE LEVEL GATE ----
@@ -687,7 +709,7 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
         historyColorSpace, currentColorSpace, colorStats, partsLive,
         carryRecord, carryRecord ? agePrev : 0.0,
         splitPrev,
-        missSigmaPx,
+        missModel,
         accumulatedNeighbors,
         rXYg, rXZg, rYZg);
     float3 clippedHistorySpace = clipGate.clippedColorSpace;
@@ -780,6 +802,23 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
             dbgA = saturate(clipGate.mdd * (1.0 / 16.0));
             dbgB = (clipGate.mdd > chiDbg * chiDbg) ? 1.0 : 0.0;
         }
+        else if (taaDebugMode > 13.5 && taaDebugMode < 14.5)   // 14: deployment canary
+        {
+            // Three one-bit probes, settings-independent: 4 = the pushed
+            // non-setting constants are live (taaArmingA is a host-FIT
+            // value ~4.35; a stale/no-op'ed cbuffer reads 0, and no user
+            // setting can push it below 1); 2 = the viewport uniforms are
+            // sane (1/size in (0,1] -- the solid-color failure is 1/size
+            // = 0, every tap sampling texel (0,0)); 1 = the transported
+            // state decodes (tag 5 live, tag 1 while ANY debug mode is on
+            // -- both mean the store chain ran).
+            float sa = tex2Dlod(historyStateTex, float4(clamp(IN.uv0, vp.minUV, vp.maxUV), 0.0, 0.0)).a;
+            uint  tg = (asuint(sa) >> 28) & 0x7u;
+            float f = (taaArmingA > 1.0 ? 4.0 : 0.0)
+                    + ((oneOverTargetSize.x > 1e-6 && oneOverTargetSize.x <= 1.0) ? 2.0 : 0.0)
+                    + ((tg == 0x5u || tg == 0x1u) ? 1.0 : 0.0);
+            dbgCode = 14.0; dbgA = f * 0.125;
+        }
     }
 
     // ------------------------------------------------------------------
@@ -787,16 +826,13 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
     // ------------------------------------------------------------------
     float historyFeedback    = ComputeHistoryFeedback(repro, currentSingleLayer);
 
-    // (v5.6.7) The clip-excess blend reduction: how far the history
-    // landed outside the gate (in gate radii) linearly drops the history
-    // blend to zero past a start margin. Purely blend-side -- the clamp /
-    // soft clip fix the STORED value, this fixes how much of it survives
-    // this frame; the record and the split are untouched by policy, and
-    // the VarH recursion sees the raised blend weight and correctly
-    // restarts the accumulator on dropped pixels through its own
-    // semantics. With the motion field off this is the disocclusion
-    // path: ~2e-8 on the nominal null at the defaults, routine on true
-    // reveals (which sit at 3-10+ radii).
+    // The clip-excess blend reduction: how far the history landed outside
+    // the gate (in gate radii) linearly drops the history blend to zero
+    // past a start margin. Purely blend-side -- the clamp / soft clip fix
+    // the STORED value, this fixes how much of it survives this frame; the
+    // record and the split are untouched by policy, and the VarH recursion
+    // sees the raised blend weight and correctly restarts the accumulator
+    // on dropped pixels through its own semantics.
     historyFeedback *= 1.0 - ComputeClipExcessBlendDrop(clipGate);
 
     float currentBlendWeight = 1.0 - historyFeedback;
@@ -821,6 +857,12 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
     // 13) The blend, the VarH recursion, the packed output.
     // ------------------------------------------------------------------
     float3 blendedColorSpace = lerp(clippedHistorySpace, currentFrameColorSpace, currentBlendWeight);
+    // The write-side guard: NOTHING non-finite is ever stored. One NaN
+    // frame here is feedback-locked and neighbor-visible through the
+    // resample footprint; the fallback is guaranteed finite (every scene
+    // read is scrubbed; the gate chain is total on finite input).
+    if (!(dot(blendedColorSpace, blendedColorSpace) < kLargeValue))
+        blendedColorSpace = currentFrameColorSpace;
     blendedColorSpace.x = max(blendedColorSpace.x, 0.0);
     float3 outputRGB = max(FromSpace(blendedColorSpace), 0.0);
 
