@@ -702,10 +702,11 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
             // sum (a chi^2_3/3 stand-in would run the point at ~2% on gray
             // content and systematically under-ingest legitimate variance).
             float winsorCap = WinsorCapNuStar(partsLive, colorStats, splitPrev, rXYg, rXZg, rYZg);
-            float3 devIng    = (currentColorSpace - colorStats.phaseShift) - colorStats.plane0;
-            float3 tauB2Ing  = max(splitPrev, 0.0) * colorStats.residSq;
-            float3 vPriorIng = tauB2Ing + partsLive.sPer * colorStats.evalVar;
-            float3 sIngestPer = devIng * devIng - vPriorIng + 2.0 * colorStats.priorTapCov;
+            // The de-bias is taaClip's law now: RecordIngestPerChannel is
+            // the exact identity E[dev^2] = sPer + vPrior - 2*cPT -- the
+            // same null the gate and the winsor consume (bit-identical to
+            // the historical inline form).
+            float3 sIngestPer = RecordIngestPerChannel(currentColorSpace, colorStats, partsLive, splitPrev);
             float  sIngest    = max(dot(sIngestPer, float3(1.0, 1.0, 1.0)), 0.0);
             sigmaStatSq = max(lerp(sigmaPrevSq, min(sIngest, winsorCap), kClipSigmaEmaRate),
                               kClipSigmaRecordFloorSq);

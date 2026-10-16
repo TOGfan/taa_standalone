@@ -64,7 +64,9 @@ static const float kTyUnmeasuredFrac         = 0.02;
 static const float kDebugVelocityScale       = 0.1;
 static const float kDebugLinearDepthRange    = 100.0;
 
-static const float kStdWeights[9] = { 1.0, 0.36787944, 0.36787944, 0.36787944, 0.36787944, 0.13533528, 0.13533528, 0.13533528, 0.13533528 };
+// (kStdWeights -- the hard-coded exp(-|o|^2) 9-tap stencil -- was RETIRED:
+// taaClip.h.hlsl computes the design kernel analytically, centered at the
+// jitter phase, exp(-|o - c|^2); it was the table's only consumer.)
 static const float kInvLength[9]  = { 0.0, 1.0, 1.0, 1.0, 1.0, 0.70710678, 0.70710678, 0.70710678, 0.70710678 };
 
 // Wiener per-tier betas (see taaResample.h.hlsl).
