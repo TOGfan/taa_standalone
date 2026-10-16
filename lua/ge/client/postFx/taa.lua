@@ -172,7 +172,7 @@ function M.build(shaderKey)
         -- fallback samples at sub-texel positions and needs real filtering.
         sb:setField("samplerStates", 0, "SamplerClampLinear")   -- 0: sceneTex
         sb:setField("samplerStates", 1, "SamplerClampPoint")    -- 1: depthTex
-        sb:setField("samplerStates", 2, "SamplerClampLinear")   -- 2: historyTex (fused Kaiser tap needs it)
+        sb:setField("samplerStates", 2, "SamplerClampLinear")   -- 2: historyTex (fused Wiener tap needs it)
         sb:setField("samplerStates", 3, "SamplerClampPoint")    -- 3: velocityTex
         sb:setField("samplerStates", 4, "SamplerClampPoint")    -- 4: historyMotionTex (stored field, exact texel fetches)
         -- Slot 5: #TAA_History bound a SECOND time, through a POINT sampler:
@@ -181,7 +181,7 @@ function M.build(shaderKey)
         -- center (the center (k+0.5)/N is not float-representable for
         -- non-power-of-two sizes; the residual weight corrupts the packed
         -- low bits, the bias field first). Slot 2 stays linear for the
-        -- fused Kaiser color taps -- one texture, two filterings, two
+        -- fused Wiener color taps -- one texture, two filterings, two
         -- bindings.
         sb:setField("samplerStates", 5, "SamplerClampPoint")    -- 5: historyStateTex
     end)
@@ -230,7 +230,7 @@ function M.build(shaderKey)
     -- motion-writer note below).
     taaPreFx:setField("texture", 4, "#TAA_HistMotion")
     -- The clip-state read: #TAA_History bound a second time, point-sampled
-    -- (slot 2 is the linear Kaiser color binding; the packed alpha needs a
+    -- (slot 2 is the linear Wiener color binding; the packed alpha needs a
     -- filter-free fetch). Frame 0 / post-resize reads whatever the engine
     -- left in the target (typically zero): alpha 0 decodes as tag 0 = a
     -- COLD record, so those pixels run the cold gate for one frame and the
@@ -626,7 +626,7 @@ end
 -- track the feedback rate and the resample tier)
 -- ----------------------------------------------------------------------------
 --   * varhLoss: 1 - D, D = the fixed-point READ gain (kernelChainConstants)
---     -- varH is transported in READ semantics (the Kaiser-resampled
+--     -- varH is transported in READ semantics (the Wiener-resampled
 --     history the gate tests), and the history term of the recursion
 --     re-reads the smooth accumulated field at the fixed-point gain.
 --     Encoded as a LOSS so an unset constant (0) degrades to the legacy
@@ -638,17 +638,17 @@ end
 --     noise structure (see kernelChainConstants).
 --
 -- KERNEL CONTRACT: the resolve's history resample is a SEPARABLE per-axis
--- windowed sinc -- logical taps n = -2..3, radius 3, Kaiser beta 5.2
--- (kKaiserBeta6Tap) for the 6-tap tier, n = -1..2, radius 2, beta 3.2
--- (kKaiserBeta4Tap) for the 4-tap tier -- selected by useKaiser6. MUST
+-- windowed sinc -- logical taps n = -2..3, radius 3, Wiener beta 5.2
+-- (kWienerBeta6Tap) for the 6-tap tier, n = -1..2, radius 2, beta 3.2
+-- (kWienerBeta4Tap) for the 4-tap tier -- selected by useWiener6. MUST
 -- MATCH taaResample.h.hlsl; the constants are logged at startup for
 -- cross-checking. The 21-tap fetch pattern's corner skip is ~0.08% of the
 -- kernel mass and is not modeled in the spectral chain.
 -- ============================================================================
-local KAISER6_BETA   = 5.2    -- kKaiserBeta6Tap
-local KAISER6_RADIUS = 3.0
-local KAISER4_BETA   = 3.2    -- kKaiserBeta4Tap
-local KAISER4_RADIUS = 2.0
+local Wiener6_BETA   = 5.2    -- kWienerBeta6Tap
+local Wiener6_RADIUS = 3.0
+local Wiener4_BETA   = 3.2    -- kWienerBeta4Tap
+local Wiener4_RADIUS = 2.0
 
 local function besselI0(x)
     local sum, term = 1.0, 1.0
@@ -661,8 +661,8 @@ local function besselI0(x)
 end
 
 -- The per-axis kernel evaluated at logical tap n for sub-texel phase f:
--- k(n, f) = sinc(n - f) * KaiserWindow(|n - f| / R), zero outside |n-f| < R.
-local function kaiser1DTap(n, phase, beta, radius)
+-- k(n, f) = sinc(n - f) * WienerWindow(|n - f| / R), zero outside |n-f| < R.
+local function Wiener1DTap(n, phase, beta, radius)
     local d = n - phase
     if math.abs(d) >= radius then return 0.0 end
     local sinc
@@ -676,7 +676,7 @@ end
 -- ============================================================================
 -- THE RESAMPLE KERNEL'S ACCUMULATION CHAIN (the spectral fixed point)
 -- ----------------------------------------------------------------------------
--- varH means Var(READ) -- the Kaiser-resampled history that the gate and the
+-- varH means Var(READ) -- the Wiener-resampled history that the gate and the
 -- detector actually test. Three constants, all measured on the ACTUAL per-tier
 -- kernel:
 --   * w (whiteGain)  = (E_f[sum_n k(n,f)^2])^2: the read gain against WHITE
@@ -697,7 +697,7 @@ end
 --     and D = Vr/Vs.
 --
 -- THE ACCUMULATED-NOISE STRUCTURE: the soft clip's accumulated components
--- price Var(Kaiser-read of the stored field - center texel) at the spectral
+-- price Var(Wiener-read of the stored field - center texel) at the spectral
 -- fixed point. The 2D noise spectrum is S2D = a^2/(1 - b*Kx2*Ky2); expanding
 -- the geometric series, its autocovariance is R2D(x,y) = sum_k b^k * cx_k(x)
 -- * cx_k(y) with cx_k = IDFT(Kbar^{2k}) (the a^2 is a common factor and
@@ -731,7 +731,7 @@ local function kernelChainConstants(beta, radius, a)
         ktab[p] = {}
         local sum = 0.0
         for n = lo, hi do
-            local k = kaiser1DTap(n, f, beta, radius)
+            local k = Wiener1DTap(n, f, beta, radius)
             ktab[p][n] = k
             sum = sum + k
         end
@@ -917,10 +917,10 @@ local function varhHostConstants()
 
     -- The VarH chain's gains from the accumulation's spectral fixed point,
     -- per resample tier (kernelChainConstants).
-    local use6 = ((tonumber(s.useKaiser6) or 1.0) > 0.5)
+    local use6 = ((tonumber(s.useWiener6) or 1.0) > 0.5)
     local whiteGain, readGain, _, accFactorIn = kernelChainConstants(
-        use6 and KAISER6_BETA  or KAISER4_BETA,
-        use6 and KAISER6_RADIUS or KAISER4_RADIUS,
+        use6 and Wiener6_BETA  or Wiener4_BETA,
+        use6 and Wiener6_RADIUS or Wiener4_RADIUS,
         a)
     -- BOTH gains are the read gain D. The lumped recursion
     --     varH' = (1-a)^2 * D * varH + a^2 * F * sPer
@@ -998,7 +998,7 @@ M.defaultSettings = {
     velocityAlignedVariance       = 0.0,
     alignmentFeedbackDrop         = 0.15,
     motionBlendDropSpeed          = 1.0,
-    useKaiser6                    = 1.0,
+    useWiener6                    = 1.0,
     historyOvershoot              = 1.0,
     clipOvershoot                 = 0.0,
     -- The clip-excess blend reduction: start/width are in GATE RADII of
@@ -1075,7 +1075,7 @@ function M.applySettings(inputs)
         pre:setShaderConst("$taaJitterPhaseEy",  phEy)
         pre:setShaderConst("$taaJitterPhaseExy", phExy)
         -- The VarH transport's two read gains + the accumulated components'
-        -- noise factor: they track feedbackMax / useKaiser6, so every apply
+        -- noise factor: they track feedbackMax / useWiener6, so every apply
         -- recomputes them.
         local varhLoss, whiteLoss, accFactor = varhHostConstants()
         pre:setShaderConst("$taaVarhResampleLoss",       varhLoss)
@@ -1085,8 +1085,8 @@ function M.applySettings(inputs)
             varhConstantsLogged = true
             if log then
                 log("I", "TAA", string.format(
-                    "VarH host constants: varhLoss=%.4f whiteLoss=%.4f accNoiseFactor=%.4f armingA=%.4f armingB=%.4f studentA=%.4f studentB=%.4f studentC=%.4f (kernel: separable per-axis Kaiser, beta %.1f (6-tap) / %.1f (4-tap) by useKaiser6; VarH gains and the accumulated-noise factor from the spectral fixed point -- MUST MATCH taaResample.h.hlsl / taaClip.h.hlsl; the arming pair and the Student Pade triple MUST MATCH taaClip.h.hlsl's consumption (1 + A*x + B*x^2)/(1 + C*x), x = 1/nu; ingest dof = 1.0, nu_inf = %.2f)",
-                    varhLoss, whiteLoss, accFactor, ARMING_A, ARMING_B, studentA, studentB, studentC, KAISER6_BETA, KAISER4_BETA, STUDENT_NUINF))
+                    "VarH host constants: varhLoss=%.4f whiteLoss=%.4f accNoiseFactor=%.4f armingA=%.4f armingB=%.4f studentA=%.4f studentB=%.4f studentC=%.4f (kernel: separable per-axis Wiener, beta %.1f (6-tap) / %.1f (4-tap) by useWiener6; VarH gains and the accumulated-noise factor from the spectral fixed point -- MUST MATCH taaResample.h.hlsl / taaClip.h.hlsl; the arming pair and the Student Pade triple MUST MATCH taaClip.h.hlsl's consumption (1 + A*x + B*x^2)/(1 + C*x), x = 1/nu; ingest dof = 1.0, nu_inf = %.2f)",
+                    varhLoss, whiteLoss, accFactor, ARMING_A, ARMING_B, studentA, studentB, studentC, Wiener6_BETA, Wiener4_BETA, STUDENT_NUINF))
             end
         end
         pre:setShaderConst("$taaSoftClip",                s.softClip)
@@ -1105,7 +1105,7 @@ function M.applySettings(inputs)
         pre:setShaderConst("$taaVelocityAlignedVariance", s.velocityAlignedVariance)
         pre:setShaderConst("$taaAlignmentFeedbackDrop",   s.alignmentFeedbackDrop)
         pre:setShaderConst("$taaMotionBlendDropSpeed",    s.motionBlendDropSpeed)
-        pre:setShaderConst("$taaUseKaiser6",              s.useKaiser6)
+        pre:setShaderConst("$taaUseWiener6",              s.useWiener6)
         pre:setShaderConst("$taaHistoryOvershoot",        s.historyOvershoot)
         pre:setShaderConst("$taaClipOvershoot",           s.clipOvershoot)
         pre:setShaderConst("$taaClipBlendDrop",           s.clipBlendDrop)

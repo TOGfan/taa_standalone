@@ -83,7 +83,7 @@
 // AUDITED, DO NOT RE-ATTEMPT:
 //   * a Sum-c^2 (or any kernel-quadratic-form) discount on the gate's
 //     varH charge, INCLUDING at the decode-blend: varH is transported in
-//     READ semantics -- it already IS the Kaiser read's variance, and
+//     READ semantics -- it already IS the Wiener read's variance, and
 //     each neighbor's transported value already contains the full
 //     kernel-weights-vs-field-autocovariance quadratic form. Discounting
 //     double-counts the read's smoothing.

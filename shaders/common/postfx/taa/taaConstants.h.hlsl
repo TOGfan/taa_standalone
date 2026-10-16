@@ -67,8 +67,8 @@ static const float kDebugLinearDepthRange    = 100.0;
 static const float kStdWeights[9] = { 1.0, 0.36787944, 0.36787944, 0.36787944, 0.36787944, 0.13533528, 0.13533528, 0.13533528, 0.13533528 };
 static const float kInvLength[9]  = { 0.0, 1.0, 1.0, 1.0, 1.0, 0.70710678, 0.70710678, 0.70710678, 0.70710678 };
 
-// Kaiser per-tier betas (see taaResample.h.hlsl).
-static const float kKaiserBeta4Tap           = 3.2;
-static const float kKaiserBeta6Tap           = 5.2;
+// Wiener per-tier betas (see taaResample.h.hlsl).
+static const float kWienerBeta4Tap           = 3.2;
+static const float kWienerBeta6Tap           = 5.2;
 
 #endif // TAA_CONSTANTS_H_HLSL
