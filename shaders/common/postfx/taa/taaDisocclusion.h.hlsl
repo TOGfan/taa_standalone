@@ -16,7 +16,7 @@
 // can never false-reject; only approach can -- exactly what T_y corrects.
 // The tolerance is a measured error budget: depth quanta, surface slope x
 // tracked-point position error (incl. the extrapolation displacement and
-// the ACTUAL Wiener filter footprint), plane curvature, and 2*sigma_Ty.
+// the ACTUAL Kaiser filter footprint), plane curvature, and 2*sigma_Ty.
 //
 // PURSUIT: push the historical surface forward along its own (dejittered)
 // motion into the CURRENT frame, then measure how much the current-frame

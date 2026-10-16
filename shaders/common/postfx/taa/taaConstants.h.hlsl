@@ -69,8 +69,8 @@ static const float kDebugLinearDepthRange    = 100.0;
 // jitter phase, exp(-|o - c|^2); it was the table's only consumer.)
 static const float kInvLength[9]  = { 0.0, 1.0, 1.0, 1.0, 1.0, 0.70710678, 0.70710678, 0.70710678, 0.70710678 };
 
-// Wiener per-tier betas (see taaResample.h.hlsl).
-static const float kWienerBeta4Tap           = 3.2;
-static const float kWienerBeta6Tap           = 5.2;
+// Kaiser per-tier betas (see taaResample.h.hlsl).
+static const float kKaiserBeta4Tap           = 3.75;
+static const float kKaiserBeta6Tap           = 4.375;
 
 #endif // TAA_CONSTANTS_H_HLSL

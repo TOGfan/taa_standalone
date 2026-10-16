@@ -66,7 +66,7 @@ cbuffer perDraw
     float  taaLumaVariance;                 float  taaUseHullClipping;
     float  taaColorSpaceOklab;              float  taaJitterAwareVariance;
     float  taaVelocityAlignedVariance;      float  taaAlignmentFeedbackDrop;
-    float  taaMotionBlendDropSpeed;         float  taaUseWiener6;
+    float  taaMotionBlendDropSpeed;         float  taaUseKaiser6;
     float  taaFallbackFXAA;
     float  taaMotionBlendStart;             float  taaDebugMode;
     float  taaCurPX;                        float  taaCurPY;
@@ -123,7 +123,7 @@ void FetchFxaaCorners(float2 tapUVs[9], out float3 cornersRGB[4])
 // ============================================================================
 // THE CLIP STATE, DECODE-THEN-BLENDED
 // ----------------------------------------------------------------------------
-// The state must describe the content the Wiener read actually blended --
+// The state must describe the content the Kaiser read actually blended --
 // a ~9-21 texel footprint -- not one coin-flipped texel. Four point-sampled
 // fetches (the bilinear quad around the landing), each DECODED, then:
 //   * the CONTINUOUS fields (sigma^2, varH -- linear space; varH's ratio
@@ -274,7 +274,7 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
     }
 
     // 6) Validate the history landing position.
-    float  historySupportTexels = (taaUseWiener6 > 0.5) ? 3.0 : 2.0;
+    float  historySupportTexels = (taaUseKaiser6 > 0.5) ? 3.0 : 2.0;
     float2 historyMinUV = historySupportTexels * vp.texelSize;
     float2 historyMaxUV = 1.0 - historyMinUV;
     bool historyValid = all(repro.sampleUV >= historyMinUV) && all(repro.sampleUV <= historyMaxUV);
@@ -455,7 +455,7 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
 
     if (temporalStateEnabled)
     {
-        // Decode-then-blend: the state describes the footprint the Wiener
+        // Decode-then-blend: the state describes the footprint the Kaiser
         // read actually blended. Bit-identical to the snapped read at exact
         // texel centers (the static identity).
         SampleHistoryClipState(repro.sampleUV, vp,
@@ -572,10 +572,10 @@ float4 mainP(PFXVertToPix IN) : SV_TARGET0
         partsLive = SplitRecordVariance(colorStats, sigmaPrevSq, varHPrevSq, nuPrev);
 
     float3 historyColorSpace;
-    if (taaUseWiener6 > 0.5)
-        historyColorSpace = SampleHistoryColor_Wiener6_21Tap(repro.sampleUV, vp, vp.minUV, vp.maxUV);
+    if (taaUseKaiser6 > 0.5)
+        historyColorSpace = SampleHistoryColor_Kaiser6_21Tap(repro.sampleUV, vp, vp.minUV, vp.maxUV);
     else
-        historyColorSpace = SampleHistoryColor_Wiener4_9Tap(repro.sampleUV, vp, vp.minUV, vp.maxUV);
+        historyColorSpace = SampleHistoryColor_Kaiser4_9Tap(repro.sampleUV, vp, vp.minUV, vp.maxUV);
 
     if (!(dot(historyColorSpace, historyColorSpace) < kLargeValue))
         historyColorSpace = colorStats.plane0;
