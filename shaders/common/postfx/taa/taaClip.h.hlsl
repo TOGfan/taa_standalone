@@ -8,11 +8,18 @@
 //       hat-matrix bookkeeping:
 //         * residSq's dof: E[Sum w r^2] = sigma^2 Sum w(1-h), h_i =
 //           (w_i/W)(1 + mahal_i), Sum h_i = 3 exactly (the trace identity).
-//         * the IRLS studentization: q_i = r_i^2/((1-h_i) s^2) has E = 1
-//           per tap (the classical internally-studentized residual), so
-//           clean taps keep weight exactly 1 and a contaminated CENTER
-//           tap -- the highest hat -- is downweighted at its true
-//           deviation.
+//         * the IRLS studentization: under the FLAT model the honest
+//           per-tap variance is sigma^2 (1 - 2 h_i + |P_i|^2), |P_i|^2
+//           the weighted hat matrix's squared row norm -- the sandwich
+//           quadratic form x_i'(X'WX)^-1 (X'W^2X) (X'WX)^-1 x_i on the
+//           w^2 design moments (the F1 lever's accumulator class).
+//           q_i = r_i^2/(v_i s^2) has E = 1 per tap EXACTLY, so clean
+//           taps keep weight exactly 1 and a contaminated CENTER tap
+//           -- the highest hat -- is downweighted at its true
+//           deviation. sigma^2 (1-h_i) is the w == 1 special case (a
+//           projection's row norm IS its diagonal); charged as the
+//           denominator through v3 it ran E[q_i] at ~0.77/0.96/1.46
+//           center/edge/corner on the symmetric c = 0 kernel.
 //         * the evaluation variance: vFit = sPer * Sum c_k^2 with c_k the
 //           EXACT evaluation functional; Sum c^2 reproduces the classical
 //           (1/n)(1 + mahal) on uniform weights.
@@ -91,6 +98,12 @@
 //     perpetuate the miss).
 //   * a dynamic ingest dof (would break the STUDENT_NUINF host sync; the
 //     dev IS a single Gaussian linear functional -- chi^2_1 is exact).
+//   * the pass-1 studentization back to the variance-weight
+//     sigma^2 (1 - h_i) denominator: that form is the w == 1 special
+//     case (a projection's row norm collapses onto its diagonal) and
+//     misprices E[q_i] at ~0.77/0.96/1.46 center/edge/corner under the
+//     flat kernel. The sandwich row-norm term |P_i|^2 is load-bearing,
+//     not a refinement.
 //
 // v2 CONSOLIDATION MANIFEST (accuracy frozen; every merge is exact, float
 // association may differ by <= 1 ulp where noted):
@@ -119,6 +132,29 @@
 //     the pieces -- the SplitRecordVariance precedent).
 //   * The ingest de-bias is EXPORTED (RecordIngestPerChannel): taa.fx
 //     calls the law instead of inlining it.
+// v4 FIX (F1's pass-1 studentization made exact under the declared flat
+// model; the plane's outputs shift within the IRLS reweighting's
+// designed envelope -- accuracy intentionally NOT frozen):
+//   * The pass-1 per-tap variance is the flat model's honest
+//     sigma^2 (1 - 2 h_i + |P_i|^2), |P_i|^2 = the weighted hat matrix's
+//     squared row norm (the sandwich quadratic form
+//     x_i'(X'WX)^-1 (X'W^2X) (X'WX)^-1 x_i), NOT the variance-weight
+//     sigma^2 (1 - h_i) -- that is the w == 1 special case, exact only
+//     for a projection. E[q_i] = 1 per tap is exact now; through v3 it
+//     ran ~0.77/0.96/1.46 center/edge/corner at c = 0 (center
+//     contamination downweighted at 0.77x its true deviation, corner
+//     taps hot -- the far-side departure from the w3 count at steps is
+//     now calibrated).
+//   * ColorMomentAccumLean carries the W2-class fields (the F1 lever's
+//     accumulator class): pass 1 consumes them in place; the lean/full
+//     split still excludes only the cross-channel covariance fields
+//     (~54 dead MADs through pass 1, was ~108).
+//   * The SUM-level dof law is untouched and stays exact under flat:
+//     E[Sum w r^2] = sigma^2 Sum w(1-h) rides tr(W H H') = tr(W H)
+//     identically; the per-tap SPLIT of that sum is what the sandwich
+//     restores. The mahal rewrite dot(d1, sd1) is the identical
+//     expression tree (no reassociation); degenerate spread folds to
+//     the exact mean-only law through the zeroed rows, as before.
 //
 // MUST MATCH client/postFx/taa.lua: kClipSigmaEmaRate (rho),
 // kClipStudentPriorDof (nu0), kRecordIngestDof, the Pade (2,1)
@@ -219,9 +255,12 @@ static const float kTransportGatePx          = 2.0;
 // section 1 -- THE SPATIAL MODEL (L1)
 // ----------------------------------------------------------------------------
 // Moments -> the robust coupled plane. Lean accumulator for pass 1, full
-// for pass 2: pass 1 needs only ~15 floats live, and source-level
-// translation paths that do not DCE struct fields through out-params would
-// otherwise carry all ~27 through pass 1 (~108 dead MADs per pixel).
+// for pass 2: pass 1 carries ~21 floats live (the honest F1
+// studentization consumes the w^2 design moments -- the F1 lever's
+// accumulator class -- inside pass 1), and source-level translation
+// paths that do not DCE struct fields through out-params would
+// otherwise carry all ~27 through pass 1 (~54 dead MADs per pixel: the
+// cross-channel covariance fields).
 // ============================================================================
 struct ColorNeighborhoodStats
 {
@@ -262,6 +301,14 @@ struct ColorMomentAccumLean
     float  offXSq;
     float  offYSq;
     float  offXY;
+    // The w^2 design moments (the F1 lever's accumulator class): pass
+    // 1's honest studentization consumes the sandwich quadratic form
+    // built from them -- see the pass-1 block below.
+    float  totalWSq;
+    float2 offSumW2;
+    float  offXSqW2;
+    float  offYYSqW2;
+    float  offXYW2;
 };
 
 void AccumulateColorMomentsLean(float3 taps[9], float w[9], out ColorMomentAccumLean a)
@@ -274,6 +321,11 @@ void AccumulateColorMomentsLean(float3 taps[9], float w[9], out ColorMomentAccum
     a.offXSq  = 0.0;
     a.offYSq  = 0.0;
     a.offXY   = 0.0;
+    a.totalWSq = 0.0;
+    a.offSumW2 = float2(0.0, 0.0);
+    a.offXSqW2 = 0.0;
+    a.offYYSqW2 = 0.0;
+    a.offXYW2  = 0.0;
 
     [unroll]
     for (int i = 0; i < 9; ++i)
@@ -281,6 +333,7 @@ void AccumulateColorMomentsLean(float3 taps[9], float w[9], out ColorMomentAccum
         float3 c  = taps[i];
         float2 o  = kOffsets3x3[i];
         float  wi = w[i];
+        float  wi2 = wi * wi;
 
         a.sum3    += c * wi;
         a.covXSum += o.x * c * wi;
@@ -290,6 +343,11 @@ void AccumulateColorMomentsLean(float3 taps[9], float w[9], out ColorMomentAccum
         a.offXSq  += o.x * o.x * wi;
         a.offYSq  += o.y * o.y * wi;
         a.offXY   += o.x * o.y * wi;
+        a.totalWSq += wi2;
+        a.offSumW2 += o * wi2;
+        a.offXSqW2 += o.x * o.x * wi2;
+        a.offYYSqW2 += o.y * o.y * wi2;
+        a.offXYW2  += o.x * o.y * wi2;
     }
 }
 
@@ -468,11 +526,26 @@ ColorNeighborhoodStats ComputeColorNeighborhoodStats(
     float2 cen1  = acc1.offSum * invW1;
     ColorPlaneFit fit1 = SolveColorPlane(acc1, mean1, cen1, invW1);
 
-    // The pass-1 hat diagonals: h_i = (w_i/W)(1 + mahal_i), Var(r_i) =
-    // sigma^2 (1 - h_i), Sum h_i = 3 exactly (the trace identity). The
-    // studentized residual has E[q] = 1 per tap, so the IRLS sees a
-    // calibrated chi^2_1. Degenerate spread folds through the zeroed
-    // inverse rows (mahal = 0 identically -- no branch needed).
+    // The pass-1 hat diagonals: h_i = (w_i/W)(1 + mahal_i), Sum h_i = 3
+    // exactly (the trace identity). THE HONEST PER-TAP VARIANCE under the
+    // flat model is Var(r_i) = sigma^2 (1 - 2 h_i + |P_i|^2), |P_i|^2 the
+    // weighted hat matrix's squared row norm -- the sandwich quadratic
+    // form x_i'(X'WX)^-1 (X'W^2X) (X'WX)^-1 x_i, built from the SAME w^2
+    // design moments the pass-2 F1 lever consumes (the accumulator class
+    // above). The variance-weight sigma^2 (1 - h_i) is the w == 1 special
+    // case (a projection's row norm IS its diagonal): charged under
+    // unequal weights it misprices the studentization -- honest
+    // 0.514/0.568/1.087 vs charged 0.668/0.590/0.744 on the symmetric
+    // c = 0 kernel, E[q_i] ~ 0.77/0.96/1.46 center/edge/corner. The exact
+    // form restores E[q_i] = 1 per tap: the IRLS sees a calibrated
+    // chi^2_1, clean taps keep weight exactly 1, and a contaminated
+    // CENTER tap -- the highest hat -- is downweighted at its true
+    // deviation (the 0.1 floor keeps the dominant-tap limit, where the
+    // fit passes through the tap and both r_i and v_i collapse, bounded
+    // at 10x). Degenerate spread folds through the zeroed inverse rows:
+    // S^-1 d = 0 identically, and the fold is the exact MEAN-ONLY law
+    // 1 - 2 w_i/W + Sum w^2/W^2 (the unobserved direction dropped -- no
+    // branch needed).
     float2 vInv1_0 = float2(0.0, 0.0);
     float2 vInv1_1 = float2(0.0, 0.0);
     if (fit1.detV > 1e-6)
@@ -480,6 +553,18 @@ ColorNeighborhoodStats ComputeColorNeighborhoodStats(
         vInv1_0 = float2( fit1.vYY, -fit1.vXY) / fit1.detV;
         vInv1_1 = float2(-fit1.vXY,  fit1.vXX) / fit1.detV;
     }
+    // The sandwich's w^2 moments about the W-centroid: U = Sum w^2 (o -
+    // cen), T = Sum w^2 (o - cen)(o - cen)' -- the same centering the
+    // pass-2 sXX/sYY/sXY class performs on the refit weights.
+    float  invW1Sq = invW1 * invW1;
+    float2 uW2 = acc1.offSumW2 - cen1 * acc1.totalWSq;
+    float  tXX = acc1.offXSqW2 - 2.0 * cen1.x * acc1.offSumW2.x
+               + acc1.totalWSq * cen1.x * cen1.x;
+    float  tYY = acc1.offYYSqW2 - 2.0 * cen1.y * acc1.offSumW2.y
+               + acc1.totalWSq * cen1.y * cen1.y;
+    float  tXY = acc1.offXYW2 - cen1.x * acc1.offSumW2.y
+               - cen1.y * acc1.offSumW2.x
+               + acc1.totalWSq * cen1.x * cen1.y;
     float rStdSq[9];
     float sumWrStd2 = 0.0;
     float maxWrStd2 = 0.0;
@@ -490,9 +575,18 @@ ColorNeighborhoodStats ComputeColorNeighborhoodStats(
         float2 d1 = kOffsets3x3[r] - cen1;
         float3 res = neighborhoodColorSpace[r]
                    - (mean1 + fit1.gradX * d1.x + fit1.gradY * d1.y);
-        float mahal = d1.x * dot(vInv1_0, d1) + d1.y * dot(vInv1_1, d1);
-        float oneMinusH = max(1.0 - w9[r] * (1.0 + mahal) * invW1, 0.1);
-        rStdSq[r] = dot(res, res) / oneMinusH;
+        float2 sd1 = float2(dot(vInv1_0, d1), dot(vInv1_1, d1));  // S^-1 d
+        float mahal = dot(d1, sd1);                               // d' S^-1 d
+        float h1 = w9[r] * (1.0 + mahal) * invW1;
+        // |P_i|^2 = (Sum w^2 + 2 (S^-1 d)' U + (S^-1 d)' T (S^-1 d)) / W^2
+        // -- the hat row's squared norm, Sum_j [x_i'(X'WX)^-1 x_j w_j]^2
+        // (the 3x3 sandwich product never materializes: the per-tap form
+        // is the centered decomposition).
+        float rowNormSq = (acc1.totalWSq + 2.0 * dot(sd1, uW2)
+                         + tXX * sd1.x * sd1.x + tYY * sd1.y * sd1.y
+                         + 2.0 * tXY * sd1.x * sd1.y) * invW1Sq;
+        float vResid = max(1.0 - 2.0 * h1 + rowNormSq, 0.1);
+        rStdSq[r] = dot(res, res) / vResid;
         float wr = w9[r] * rStdSq[r];
         sumWrStd2 += wr;
         if (wr > maxWrStd2) { maxWrStd2 = wr; wAtMax = w9[r]; }
